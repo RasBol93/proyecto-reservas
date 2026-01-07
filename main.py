@@ -2,331 +2,310 @@ import os
 import json
 import urllib.request
 import urllib.parse
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, Header, HTTPException
 
 app = FastAPI()
 
 # =========================
-# 1) Config / Variables
+# 1) Config general
 # =========================
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "")  # ej: https://proyecto-reservas-idwl.onrender.com
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")          # opcional pero recomendado
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 
-# =========================
-# 2) Estado en memoria (simple)
-#    OJO: esto se borra si Render reinicia.
-# =========================
-SESSIONS = {}  # chat_id -> dict con estado y datos
+# Botones (Reply Keyboard)
+BTN_MENU = "📄 Ver menú"
+BTN_FAQ = "❓ Preguntas frecuentes"
+BTN_RESERVAR = "📅 Reservar"
+BTN_AGENT = "👤 Hablar con alguien"
+BTN_CANCEL = "✖️ Cancelar"
 
-RESTAURANTS = ["R1", "R2"]
-
-# Flujo de pasos de reserva
-STEPS = [
-    "choose_restaurant",
-    "date",
-    "time",
-    "people",
-    "name",
-    "phone",
-    "confirm",
-]
+# Estado en memoria (simple)
+# clave: (tenant, chat_id)
+SESSIONS = {}  # (tenant, chat_id) -> {"step": str, "data": dict}
 
 # =========================
-# 3) Utilidades Telegram
+# 2) Config por restaurante (tenant)
 # =========================
-def telegram_api(method: str, payload: dict):
-    """Llama a la API de Telegram."""
-    if not TELEGRAM_BOT_TOKEN:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+def get_env(name: str, tenant: str, default: str = "") -> str:
+    return os.getenv(f"{name}_{tenant.upper()}", os.getenv(name, default)).strip()
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-def telegram_send_message(chat_id: int, text: str):
-    """Envía mensaje simple."""
-    try:
-        telegram_api("sendMessage", {"chat_id": chat_id, "text": text})
-    except Exception as e:
-        # No hacemos crash del webhook
-        print(f"[ERROR] sendMessage failed: {e}")
-
-def menu_text():
-    return (
-        "📌 Menú\n"
-        "1) Reservar\n"
-        "2) Ver disponibilidad\n"
-        "3) Preguntas frecuentes\n"
-        "4) Hablar con un agente\n\n"
-        "Escribe el número (1-4)."
-    )
-
-def reset_session(chat_id: int):
-    SESSIONS[chat_id] = {
-        "step": None,
-        "data": {
-            "restaurant": None,
-            "date": None,
-            "time": None,
-            "people": None,
-            "name": None,
-            "phone": None,
-        }
+def tenant_config(tenant: str) -> dict:
+    # tenant: "r1" o "r2"
+    t = tenant.upper()
+    return {
+        "tenant": tenant,
+        "token": get_env("TELEGRAM_BOT_TOKEN", t),
+        "webhook_secret": get_env("WEBHOOK_SECRET", t),
+        "menu_pdf_url": get_env("MENU_PDF_URL", t),
+        "faq_text": get_env("FAQ_TEXT", t, default="Aún no se configuró el FAQ."),
+        "admin_chat_id": get_env("ADMIN_CHAT_ID", t),  # string, luego lo parseamos
     }
 
-def start_reservation(chat_id: int):
-    reset_session(chat_id)
-    SESSIONS[chat_id]["step"] = "choose_restaurant"
-    telegram_send_message(chat_id, "🍽️ ¿Para cuál restaurante quieres reservar?\nA) R1\nB) R2\n\nResponde A o B.")
-
-def normalize(text: str) -> str:
-    return (text or "").strip()
+def require_token(cfg: dict):
+    if not cfg["token"]:
+        raise RuntimeError(f"Missing TELEGRAM_BOT_TOKEN_{cfg['tenant'].upper()}")
 
 # =========================
-# 4) Rutas de salud / debug
+# 3) Telegram helpers (por tenant)
+# =========================
+def telegram_api(cfg: dict, method: str, payload: dict):
+    require_token(cfg)
+    url = f"https://api.telegram.org/bot{cfg['token']}/{method}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+def main_keyboard():
+    return {
+        "keyboard": [
+            [{"text": BTN_MENU}, {"text": BTN_FAQ}],
+            [{"text": BTN_RESERVAR}, {"text": BTN_AGENT}],
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+
+def reservation_keyboard():
+    return {
+        "keyboard": [[{"text": BTN_CANCEL}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+
+def send_message(cfg: dict, chat_id: int, text: str, keyboard: dict | None = None):
+    payload = {"chat_id": chat_id, "text": text}
+    if keyboard:
+        payload["reply_markup"] = keyboard
+    try:
+        telegram_api(cfg, "sendMessage", payload)
+    except Exception as e:
+        print(f"[ERROR] sendMessage ({cfg['tenant']}): {e}")
+
+def send_document(cfg: dict, chat_id: int, doc_url: str, caption: str = ""):
+    # Telegram sendDocument acepta URL pública en "document"
+    payload = {"chat_id": chat_id, "document": doc_url}
+    if caption:
+        payload["caption"] = caption
+    try:
+        telegram_api(cfg, "sendDocument", payload)
+    except Exception as e:
+        print(f"[ERROR] sendDocument ({cfg['tenant']}): {e}")
+
+def notify_admin(cfg: dict, text: str):
+    admin_chat_id = cfg.get("admin_chat_id", "").strip()
+    if not admin_chat_id:
+        return
+    try:
+        cid = int(admin_chat_id)
+        send_message(cfg, cid, text)
+    except Exception:
+        pass
+
+# =========================
+# 4) Health check
 # =========================
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "proyecto-reservas"}
-
-@app.get("/debug/env")
-def debug_env():
-    # Para verificar rápidamente si Render tiene las variables
-    return {
-        "has_TELEGRAM_BOT_TOKEN": bool(TELEGRAM_BOT_TOKEN),
-        "PUBLIC_BASE_URL": PUBLIC_BASE_URL,
-        "has_ADMIN_TOKEN": bool(ADMIN_TOKEN),
-    }
+    return {"status": "ok", "service": "proyecto-reservas", "bots": ["r1", "r2"]}
 
 # =========================
-# 5) Admin: setWebhook desde el servidor (útil si tu red bloquea Telegram)
+# 5) Setup webhooks (2 bots) — desde Render
 # =========================
-def require_admin(token: str):
-    if not ADMIN_TOKEN:
-        raise HTTPException(status_code=400, detail="ADMIN_TOKEN not configured")
-    if token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
-
-@app.post("/admin/telegram/setup")
-async def admin_telegram_setup(request: Request):
-    body = await request.json()
-    token = body.get("token", "")
-    require_admin(token)
-
+@app.get("/setup-webhooks")
+def setup_webhooks():
     if not PUBLIC_BASE_URL:
         return {"ok": False, "error": "Missing PUBLIC_BASE_URL env var"}
 
-    webhook_url = f"{PUBLIC_BASE_URL.rstrip('/')}/telegram/webhook"
+    results = {}
 
-    # setWebhook
-    set_res = telegram_api("setWebhook", {"url": webhook_url})
+    for tenant in ["r1", "r2"]:
+        cfg = tenant_config(tenant)
+        if not cfg["token"]:
+            results[tenant] = {"ok": False, "error": f"Missing TELEGRAM_BOT_TOKEN_{tenant.upper()}"}
+            continue
 
-    # getWebhookInfo
-    info_res = telegram_api("getWebhookInfo", {})
+        webhook_url = f"{PUBLIC_BASE_URL}/telegram/webhook/{tenant}"
+        payload = {"url": webhook_url}
 
-    return {
-        "ok": True,
-        "webhook_url": webhook_url,
-        "setWebhook": set_res,
-        "getWebhookInfo": info_res,
-        "note": "Si setWebhook ok=true, el webhook quedó configurado."
-    }
+        # Si hay secret, lo usamos (Telegram lo enviará en header X-Telegram-Bot-Api-Secret-Token)
+        if cfg["webhook_secret"]:
+            payload["secret_token"] = cfg["webhook_secret"]
+
+        try:
+            set_res = telegram_api(cfg, "setWebhook", payload)
+            info_res = telegram_api(cfg, "getWebhookInfo", {})
+            results[tenant] = {
+                "ok": True,
+                "webhook_url": webhook_url,
+                "setWebhook": set_res,
+                "getWebhookInfo": info_res,
+            }
+        except Exception as e:
+            results[tenant] = {"ok": False, "error": str(e), "webhook_url": webhook_url}
+
+    return {"ok": True, "results": results}
 
 # =========================
-# 6) Tu webhook de Telegram
+# 6) Webhook handlers (uno por bot)
 # =========================
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request):
+@app.post("/telegram/webhook/r1")
+async def telegram_webhook_r1(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+):
+    return await handle_update("r1", request, x_telegram_bot_api_secret_token)
+
+@app.post("/telegram/webhook/r2")
+async def telegram_webhook_r2(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+):
+    return await handle_update("r2", request, x_telegram_bot_api_secret_token)
+
+# =========================
+# 7) Lógica común (por tenant)
+# =========================
+def session_key(tenant: str, chat_id: int):
+    return (tenant, chat_id)
+
+def reset_session(tenant: str, chat_id: int):
+    SESSIONS.pop(session_key(tenant, chat_id), None)
+
+def get_session(tenant: str, chat_id: int):
+    return SESSIONS.get(session_key(tenant, chat_id))
+
+def set_session(tenant: str, chat_id: int, step: str, data: dict):
+    SESSIONS[session_key(tenant, chat_id)] = {"step": step, "data": data}
+
+async def handle_update(tenant: str, request: Request, secret_header: str | None):
+    cfg = tenant_config(tenant)
+
+    # Validar secret_token si está configurado
+    expected_secret = cfg.get("webhook_secret", "").strip()
+    if expected_secret:
+        if not secret_header or secret_header != expected_secret:
+            raise HTTPException(status_code=401, detail="Invalid webhook secret token")
+
     update = await request.json()
-
     msg = update.get("message") or {}
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
-    text = normalize(msg.get("text"))
-
-    # Logs útiles (los ves en Render -> Logs)
-    print(f"[IN] chat_id={chat_id} text={text}")
+    text = (msg.get("text") or "").strip()
 
     if not chat_id:
         return {"ok": True}
 
-    # Asegura sesión
-    if chat_id not in SESSIONS:
-        reset_session(chat_id)
-
-    # Comandos base
-    if text.lower() in ["/start", "menu"]:
-        telegram_send_message(chat_id, "Hola 👋 Soy el bot de reservas.")
-        telegram_send_message(chat_id, menu_text())
-        SESSIONS[chat_id]["step"] = None
-        return {"ok": True}
-
-    if text.lower() in ["cancelar", "cancel", "stop"]:
-        reset_session(chat_id)
-        telegram_send_message(chat_id, "✅ Listo. Cancelé el proceso.")
-        telegram_send_message(chat_id, menu_text())
-        return {"ok": True}
-
-    # Si está en un flujo de reserva, seguimos el flujo
-    step = SESSIONS[chat_id].get("step")
-
-    if step:
-        handle_reservation_step(chat_id, text)
-        return {"ok": True}
-
-    # Si no está en flujo, interpretamos menú
-    if text in ["1", "reservar", "reserva"]:
-        start_reservation(chat_id)
-        return {"ok": True}
-
-    if text in ["2", "disponibilidad", "ver disponibilidad"]:
-        telegram_send_message(
+    # /start => menú principal (botones)
+    if text == "/start":
+        reset_session(tenant, chat_id)
+        send_message(
+            cfg,
             chat_id,
-            "📅 Disponibilidad (demo):\n"
-            "- R1: Hoy 19:00 / 20:00\n"
-            "- R2: Hoy 18:30 / 21:00\n\n"
-            "Si quieres reservar, escribe 1."
+            "¡Hola! 👋 Soy el bot de reservas.\nElige una opción:",
+            keyboard=main_keyboard(),
         )
         return {"ok": True}
 
-    if text in ["3", "faq", "preguntas", "preguntas frecuentes"]:
-        telegram_send_message(
-            chat_id,
-            "❓ Preguntas frecuentes (demo):\n"
-            "- Horario: 12:00 a 23:00\n"
-            "- Reservas: hasta 10 personas por mesa (consultar si más)\n"
-            "- Cancelaciones: hasta 2 horas antes\n\n"
-            "Para reservar, escribe 1."
-        )
-        return {"ok": True}
-
-    if text in ["4", "agente", "hablar con un agente"]:
-        telegram_send_message(
-            chat_id,
-            "👤 Ok. Para hablar con un agente, escribe tu nombre y tu consulta.\n"
-            "(En la siguiente versión aquí enviamos aviso al staff.)"
-        )
-        return {"ok": True}
-
-    # Default si no entendió
-    telegram_send_message(chat_id, "No entendí 😅")
-    telegram_send_message(chat_id, menu_text())
-    return {"ok": True}
-
-
-def handle_reservation_step(chat_id: int, text: str):
-    """Máquina de estados simple para guiar la reserva."""
-    session = SESSIONS[chat_id]
-    step = session["step"]
-    data = session["data"]
-
-    # Paso 1: elegir restaurante
-    if step == "choose_restaurant":
-        t = text.lower()
-        if t in ["a", "r1", "1"]:
-            data["restaurant"] = "R1"
-        elif t in ["b", "r2", "2"]:
-            data["restaurant"] = "R2"
+    # Botones principales
+    if text == BTN_MENU:
+        if not cfg["menu_pdf_url"]:
+            send_message(cfg, chat_id, "Aún no está configurado el PDF del menú.", keyboard=main_keyboard())
         else:
-            telegram_send_message(chat_id, "Por favor responde A (R1) o B (R2).")
-            return
+            send_document(cfg, chat_id, cfg["menu_pdf_url"], caption="Aquí tienes el menú 📄")
+            send_message(cfg, chat_id, "¿Deseas algo más?", keyboard=main_keyboard())
+        return {"ok": True}
 
-        session["step"] = "date"
-        telegram_send_message(chat_id, f"✅ Perfecto. Restaurante: {data['restaurant']}\n\n📅 ¿Qué fecha? (Ej: 2026-01-10)")
-        return
+    if text == BTN_FAQ:
+        send_message(cfg, chat_id, cfg["faq_text"], keyboard=main_keyboard())
+        return {"ok": True}
 
-    # Paso 2: fecha
-    if step == "date":
-        # Validación simple (puedes mejorar después)
-        if len(text) < 8:
-            telegram_send_message(chat_id, "Fecha inválida. Ejemplo correcto: 2026-01-10")
-            return
+    if text == BTN_AGENT:
+        send_message(cfg, chat_id, "Perfecto. Escribe tu mensaje y te contactará un encargado.", keyboard=main_keyboard())
+        # Notificación al admin (por tenant)
+        notify_admin(cfg, f"[{tenant.upper()}] Un cliente pidió hablar con alguien. ChatID: {chat_id}")
+        return {"ok": True}
+
+    if text == BTN_RESERVAR:
+        # Inicia flujo de reserva SIN elegir restaurante (tenant ya está fijado por el bot)
+        set_session(tenant, chat_id, "ASK_DATE", {})
+        send_message(cfg, chat_id, "Perfecto. ¿Para qué fecha? (formato: YYYY-MM-DD)", keyboard=reservation_keyboard())
+        return {"ok": True}
+
+    # Cancelar en cualquier punto
+    if text == BTN_CANCEL:
+        reset_session(tenant, chat_id)
+        send_message(cfg, chat_id, "Reserva cancelada. ¿Qué deseas hacer ahora?", keyboard=main_keyboard())
+        return {"ok": True}
+
+    # Flujo de reserva (simple, como en el PDF: fecha, hora, personas, nombre, teléfono, confirmación)
+    s = get_session(tenant, chat_id)
+    if not s:
+        # Si no está en flujo, devolvemos al menú
+        send_message(cfg, chat_id, "Elige una opción:", keyboard=main_keyboard())
+        return {"ok": True}
+
+    step = s["step"]
+    data = s["data"]
+
+    if step == "ASK_DATE":
         data["date"] = text
-        session["step"] = "time"
-        telegram_send_message(chat_id, "🕒 ¿A qué hora? (Ej: 19:30)")
-        return
+        set_session(tenant, chat_id, "ASK_TIME", data)
+        send_message(cfg, chat_id, "¿A qué hora? (ej: 19:30)", keyboard=reservation_keyboard())
+        return {"ok": True}
 
-    # Paso 3: hora
-    if step == "time":
-        if ":" not in text:
-            telegram_send_message(chat_id, "Hora inválida. Ejemplo: 19:30")
-            return
+    if step == "ASK_TIME":
         data["time"] = text
-        session["step"] = "people"
-        telegram_send_message(chat_id, "👥 ¿Para cuántas personas?")
-        return
+        set_session(tenant, chat_id, "ASK_PEOPLE", data)
+        send_message(cfg, chat_id, "¿Para cuántas personas?", keyboard=reservation_keyboard())
+        return {"ok": True}
 
-    # Paso 4: personas
-    if step == "people":
-        try:
-            n = int(text)
-            if n <= 0:
-                raise ValueError()
-        except ValueError:
-            telegram_send_message(chat_id, "Escribe un número válido (ej: 2, 4, 6).")
-            return
+    if step == "ASK_PEOPLE":
+        data["people"] = text
+        set_session(tenant, chat_id, "ASK_NAME", data)
+        send_message(cfg, chat_id, "¿A nombre de quién?", keyboard=reservation_keyboard())
+        return {"ok": True}
 
-        data["people"] = n
-        session["step"] = "name"
-        telegram_send_message(chat_id, "🧑 ¿A nombre de quién?")
-        return
-
-    # Paso 5: nombre
-    if step == "name":
-        if len(text) < 2:
-            telegram_send_message(chat_id, "Escribe un nombre válido.")
-            return
+    if step == "ASK_NAME":
         data["name"] = text
-        session["step"] = "phone"
-        telegram_send_message(chat_id, "📞 ¿Tu teléfono? (solo número o con +)")
-        return
+        set_session(tenant, chat_id, "ASK_PHONE", data)
+        send_message(cfg, chat_id, "¿Tu número de teléfono?", keyboard=reservation_keyboard())
+        return {"ok": True}
 
-    # Paso 6: teléfono
-    if step == "phone":
-        # Validación suave
-        cleaned = text.replace(" ", "")
-        if len(cleaned) < 6:
-            telegram_send_message(chat_id, "Teléfono muy corto. Intenta de nuevo.")
-            return
+    if step == "ASK_PHONE":
         data["phone"] = text
-        session["step"] = "confirm"
-
-        summary = (
-            "✅ Confirma tu reserva:\n"
-            f"- Restaurante: {data['restaurant']}\n"
-            f"- Fecha: {data['date']}\n"
-            f"- Hora: {data['time']}\n"
-            f"- Personas: {data['people']}\n"
-            f"- Nombre: {data['name']}\n"
-            f"- Teléfono: {data['phone']}\n\n"
-            "Responde: SI para confirmar o NO para cancelar."
+        set_session(tenant, chat_id, "CONFIRM", data)
+        resumen = (
+            f"Confirma tu reserva:\n"
+            f"📅 Fecha: {data['date']}\n"
+            f"🕒 Hora: {data['time']}\n"
+            f"👥 Personas: {data['people']}\n"
+            f"👤 Nombre: {data['name']}\n"
+            f"📞 Tel: {data['phone']}\n\n"
+            f"Responde: SI o NO"
         )
-        telegram_send_message(chat_id, summary)
-        return
+        send_message(cfg, chat_id, resumen, keyboard=reservation_keyboard())
+        return {"ok": True}
 
-    # Paso 7: confirmación
-    if step == "confirm":
-        t = text.lower()
-        if t in ["si", "sí", "s", "ok", "confirmar"]:
-            # Aquí luego guardaremos en Google Sheets / base de datos
-            telegram_send_message(chat_id, "🎉 ¡Listo! Tu reserva fue registrada (demo).")
-            telegram_send_message(chat_id, menu_text())
-            reset_session(chat_id)
-            return
+    if step == "CONFIRM":
+        if text.strip().lower() in ["si", "sí"]:
+            # Aquí luego conectamos Google Calendar por tenant.
+            # Por ahora confirmamos y notificamos admin del tenant.
+            send_message(cfg, chat_id, "✅ Reserva confirmada. ¡Gracias!", keyboard=main_keyboard())
+            notify_admin(
+                cfg,
+                f"✅ Nueva reserva [{tenant.upper()}]\n"
+                f"{data['date']} {data['time']} - {data['people']} pax\n"
+                f"Nombre: {data['name']} - Tel: {data['phone']}"
+            )
+            reset_session(tenant, chat_id)
+        else:
+            send_message(cfg, chat_id, "Reserva no confirmada. Si deseas, vuelve a empezar.", keyboard=main_keyboard())
+            reset_session(tenant, chat_id)
+        return {"ok": True}
 
-        if t in ["no", "n", "cancelar"]:
-            telegram_send_message(chat_id, "✅ Ok, cancelé la reserva.")
-            telegram_send_message(chat_id, menu_text())
-            reset_session(chat_id)
-            return
-
-        telegram_send_message(chat_id, "Responde SI para confirmar o NO para cancelar.")
-        return
+    # fallback
+    send_message(cfg, chat_id, "Elige una opción:", keyboard=main_keyboard())
+    return {"ok": True}
