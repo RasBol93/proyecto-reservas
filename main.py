@@ -1,359 +1,443 @@
 import os
 import json
 import uuid
+import re
+import unicodedata
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 import gspread
 from google.oauth2.service_account import Credentials
 
 
-# =========================
-# Config
-# =========================
+# ============================================================
+# ENV
+# ============================================================
+# Debe ser el Spreadsheet ID del Google Sheet "reservaciones_config"
+CONFIG_SPREADSHEET_ID = os.getenv("CONFIG_SPREADSHEET_ID", "").strip()
+
+# Credenciales service account en JSON (string)
+GCP_CREDENTIALS_JSON = os.getenv("GCP_CREDENTIALS_JSON", "").strip()
+
+if not CONFIG_SPREADSHEET_ID:
+    # No hacemos crash al importar, pero sí al primer request útil.
+    print("WARN: CONFIG_SPREADSHEET_ID is empty. Set it in Render Environment.")
+if not GCP_CREDENTIALS_JSON:
+    print("WARN: GCP_CREDENTIALS_JSON is empty. Set it in Render Environment.")
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive",
 ]
 
-# EDITA ESTO: pon aquí tus IDs reales de Google Sheets
-TENANTS: Dict[str, Dict[str, str]] = {
-    "resto_demo": {
-        "spreadsheet_id": "PON_AQUI_EL_SPREADSHEET_ID_DE_ORDERS_RESTO_DEMO",
-        "menu_sheet": "Menu",
-        "orders_sheet": "Orders",
-    },
-    # Ejemplo futuro:
-    # "salon_demo": {
-    #     "spreadsheet_id": "PON_AQUI_EL_SPREADSHEET_ID_DE_ORDERS_SALON_DEMO",
-    #     "menu_sheet": "Menu",
-    #     "orders_sheet": "Orders",
-    # },
-}
+# Nombres de pestañas (según tus screenshots)
+TENANTS_TAB = "Tenants"
+CONTENT_TAB = "Content"
+BOOKING_RULES_TAB = "BookingRules"
+DEFAULTS_TAB = "Defaults"
 
-TECH_HEADERS_MENU = ["sku", "name", "price", "active", "category"]
-TECH_HEADERS_ORDERS = [
-    "order_id",
-    "created_at",
-    "tenant_id",
-    "customer_name",
-    "customer_contact",
-    "items",
-    "notes",
-    "delivery_type",
-    "requested_time",
-    "status",
-    "source",
-    "total_amount",
-]
+ORDERS_TAB = "Orders"
+MENU_TAB = "Menu"
 
 
-# =========================
-# Helpers Google Sheets
-# =========================
+# ============================================================
+# HELPERS (normalización / lectura robusta)
+# ============================================================
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-def get_gspread_client() -> gspread.client.Client:
-    raw = os.getenv("GCP_CREDENTIALS_JSON")
-    if not raw:
-        raise RuntimeError("Missing env var GCP_CREDENTIALS_JSON")
+def normalize(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    s = re.sub(r"[^\w\s-]", " ", s)  # saca puntuación
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-    info = json.loads(raw)
+def to_bool(val: Any) -> bool:
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return False
+    s = str(val).strip().lower()
+    return s in ("true", "1", "yes", "y", "si", "sí")
+
+def to_number(val: Any) -> Optional[float]:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip()
+    if not s:
+        return None
+    # soporta "25", "25.0", "25,5"
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except:
+        return None
+
+def detect_header_row(values: List[List[Any]], required_headers: List[str], max_scan: int = 10) -> int:
+    """
+    Busca la fila de headers dentro de las primeras max_scan filas.
+    Devuelve índice 0-based de la fila header.
+    """
+    req = [normalize(h) for h in required_headers]
+    for i in range(min(max_scan, len(values))):
+        row = [normalize(c) for c in values[i]]
+        if all(h in row for h in req):
+            return i
+    return 0
+
+def read_records_manual(ws, required_headers: List[str]) -> List[Dict[str, Any]]:
+    """
+    Lee una worksheet detectando la fila header, y devolviendo lista de dicts.
+    """
+    values = ws.get_all_values()
+    if not values:
+        return []
+    header_idx = detect_header_row(values, required_headers=required_headers)
+    headers = [normalize(h) for h in values[header_idx]]
+    records = []
+    for r in values[header_idx + 1:]:
+        if not any(str(x).strip() for x in r):
+            continue
+        row_dict = {}
+        for j, h in enumerate(headers):
+            if not h:
+                continue
+            row_dict[h] = r[j] if j < len(r) else ""
+        records.append(row_dict)
+    return records
+
+def find_row_index_by_key(ws, key_col_header: str, key_value: str) -> Optional[int]:
+    """
+    Busca la fila (1-based) donde la columna key_col_header == key_value.
+    Detecta header.
+    """
+    values = ws.get_all_values()
+    if not values:
+        return None
+
+    header_idx = detect_header_row(values, required_headers=[key_col_header])
+    headers = [normalize(h) for h in values[header_idx]]
+    try:
+        key_col = headers.index(normalize(key_col_header))
+    except ValueError:
+        return None
+
+    for i in range(header_idx + 1, len(values)):
+        row = values[i]
+        cell = row[key_col] if key_col < len(row) else ""
+        if str(cell).strip() == str(key_value).strip():
+            return i + 1  # 1-based for gspread
+    return None
+
+def update_cell_by_header(ws, row_1based: int, header_name: str, new_value: Any) -> None:
+    values = ws.get_all_values()
+    if not values:
+        raise ValueError("Worksheet empty; cannot update.")
+    header_idx = detect_header_row(values, required_headers=[header_name])
+    headers = [normalize(h) for h in values[header_idx]]
+    try:
+        col_idx = headers.index(normalize(header_name)) + 1  # 1-based
+    except ValueError:
+        raise ValueError(f"Header not found: {header_name}")
+    ws.update_cell(row_1based, col_idx, new_value)
+
+
+# ============================================================
+# GOOGLE CLIENT
+# ============================================================
+def get_gspread_client() -> gspread.Client:
+    if not GCP_CREDENTIALS_JSON:
+        raise HTTPException(status_code=500, detail="Missing GCP_CREDENTIALS_JSON in environment.")
+    info = json.loads(GCP_CREDENTIALS_JSON)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.Client(auth=creds)
 
+def open_config_spreadsheet(gc: gspread.Client):
+    if not CONFIG_SPREADSHEET_ID:
+        raise HTTPException(status_code=500, detail="Missing CONFIG_SPREADSHEET_ID in environment.")
+    try:
+        return gc.open_by_key(CONFIG_SPREADSHEET_ID)
+    except Exception as e:
+        # 404 casi siempre es "no compartiste con service account" o id incorrecto
+        raise HTTPException(status_code=500, detail=f"Cannot open CONFIG_SPREADSHEET_ID. Share sheet with service account. Error: {str(e)}")
 
-def open_ws(tenant_id: str):
-    cfg = TENANTS.get(tenant_id)
-    if not cfg:
-        raise HTTPException(status_code=404, detail=f"Unknown tenant_id: {tenant_id}")
+def get_tenant_cfg(tenant_id: str) -> Dict[str, Any]:
+    gc = get_gspread_client()
+    cfg_sh = open_config_spreadsheet(gc)
+
+    try:
+        tenants_ws = cfg_sh.worksheet(TENANTS_TAB)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Config sheet missing tab '{TENANTS_TAB}'. Error: {str(e)}")
+
+    # Importante: en tu screenshot la columna se llama orders_sheet_id
+    required = ["tenant_id", "orders_sheet_id", "orders_enabled", "active"]
+    rows = read_records_manual(tenants_ws, required_headers=required)
+
+    tid = str(tenant_id).strip()
+    for r in rows:
+        if str(r.get("tenant_id", "")).strip() != tid:
+            continue
+        if not to_bool(r.get("active", "TRUE")):
+            raise HTTPException(status_code=400, detail=f"Tenant inactive: {tenant_id}")
+        return {
+            "tenant_id": tid,
+            "name": r.get("name", ""),
+            "business_type": r.get("business_type", ""),
+            "orders_sheet_id": str(r.get("orders_sheet_id", "")).strip(),
+            "orders_enabled": to_bool(r.get("orders_enabled", "FALSE")),
+            "bookings_enabled": to_bool(r.get("bookings_enabled", "FALSE")),
+            "timezone": r.get("timezone", "America/La_Paz"),
+            "admin_chat_id": r.get("admin_chat_id", ""),
+            "admin_whatsapp": r.get("admin_whatsapp", ""),
+        }
+
+    raise HTTPException(status_code=404, detail=f"Tenant not found: {tenant_id}")
+
+def open_orders_spreadsheet_for_tenant(tenant_id: str):
+    cfg = get_tenant_cfg(tenant_id)
+    if not cfg.get("orders_enabled", False):
+        raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {tenant_id}")
+
+    orders_sheet_id = cfg.get("orders_sheet_id", "").strip()
+    if not orders_sheet_id:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Tenant '{tenant_id}' has empty orders_sheet_id in '{TENANTS_TAB}' tab."
+        )
 
     gc = get_gspread_client()
-    sh = gc.open_by_key(cfg["spreadsheet_id"])
+    try:
+        sh = gc.open_by_key(orders_sheet_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Cannot open orders spreadsheet for tenant '{tenant_id}'. "
+                f"Make sure you shared it with the service account. Error: {str(e)}"
+            )
+        )
 
-    menu_ws = sh.worksheet(cfg.get("menu_sheet", "Menu"))
-    orders_ws = sh.worksheet(cfg.get("orders_sheet", "Orders"))
+    # Tabs según tu sheet: Orders y Menu
+    try:
+        orders_ws = sh.worksheet(ORDERS_TAB)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Orders sheet missing tab '{ORDERS_TAB}'. Error: {str(e)}")
+
+    try:
+        menu_ws = sh.worksheet(MENU_TAB)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Orders sheet missing tab '{MENU_TAB}'. Error: {str(e)}")
+
     return menu_ws, orders_ws
 
 
-def normalize_bool(v: Any) -> bool:
-    if v is None:
-        return False
-    s = str(v).strip().lower()
-    return s in ("true", "1", "yes", "y", "si", "sí")
-
-
-def parse_price_to_int(v: Any) -> int:
-    """
-    Convierte precio a int (Bs). Acepta "32", "32.0", "32,0", " 32 ", etc.
-    Si no se puede parsear -> lanza ValueError
-    """
-    if v is None:
-        raise ValueError("price is empty")
-
-    s = str(v).strip()
-    if s == "":
-        raise ValueError("price is empty")
-
-    # Reemplaza coma decimal por punto
-    s = s.replace(",", ".")
-
-    # Quita posibles "Bs" o símbolos simples (por si acaso)
-    s = s.replace("bs", "").replace("Bs", "").replace("B", "").replace("$", "").strip()
-
-    # float -> int (si viene "32.0")
-    n = float(s)
-    return int(round(n))
-
-
-def get_menu_items(menu_ws) -> List[Dict[str, Any]]:
-    """
-    Lee Menu y devuelve solo items activos (active=TRUE).
-    Asume:
-    - Fila 1: headers técnicos exactos (sku,name,price,active,category)
-    - Fila 2: puede estar en español, PERO active NO debe ser TRUE
-    """
-    values = menu_ws.get_all_values()
-    if not values or len(values) < 1:
-        return []
-
-    header = [h.strip() for h in values[0]]
-    # Validación ligera: que existan columnas mínimas
-    for h in TECH_HEADERS_MENU:
-        if h not in header:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Menu sheet missing header '{h}'. Row1 must be: {TECH_HEADERS_MENU}",
-            )
-
-    idx = {name: header.index(name) for name in TECH_HEADERS_MENU}
-
-    items: List[Dict[str, Any]] = []
-    for r in values[1:]:
-        # fila vacía
-        if not any([c.strip() for c in r if isinstance(c, str)]):
-            continue
-
-        sku = (r[idx["sku"]] if idx["sku"] < len(r) else "").strip()
-        name = (r[idx["name"]] if idx["name"] < len(r) else "").strip()
-        price_raw = (r[idx["price"]] if idx["price"] < len(r) else "").strip()
-        active_raw = (r[idx["active"]] if idx["active"] < len(r) else "").strip()
-        category = (r[idx["category"]] if idx["category"] < len(r) else "").strip()
-
-        # Reglas para saltar filas "no-producto"
-        if sku == "" or name == "":
-            continue
-        if not normalize_bool(active_raw):
-            continue
-
-        # Precio robusto: si falla, saltamos el producto (mejor que romper /menu)
-        try:
-            price_int = parse_price_to_int(price_raw)
-        except Exception:
-            continue
-
-        items.append(
-            {
-                "sku": sku,
-                "name": name,
-                "price": str(price_int),
-                "active": "TRUE",
-                "category": category or "Sin categoría",
-            }
-        )
-
-    return items
-
-
-def build_price_map(menu_ws) -> Dict[str, int]:
-    """
-    Mapa sku -> price_int, usando TODAS las filas con sku+price válidos (no solo activos),
-    para poder calcular totales aunque luego alguien desactive un ítem.
-    """
-    values = menu_ws.get_all_values()
-    if not values:
-        return {}
-
-    header = [h.strip() for h in values[0]]
-    for h in TECH_HEADERS_MENU:
-        if h not in header:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Menu sheet missing header '{h}'. Row1 must be: {TECH_HEADERS_MENU}",
-            )
-    idx_sku = header.index("sku")
-    idx_price = header.index("price")
-
-    price_map: Dict[str, int] = {}
-    for r in values[1:]:
-        sku = (r[idx_sku] if idx_sku < len(r) else "").strip()
-        price_raw = (r[idx_price] if idx_price < len(r) else "").strip()
-        if not sku:
-            continue
-        try:
-            price_map[sku] = parse_price_to_int(price_raw)
-        except Exception:
-            # ignora filas no válidas (ej: fila 2 en español)
-            continue
-    return price_map
-
-
-def ensure_orders_headers(orders_ws):
-    values = orders_ws.get_all_values()
-    if not values:
-        orders_ws.append_row(TECH_HEADERS_ORDERS)
-        return
-
-    header = [h.strip() for h in values[0]]
-    # si faltan headers técnicos, no intentamos “arreglar” silenciosamente
-    for h in TECH_HEADERS_ORDERS:
-        if h not in header:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Orders sheet missing header '{h}'. Row1 must include: {TECH_HEADERS_ORDERS}",
-            )
-
-
-def find_order_row_by_id(orders_ws, order_id: str) -> Optional[int]:
-    """
-    Devuelve el número de fila (1-indexed) donde está el order_id.
-    Asume que order_id está en la columna A.
-    """
-    col = orders_ws.col_values(1)  # columna A
-    for i, v in enumerate(col, start=1):
-        if v == order_id:
-            return i
-    return None
-
-
-# =========================
-# API Models
-# =========================
+# ============================================================
+# MODELS
+# ============================================================
+class MenuItem(BaseModel):
+    sku: str
+    name: str
+    price: float
+    active: bool = True
+    category: str = ""
 
 class OrderItem(BaseModel):
     sku: str
-    qty: int = Field(ge=1, le=99)
+    qty: int = Field(..., ge=1)
 
-
-class CreateOrderPayload(BaseModel):
+class OrderCreateRequest(BaseModel):
     tenant_id: str
     customer_name: str
     customer_contact: str
-    delivery_type: str = Field(default="pickup")  # pickup/delivery
-    requested_time: str = Field(default="ahora")
     items: List[OrderItem]
-    notes: str = Field(default="")
-    source: str = Field(default="api")
+    delivery_type: str = "pickup"
+    requested_time: str = "ahora"
+    notes: str = ""
+    source: str = "api"
 
+class OrderCreateResponse(BaseModel):
+    ok: bool
+    tenant_id: str
+    order_id: str
+    total_amount: float
 
-class MarkPaidPayload(BaseModel):
+class MarkPaidRequest(BaseModel):
     tenant_id: str
     order_id: str
 
+class MarkPaidResponse(BaseModel):
+    ok: bool
+    tenant_id: str
+    order_id: str
+    new_status: str
 
-# =========================
-# FastAPI App
-# =========================
 
-app = FastAPI(title="Proyecto Reservas - Demo Pedidos", version="1.0.0")
+# ============================================================
+# BUSINESS: MENU + TOTAL CALC
+# ============================================================
+def load_menu_map(menu_ws) -> Dict[str, Dict[str, Any]]:
+    """
+    Devuelve un dict: sku -> {name, price, category, active}
+    Lee de la pestaña Menu con headers: sku, name, price, active, category
+    """
+    required = ["sku", "name", "price", "active", "category"]
+    rows = read_records_manual(menu_ws, required_headers=required)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    menu = {}
+    for r in rows:
+        sku = str(r.get("sku", "")).strip()
+        if not sku:
+            continue
+
+        # active puede venir como TRUE/FALSE
+        active = to_bool(r.get("active", "FALSE"))
+        if not active:
+            continue
+
+        price = to_number(r.get("price"))
+        if price is None:
+            # si falta precio, lo ignoramos para no romper todo
+            continue
+
+        menu[sku] = {
+            "sku": sku,
+            "name": str(r.get("name", "")).strip(),
+            "price": float(price),
+            "category": str(r.get("category", "")).strip(),
+            "active": True,
+        }
+    return menu
+
+def calc_total_amount(order_items: List[OrderItem], menu_map: Dict[str, Dict[str, Any]]) -> float:
+    total = 0.0
+    for it in order_items:
+        sku = it.sku.strip()
+        if sku not in menu_map:
+            raise HTTPException(status_code=400, detail=f"SKU not found in Menu or inactive: {sku}")
+        price = float(menu_map[sku]["price"])
+        total += price * int(it.qty)
+    # redondeo simple para mostrar
+    return round(total, 2)
+
+def append_order_row(orders_ws, row: Dict[str, Any]) -> None:
+    """
+    Inserta una fila en Orders respetando headers existentes.
+    Headers esperados según tu screenshot:
+    order_id, created_at, tenant_id, customer_name, customer_contact,
+    items, notes, delivery_type, requested_time, status, source, total_amount
+    """
+    values = orders_ws.get_all_values()
+    if not values:
+        raise HTTPException(status_code=500, detail="Orders worksheet is empty; missing headers.")
+
+    header_idx = detect_header_row(values, required_headers=["order_id", "tenant_id", "status"])
+    headers = [normalize(h) for h in values[header_idx]]
+
+    def getv(h: str) -> Any:
+        return row.get(normalize(h), "")
+
+    out_row = []
+    for h in headers:
+        out_row.append(getv(h))
+
+    orders_ws.append_row(out_row, value_input_option="USER_ENTERED")
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
+app = FastAPI(title="Proyecto Reservas - Orders Demo")
 
 
 @app.get("/")
-def root():
-    return {"ok": True, "service": "proyecto-reservas", "tenants": list(TENANTS.keys())}
-
-
-@app.get("/debug/tenants")
-def debug_tenants():
-    return {"ok": True, "tenants": TENANTS}
+def health():
+    return {"status": "ok"}
 
 
 @app.get("/menu")
-def get_menu(tenant_id: str):
-    menu_ws, _ = open_ws(tenant_id)
-    items = get_menu_items(menu_ws)
-    return {"ok": True, "tenant_id": tenant_id, "count": len(items), "items": items}
+def get_menu(tenant_id: str = Query(...)):
+    menu_ws, _ = open_orders_spreadsheet_for_tenant(tenant_id)
+    menu_map = load_menu_map(menu_ws)
 
+    # formato simple para bot: categories + items
+    categories: Dict[str, List[Dict[str, Any]]] = {}
+    for sku, it in menu_map.items():
+        cat = it.get("category", "") or "General"
+        categories.setdefault(cat, []).append({
+            "sku": it["sku"],
+            "name": it["name"],
+            "price": it["price"],
+            "category": cat,
+        })
 
-@app.post("/orders/create")
-def create_order(payload: CreateOrderPayload):
-    menu_ws, orders_ws = open_ws(payload.tenant_id)
-    ensure_orders_headers(orders_ws)
-
-    price_map = build_price_map(menu_ws)
-
-    # Calcula total
-    total = 0
-    missing: List[str] = []
-    for it in payload.items:
-        if it.sku not in price_map:
-            missing.append(it.sku)
-            continue
-        total += price_map[it.sku] * int(it.qty)
-
-    if missing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown SKU(s): {missing}. Check Menu sheet (sku/price).",
-        )
-
-    order_id = uuid.uuid4().hex[:7]
-    created_at = datetime.now(timezone.utc).isoformat()
-
-    row = [
-        order_id,
-        created_at,
-        payload.tenant_id,
-        payload.customer_name,
-        payload.customer_contact,
-        json.dumps([{"sku": it.sku, "qty": it.qty} for it in payload.items], ensure_ascii=False),
-        payload.notes,
-        payload.delivery_type,
-        payload.requested_time,
-        "PENDING_PAYMENT",
-        payload.source,
-        str(total),
-    ]
-
-    orders_ws.append_row(row, value_input_option="RAW")
+    # ordenar por nombre dentro de categoría
+    for cat in categories:
+        categories[cat] = sorted(categories[cat], key=lambda x: x["name"].lower())
 
     return {
-        "ok": True,
-        "tenant_id": payload.tenant_id,
+        "tenant_id": tenant_id,
+        "categories": sorted(categories.keys()),
+        "items_by_category": categories,
+        "total_items": len(menu_map),
+    }
+
+
+@app.post("/orders/create", response_model=OrderCreateResponse)
+def create_order(payload: OrderCreateRequest):
+    tenant_id = payload.tenant_id.strip()
+
+    menu_ws, orders_ws = open_orders_spreadsheet_for_tenant(tenant_id)
+    menu_map = load_menu_map(menu_ws)
+
+    total_amount = calc_total_amount(payload.items, menu_map)
+
+    order_id = uuid.uuid4().hex[:8]
+    created_at = now_iso()
+
+    # Guardamos items como JSON string en la columna items
+    items_json = json.dumps([{"sku": it.sku.strip(), "qty": int(it.qty)} for it in payload.items], ensure_ascii=False)
+
+    row = {
         "order_id": order_id,
+        "created_at": created_at,
+        "tenant_id": tenant_id,
+        "customer_name": payload.customer_name.strip(),
+        "customer_contact": payload.customer_contact.strip(),
+        "items": items_json,
+        "notes": payload.notes.strip(),
+        "delivery_type": payload.delivery_type.strip(),
+        "requested_time": payload.requested_time.strip(),
         "status": "PENDING_PAYMENT",
-        "total_amount": total,
+        "source": payload.source.strip(),
+        "total_amount": total_amount,
     }
 
+    append_order_row(orders_ws, row)
 
-@app.post("/orders/mark_paid")
-def mark_paid(payload: MarkPaidPayload):
-    _, orders_ws = open_ws(payload.tenant_id)
-    ensure_orders_headers(orders_ws)
+    return OrderCreateResponse(ok=True, tenant_id=tenant_id, order_id=order_id, total_amount=total_amount)
 
-    row_idx = find_order_row_by_id(orders_ws, payload.order_id)
+
+@app.post("/orders/mark_paid", response_model=MarkPaidResponse)
+def mark_paid(payload: MarkPaidRequest):
+    tenant_id = payload.tenant_id.strip()
+    order_id = payload.order_id.strip()
+
+    _, orders_ws = open_orders_spreadsheet_for_tenant(tenant_id)
+
+    row_idx = find_row_index_by_key(orders_ws, "order_id", order_id)
     if not row_idx:
-        raise HTTPException(status_code=404, detail="order_id not found")
+        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
 
-    # status está en la columna J (10) según TECH_HEADERS_ORDERS
-    status_col = TECH_HEADERS_ORDERS.index("status") + 1
-    orders_ws.update_cell(row_idx, status_col, "PAID")
+    update_cell_by_header(orders_ws, row_idx, "status", "PAID")
 
-    return {
-        "ok": True,
-        "tenant_id": payload.tenant_id,
-        "order_id": payload.order_id,
-        "new_status": "PAID",
-    }
+    return MarkPaidResponse(ok=True, tenant_id=tenant_id, order_id=order_id, new_status="PAID")
