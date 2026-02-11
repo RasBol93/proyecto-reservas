@@ -33,8 +33,9 @@ SCOPES = [
 
 app = FastAPI()
 
+
 # =========================
-# GOOGLE SHEETS HELPERS
+# HELPERS
 # =========================
 def _require_env():
     if not SHEET_ID:
@@ -59,14 +60,21 @@ def open_main_sheet():
     return open_sheet_by_id(SHEET_ID)
 
 
-def norm(s: Any) -> str:
-    return str(s).strip()
+def norm(v: Any) -> str:
+    return str(v).strip()
 
 
 def as_bool(v: Any) -> bool:
     """
-    Convierte valores de Google Sheets / Python a boolean robusto.
-    Acepta: True/False, "TRUE"/"FALSE", "true"/"false", 1/0, "1"/"0", "yes"/"no"
+    Convierte valores a boolean de forma robusta.
+    Soporta:
+      - True/False (boolean)
+      - "TRUE"/"FALSE"
+      - "true"/"false"
+      - "1"/"0"
+      - 1/0
+      - "yes"/"no"
+      - "si"/"sí"
     """
     if isinstance(v, bool):
         return v
@@ -74,39 +82,39 @@ def as_bool(v: Any) -> bool:
         return False
     if isinstance(v, (int, float)):
         return v != 0
+
     s = str(v).strip().lower()
     return s in ("true", "1", "yes", "y", "si", "sí", "on")
 
 
-def read_records(tab_name: str) -> List[Dict[str, Any]]:
+def read_records_main(tab_name: str) -> List[Dict[str, Any]]:
     sh = open_main_sheet()
     ws = sh.worksheet(tab_name)
-    # get_all_records() usa la fila 1 como encabezados
     return ws.get_all_records()
 
 
 def read_records_manual_ws(ws: gspread.Worksheet, header_row: int = 1, data_start_row: int = 2) -> List[Dict[str, Any]]:
     """
     Lectura manual:
-    - headers desde header_row
-    - datos desde data_start_row
-    Esto permite tener una fila 2 "en español" sin romper el parseo.
+      - headers desde header_row
+      - datos desde data_start_row
+
+    Esto permite tener fila 2 en español (solo descriptiva) sin romper el código.
     """
     values = ws.get_all_values()
     if len(values) < header_row:
         return []
 
     headers = values[header_row - 1]
-    headers_norm = [h.strip() for h in headers]
+    headers = [h.strip() for h in headers]
 
     out: List[Dict[str, Any]] = []
     for row in values[data_start_row - 1:]:
-        # si la fila está completamente vacía, saltar
-        if not any(cell.strip() for cell in row):
+        if not any((cell or "").strip() for cell in row):
             continue
 
         rec: Dict[str, Any] = {}
-        for i, key in enumerate(headers_norm):
+        for i, key in enumerate(headers):
             if not key:
                 continue
             rec[key] = row[i].strip() if i < len(row) else ""
@@ -120,69 +128,67 @@ def read_records_from_tenant_sheet(tenant_sheet_id: str, tab_name: str, header_r
     ws = sh.worksheet(tab_name)
     return read_records_manual_ws(ws, header_row=header_row, data_start_row=data_start_row)
 
+
 # =========================
 # LOADERS
 # =========================
 def load_tenants() -> Dict[str, Dict[str, Any]]:
-    rows = read_records(TAB_TENANTS)
+    rows = read_records_main(TAB_TENANTS)
+
     out: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         tid = norm(r.get("tenant_id", "")).lower()
         if not tid:
             continue
 
-        # Normalizamos flags para que TRUE/FALSE funcionen aunque vengan como bool
-        r["bookings_enabled_bool"] = as_bool(r.get("bookings_enabled", False))
-        r["orders_enabled_bool"] = as_bool(r.get("orders_enabled", False))
-        r["active_bool"] = as_bool(r.get("active", True))
+        # ✅ AQUÍ ESTÁ LA CLAVE: convertimos TRUE/FALSE a bool real
+        r["bookings_enabled_bool"] = as_bool(r.get("bookings_enabled"))
+        r["orders_enabled_bool"] = as_bool(r.get("orders_enabled"))
+        r["active_bool"] = as_bool(r.get("active"))
 
         out[tid] = r
+
     return out
 
 
 def load_defaults(scope: Optional[str] = None) -> Dict[str, str]:
-    """
-    Defaults sheet:
-      scope | key | value
-    """
-    rows = read_records(TAB_DEFAULTS)
+    rows = read_records_main(TAB_DEFAULTS)
     d: Dict[str, str] = {}
+
     for r in rows:
         sc = norm(r.get("scope", "")).lower()
         k = norm(r.get("key", ""))
         v = norm(r.get("value", ""))
+
         if not sc or not k:
             continue
         if scope and sc != scope.lower():
             continue
+
         d[k] = v
+
     return d
 
 
 def load_booking_rules_for_tenant(tenant_id: str) -> Dict[str, str]:
-    """
-    BookingRules sheet:
-      tenant_id | rule_key | value
-    """
-    rows = read_records(TAB_RULES)
+    rows = read_records_main(TAB_RULES)
     rules: Dict[str, str] = {}
     tid = tenant_id.lower().strip()
+
     for r in rows:
         r_tid = norm(r.get("tenant_id", "")).lower()
         if r_tid != tid:
             continue
+
         key = norm(r.get("rule_key", ""))
         val = norm(r.get("value", ""))
         if key:
             rules[key] = val
+
     return rules
 
 
 def get_effective_rules(tenant_id: str) -> Dict[str, Any]:
-    """
-    Priority:
-      BookingRules(tenant) > Defaults(scope=booking_rule)
-    """
     defaults = load_defaults(scope="booking_rule")
     overrides = load_booking_rules_for_tenant(tenant_id)
 
@@ -192,28 +198,28 @@ def get_effective_rules(tenant_id: str) -> Dict[str, Any]:
 
 
 def load_content_for_tenant(tenant_id: str) -> Dict[str, Dict[str, str]]:
-    """
-    Content sheet:
-      tenant_id | content_key | type | value
-    Returns dict: {content_key: {"type":..., "value":...}}
-    """
-    rows = read_records(TAB_CONTENT)
+    rows = read_records_main(TAB_CONTENT)
     out: Dict[str, Dict[str, str]] = {}
     tid = tenant_id.lower().strip()
+
     for r in rows:
         r_tid = norm(r.get("tenant_id", "")).lower()
         if r_tid != tid:
             continue
+
         ck = norm(r.get("content_key", ""))
         tp = norm(r.get("type", "")).lower()
         val = norm(r.get("value", ""))
+
         if not ck:
             continue
         out[ck] = {"type": tp, "value": val}
+
     return out
 
+
 # =========================
-# ENDPOINTS (E2.1)
+# ENDPOINTS
 # =========================
 @app.get("/")
 def root():
@@ -228,7 +234,7 @@ def debug_tenants():
             "ok": True,
             "count": len(tenants),
             "tenant_ids": sorted(list(tenants.keys())),
-            "sample": tenants.get("resto_demo")  # útil para ver flags
+            "sample": tenants.get("resto_demo"),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -287,17 +293,10 @@ def debug_content(tenant_id: str):
 
 
 # =========================
-# ORDERS: MENU (E2.2)
+# MENU (Orders)
 # =========================
 @app.get("/menu")
 def get_menu(tenant_id: str):
-    """
-    Lee el menú del tenant desde su orders_sheet_id.
-    Respeta tu diseño:
-      - Fila 1: headers en inglés (sku,name,price,active,category)
-      - Fila 2: explicación en español (se ignora)
-      - Fila 3+: data real
-    """
     tenants = load_tenants()
     tid = tenant_id.lower().strip()
 
@@ -309,6 +308,7 @@ def get_menu(tenant_id: str):
     if not t.get("active_bool", True):
         raise HTTPException(status_code=400, detail=f"Tenant inactive: {tid}")
 
+    # ✅ aquí usamos el boolean ya convertido
     if not t.get("orders_enabled_bool", False):
         raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {tid}")
 
@@ -316,7 +316,9 @@ def get_menu(tenant_id: str):
     if not orders_sheet_id:
         raise HTTPException(status_code=400, detail=f"Missing orders_sheet_id for tenant: {tid}")
 
-    # Menu: headers fila 1, datos desde fila 3
+    # ✅ Fila 1: headers (inglés)
+    # ✅ Fila 2: descripción en español (se ignora)
+    # ✅ Fila 3+: data real
     rows = read_records_from_tenant_sheet(
         tenant_sheet_id=orders_sheet_id,
         tab_name=TAB_MENU,
@@ -324,18 +326,23 @@ def get_menu(tenant_id: str):
         data_start_row=3
     )
 
-    # Filtrar solo active=TRUE (pero soporta bool/string)
-    items = []
+    items: List[Dict[str, Any]] = []
     for r in rows:
         if as_bool(r.get("active", False)):
+            price_raw = norm(r.get("price", "0")) or "0"
+            try:
+                price = float(price_raw)
+            except Exception:
+                price = 0.0
+
             items.append({
                 "sku": norm(r.get("sku", "")),
                 "name": norm(r.get("name", "")),
-                "price": float(norm(r.get("price", "0")) or 0),
+                "price": price,
                 "category": norm(r.get("category", "")),
             })
 
-    # Agrupar por categoría
+    # agrupar por categoría
     categories: Dict[str, List[Dict[str, Any]]] = {}
     for it in items:
         cat = it.get("category") or "Otros"
