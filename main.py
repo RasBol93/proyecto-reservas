@@ -2,309 +2,458 @@ import os
 import json
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
 import gspread
 from google.oauth2.service_account import Credentials
-from google.auth.transport.requests import AuthorizedSession
-from gspread.client import Client
+
 
 # =========================
-# CONFIG (ENV VARS)
+# CONFIG
 # =========================
-TENANTS_SHEET_ID = os.getenv("TENANTS_SHEET_ID", "").strip()  # Spreadsheet config (reservaciones_config)
-GCP_CREDENTIALS_JSON = os.getenv("GCP_CREDENTIALS_JSON", "").strip()
-
-TAB_TENANTS = os.getenv("TAB_TENANTS", "Tenants").strip()
-
-# Dentro del spreadsheet de cada tenant (orders_sheet_id)
-TAB_MENU = os.getenv("TAB_MENU", "Menu").strip()
-TAB_ORDERS = os.getenv("TAB_ORDERS", "Orders").strip()
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive",
 ]
 
-app = FastAPI()
+# Tenants demo (edita aquí los Sheet IDs reales por tenant)
+TENANTS: Dict[str, Dict[str, Any]] = {
+    "resto_demo": {
+        "tenant_id": "resto_demo",
+        "name": "Resto Demo",
+        "business_type": "restaurant",
+        # Sheet con pestañas: "Menu" y "Orders"
+        # (en tu caso se llama orders_resto_demo, pero el ID es lo importante)
+        "orders_sheet_id": "IRVsxDn7kPx_OVDvs99Gn0T3G7ia7NO5juAjS9MGofd4",
+        "timezone": "America/La_Paz",
+        "active": "TRUE",
+        "orders_enabled": "TRUE",
+        "bookings_enabled": "TRUE",
+        "admin_chat_id": "",
+        "admin_whatsapp": "",
+        "bot_token": "",
+        "webhook_secret": "",
+    },
+    "salon_demo": {
+        "tenant_id": "salon_demo",
+        "name": "Salon Demo",
+        "business_type": "salon",
+        "orders_sheet_id": "",
+        "timezone": "America/La_Paz",
+        "active": "TRUE",
+        "orders_enabled": "FALSE",
+        "bookings_enabled": "TRUE",
+        "admin_chat_id": "",
+        "admin_whatsapp": "",
+        "bot_token": "",
+        "webhook_secret": "",
+    },
+    "spa_demo": {
+        "tenant_id": "spa_demo",
+        "name": "Spa Demo",
+        "business_type": "spa",
+        "orders_sheet_id": "",
+        "timezone": "America/La_Paz",
+        "active": "TRUE",
+        "orders_enabled": "FALSE",
+        "bookings_enabled": "TRUE",
+        "admin_chat_id": "",
+        "admin_whatsapp": "",
+        "bot_token": "",
+        "webhook_secret": "",
+    },
+}
 
 
 # =========================
-# HELPERS
+# FASTAPI
 # =========================
-def _require_env():
-    if not TENANTS_SHEET_ID:
-        raise RuntimeError("Missing TENANTS_SHEET_ID env var")
-    if not GCP_CREDENTIALS_JSON:
-        raise RuntimeError("Missing GCP_CREDENTIALS_JSON env var")
+
+app = FastAPI(title="Proyecto Reservas + Orders API", version="1.0.0")
 
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# =========================
+# MODELS
+# =========================
+
+class OrderItemIn(BaseModel):
+    sku: str
+    qty: int = Field(..., ge=1, le=50)
 
 
-def norm(v: Any) -> str:
-    return str(v).strip() if v is not None else ""
+class CreateOrderIn(BaseModel):
+    tenant_id: str
+    customer_name: str
+    customer_contact: str
+    delivery_type: str = Field(..., description="pickup o delivery (texto libre permitido)")
+    requested_time: str = Field(..., description="Texto libre, ej: 'ahora' o '19:30'")
+    items: List[OrderItemIn]
+    notes: str = ""
+    source: str = "api"
 
 
-def parse_bool(v: Any) -> bool:
-    """
-    Convierte valores típicos de Google Sheets a booleano.
-    Acepta: TRUE/FALSE, true/false, 1/0, yes/no, y/n, si/no, etc.
-    """
-    if v is None:
-        return False
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    if s in ("true", "1", "yes", "y", "si", "sí", "on"):
-        return True
-    if s in ("false", "0", "no", "n", "off", ""):
-        return False
-    return False
+class CreateOrderOut(BaseModel):
+    ok: bool
+    tenant_id: str
+    order_id: str
+    status: str
+    total_amount: float
 
 
-def get_gspread_client() -> Client:
-    """
-    Cliente gspread robusto (google-auth).
-    Evita problemas raros con gspread.authorize en algunos entornos.
-    """
-    _require_env()
-    info = json.loads(GCP_CREDENTIALS_JSON)
+class MarkPaidIn(BaseModel):
+    tenant_id: str
+    order_id: str
+
+
+class MarkPaidOut(BaseModel):
+    ok: bool
+    tenant_id: str
+    order_id: str
+    new_status: str
+
+
+# =========================
+# HELPERS - AUTH / CLIENT
+# =========================
+
+def get_gspread_client() -> gspread.client.Client:
+    creds_json = os.getenv("GCP_CREDENTIALS_JSON", "").strip()
+    if not creds_json:
+        raise RuntimeError("Missing env var GCP_CREDENTIALS_JSON")
+
+    try:
+        info = json.loads(creds_json)
+    except Exception as e:
+        raise RuntimeError(f"Invalid GCP_CREDENTIALS_JSON: {e}")
+
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
-    session = AuthorizedSession(creds)
-    gc = Client(auth=creds)
-    gc.session = session
-    return gc
-
-
-def open_sheet_by_id(sheet_id: str):
-    gc = get_gspread_client()
-    return gc.open_by_key(sheet_id)
-
-
-def ws_read_records(ws, header_row: int, start_row: int) -> List[Dict[str, Any]]:
-    """
-    Lee una worksheet:
-      - header_row: fila donde están encabezados (1)
-      - start_row: primera fila de datos (2 o 3)
-    """
-    values = ws.get_all_values()
-    if not values or len(values) < header_row:
-        return []
-
-    headers = [h.strip() for h in values[header_row - 1]]
-    if not any(headers):
-        return []
-
-    if len(values) < start_row:
-        return []
-
-    out: List[Dict[str, Any]] = []
-    for row in values[start_row - 1:]:
-        if not any(cell.strip() for cell in row):
-            continue
-        row_extended = row + [""] * (len(headers) - len(row))
-        item = {headers[i]: row_extended[i].strip() for i in range(len(headers))}
-        out.append(item)
-    return out
-
-
-def ws_get_headers(ws) -> List[str]:
-    values = ws.get_all_values()
-    if not values:
-        return []
-    return [h.strip() for h in values[0]]
-
-
-def find_col_index(headers: List[str], name: str) -> int:
-    """
-    Devuelve índice 1-based (como usa gspread) para un header.
-    """
-    target = name.strip().lower()
-    for i, h in enumerate(headers):
-        if h.strip().lower() == target:
-            return i + 1
-    return -1
+    return gspread.Client(auth=creds)
 
 
 # =========================
-# TENANTS
+# HELPERS - TENANTS
 # =========================
-def load_tenants() -> Dict[str, Dict[str, Any]]:
-    sh = open_sheet_by_id(TENANTS_SHEET_ID)
-    ws = sh.worksheet(TAB_TENANTS)
 
-    # Tenants: headers fila 1, datos desde fila 2
-    rows = ws_read_records(ws, header_row=1, start_row=2)
-
-    out: Dict[str, Dict[str, Any]] = {}
-    for r in rows:
-        tid = norm(r.get("tenant_id")).lower()
-        if not tid:
-            continue
-
-        # booleans robustos
-        r["active_bool"] = parse_bool(r.get("active"))
-        r["orders_enabled_bool"] = parse_bool(r.get("orders_enabled"))
-        r["bookings_enabled_bool"] = parse_bool(r.get("bookings_enabled"))
-
-        out[tid] = r
-    return out
-
-
-def get_tenant_or_404(tenant_id: str) -> Dict[str, Any]:
-    tenants = load_tenants()
-    tid = tenant_id.strip().lower()
-    if tid not in tenants:
-        raise HTTPException(status_code=404, detail=f"Unknown tenant_id: {tid}")
-    t = tenants[tid]
-    if not t.get("active_bool", True):
-        raise HTTPException(status_code=400, detail=f"Tenant inactive: {tid}")
+def get_tenant(tenant_id: str) -> Dict[str, Any]:
+    t = TENANTS.get(tenant_id)
+    if not t:
+        raise HTTPException(status_code=404, detail=f"Unknown tenant_id: {tenant_id}")
+    if str(t.get("active", "TRUE")).upper() != "TRUE":
+        raise HTTPException(status_code=400, detail=f"Tenant inactive: {tenant_id}")
     return t
 
 
-def get_orders_sheet_id_or_400(tenant: Dict[str, Any]) -> str:
-    sid = norm(tenant.get("orders_sheet_id"))
-    if not sid:
-        raise HTTPException(status_code=400, detail=f"orders_sheet_id missing for tenant: {tenant.get('tenant_id')}")
-    return sid
+def ensure_orders_enabled(tenant: Dict[str, Any]) -> None:
+    if str(tenant.get("orders_enabled", "FALSE")).upper() != "TRUE":
+        raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {tenant['tenant_id']}")
+    if not tenant.get("orders_sheet_id"):
+        raise HTTPException(status_code=400, detail=f"orders_sheet_id not configured for tenant: {tenant['tenant_id']}")
 
 
 # =========================
-# ENDPOINTS
+# HELPERS - SHEETS PARSING
 # =========================
+
+REQUIRED_MENU_HEADERS = ["sku", "name", "price", "active", "category"]
+REQUIRED_ORDERS_HEADERS = [
+    "order_id", "created_at", "tenant_id", "customer_name", "customer_contact",
+    "items", "notes", "delivery_type", "requested_time", "status", "source", "total_amount"
+]
+
+def normalize(s: Any) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    # normalización simple suficiente para headers técnicos exactos
+    return s
+
+
+def detect_header_row(values: List[List[Any]], required_headers: List[str], max_scan: int = 10) -> int:
+    """
+    Devuelve el índice (0-based) de la fila que contiene todos los required_headers.
+    """
+    req = set(required_headers)
+    for i, row in enumerate(values[:max_scan]):
+        norm = [normalize(x) for x in row]
+        if req.issubset(set(norm)):
+            return i
+    return -1
+
+
+def read_records_manual(ws: gspread.Worksheet, required_headers: List[str]) -> List[Dict[str, Any]]:
+    values = ws.get_all_values()
+    if not values:
+        return []
+
+    header_idx = detect_header_row(values, required_headers)
+    if header_idx == -1:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Header row not found in worksheet '{ws.title}'. Required: {required_headers}"
+        )
+
+    headers = [normalize(h) for h in values[header_idx]]
+    header_pos = {h: idx for idx, h in enumerate(headers) if h}
+
+    records: List[Dict[str, Any]] = []
+    for row in values[header_idx + 1:]:
+        if not any(str(c).strip() for c in row):
+            continue
+        rec: Dict[str, Any] = {}
+        for h in required_headers:
+            idx = header_pos.get(h)
+            rec[h] = row[idx] if idx is not None and idx < len(row) else ""
+        records.append(rec)
+    return records
+
+
+def get_worksheet_by_title_or_first(sh: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
+    try:
+        return sh.worksheet(title)
+    except Exception:
+        # fallback: primera hoja
+        return sh.get_worksheet(0)
+
+
+# =========================
+# BUSINESS LOGIC - MENU
+# =========================
+
+def parse_price_to_float(p: Any) -> float:
+    """
+    Acepta '32', '32.5', '32,5', 'Bs 32' (intentando limpiar).
+    """
+    if p is None:
+        return 0.0
+    s = str(p).strip()
+    s = s.replace("Bs", "").replace("bs", "").replace(" ", "")
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except:
+        return 0.0
+
+
+def load_menu_items(client: gspread.client.Client, tenant: Dict[str, Any]) -> List[Dict[str, Any]]:
+    sh = client.open_by_key(tenant["orders_sheet_id"])
+    ws = get_worksheet_by_title_or_first(sh, "Menu")
+    records = read_records_manual(ws, REQUIRED_MENU_HEADERS)
+
+    # Importante: solo activos (TRUE). La fila 2 en español NO debe tener active=TRUE.
+    items = []
+    for r in records:
+        active = str(r.get("active", "")).strip().upper()
+        if active == "TRUE":
+            items.append({
+                "sku": str(r.get("sku", "")).strip(),
+                "name": str(r.get("name", "")).strip(),
+                "price": str(r.get("price", "")).strip(),
+                "active": "TRUE",
+                "category": str(r.get("category", "")).strip(),
+            })
+    return items
+
+
+def build_price_map(menu_items: List[Dict[str, Any]]) -> Dict[str, float]:
+    mp: Dict[str, float] = {}
+    for it in menu_items:
+        sku = str(it.get("sku", "")).strip()
+        mp[sku] = parse_price_to_float(it.get("price", "0"))
+    return mp
+
+
+def calc_total_amount(items: List[OrderItemIn], price_map: Dict[str, float]) -> float:
+    total = 0.0
+    for it in items:
+        if it.sku not in price_map:
+            raise HTTPException(status_code=400, detail=f"Unknown sku in order: {it.sku}")
+        total += price_map[it.sku] * int(it.qty)
+    # redondeo a 2 decimales (puedes cambiarlo)
+    return round(total, 2)
+
+
+# =========================
+# BUSINESS LOGIC - ORDERS
+# =========================
+
+def ensure_orders_sheet_headers(ws: gspread.Worksheet) -> None:
+    """
+    Si la hoja está vacía, crea headers técnicos en fila 1.
+    Si ya existe, valida que estén (de forma flexible) detectándolos.
+    """
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(REQUIRED_ORDERS_HEADERS)
+        return
+
+    idx = detect_header_row(values, REQUIRED_ORDERS_HEADERS)
+    if idx == -1:
+        # Si hay algo pero no hay headers técnicos detectables, no tocamos para no romper.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Orders sheet '{ws.title}' missing required headers: {REQUIRED_ORDERS_HEADERS}"
+        )
+
+
+def append_order_row(
+    client: gspread.client.Client,
+    tenant: Dict[str, Any],
+    order_id: str,
+    payload: CreateOrderIn,
+    status: str,
+    total_amount: float,
+) -> None:
+    sh = client.open_by_key(tenant["orders_sheet_id"])
+    ws = get_worksheet_by_title_or_first(sh, "Orders")
+    ensure_orders_sheet_headers(ws)
+
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    # Items en texto (como tu ejemplo)
+    items_text = str([{"sku": it.sku, "qty": it.qty} for it in payload.items])
+
+    row = [
+        order_id,
+        created_at,
+        payload.tenant_id,
+        payload.customer_name,
+        payload.customer_contact,
+        items_text,
+        payload.notes,
+        payload.delivery_type,
+        payload.requested_time,
+        status,
+        payload.source,
+        str(total_amount),
+    ]
+    ws.append_row(row, value_input_option="RAW")
+
+
+def find_order_row_index(ws: gspread.Worksheet, order_id: str) -> Optional[int]:
+    """
+    Busca order_id y devuelve el índice de fila (1-based en Sheets).
+    """
+    values = ws.get_all_values()
+    if not values:
+        return None
+
+    header_idx = detect_header_row(values, REQUIRED_ORDERS_HEADERS)
+    if header_idx == -1:
+        return None
+
+    headers = [normalize(h) for h in values[header_idx]]
+    try:
+        col_order_id = headers.index("order_id") + 1  # 1-based
+        # Buscar desde header+2 hacia abajo
+        for i in range(header_idx + 2, len(values) + 1):
+            cell_val = ws.cell(i, col_order_id).value
+            if str(cell_val).strip() == order_id:
+                return i
+    except:
+        return None
+    return None
+
+
+def update_order_status(
+    client: gspread.client.Client,
+    tenant: Dict[str, Any],
+    order_id: str,
+    new_status: str,
+) -> None:
+    sh = client.open_by_key(tenant["orders_sheet_id"])
+    ws = get_worksheet_by_title_or_first(sh, "Orders")
+
+    values = ws.get_all_values()
+    if not values:
+        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+
+    header_idx = detect_header_row(values, REQUIRED_ORDERS_HEADERS)
+    if header_idx == -1:
+        raise HTTPException(status_code=500, detail="Orders headers not found")
+
+    headers = [normalize(h) for h in values[header_idx]]
+    if "status" not in headers:
+        raise HTTPException(status_code=500, detail="Orders sheet missing 'status' column")
+
+    row_idx = find_order_row_index(ws, order_id)
+    if not row_idx:
+        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+
+    col_status = headers.index("status") + 1
+    ws.update_cell(row_idx, col_status, new_status)
+
+
+# =========================
+# ROUTES
+# =========================
+
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "proyecto-reservas", "ts": utc_now_iso()}
+    return {"ok": True, "service": "proyecto-reservas", "version": "1.0.0"}
 
 
 @app.get("/debug/tenants")
 def debug_tenants():
-    tenants = load_tenants()
-    sample_key = sorted(list(tenants.keys()))[0] if tenants else None
-    sample = tenants.get(sample_key) if sample_key else None
-    return {"ok": True, "count": len(tenants), "tenant_ids": sorted(list(tenants.keys())), "sample": sample}
+    tenant_ids = list(TENANTS.keys())
+    sample = TENANTS[tenant_ids[0]] if tenant_ids else {}
+    # añade flags bool para debug
+    sample_out = dict(sample)
+    sample_out["active_bool"] = str(sample_out.get("active", "FALSE")).upper() == "TRUE"
+    sample_out["orders_enabled_bool"] = str(sample_out.get("orders_enabled", "FALSE")).upper() == "TRUE"
+    sample_out["bookings_enabled_bool"] = str(sample_out.get("bookings_enabled", "FALSE")).upper() == "TRUE"
+    return {"ok": True, "count": len(tenant_ids), "tenant_ids": tenant_ids, "sample": sample_out}
 
 
 @app.get("/menu")
 def get_menu(tenant_id: str):
-    tenant = get_tenant_or_404(tenant_id)
+    tenant = get_tenant(tenant_id)
+    ensure_orders_enabled(tenant)
 
-    # Si esto vuelve a fallar, será porque orders_enabled_bool quedó False
-    if not tenant.get("orders_enabled_bool", False):
-        raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {tenant_id}")
-
-    orders_sheet_id = get_orders_sheet_id_or_400(tenant)
-    sh_orders = open_sheet_by_id(orders_sheet_id)
-
-    try:
-        ws_menu = sh_orders.worksheet(TAB_MENU)
-    except Exception:
-        raise HTTPException(status_code=404, detail=f"Menu tab not found in tenant sheet: {TAB_MENU}")
-
-    # Menu: headers fila 1, fila 2 descriptiva, datos reales desde fila 3
-    rows = ws_read_records(ws_menu, header_row=1, start_row=3)
-
-    items = []
-    for r in rows:
-        if parse_bool(r.get("active")):
-            items.append(r)
-
+    client = get_gspread_client()
+    items = load_menu_items(client, tenant)
     return {"ok": True, "tenant_id": tenant_id, "count": len(items), "items": items}
 
 
-@app.post("/orders/create")
-def create_order(payload: Dict[str, Any]):
-    tenant_id = norm(payload.get("tenant_id")).lower()
-    if not tenant_id:
-        raise HTTPException(status_code=400, detail="tenant_id is required")
+@app.post("/orders/create", response_model=CreateOrderOut)
+def create_order(payload: CreateOrderIn):
+    tenant = get_tenant(payload.tenant_id)
+    ensure_orders_enabled(tenant)
 
-    tenant = get_tenant_or_404(tenant_id)
-    if not tenant.get("orders_enabled_bool", False):
-        raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {tenant_id}")
+    client = get_gspread_client()
 
-    orders_sheet_id = get_orders_sheet_id_or_400(tenant)
-    sh_orders = open_sheet_by_id(orders_sheet_id)
+    # 1) cargar menú + mapa de precios
+    menu_items = load_menu_items(client, tenant)
+    price_map = build_price_map(menu_items)
 
-    try:
-        ws_orders = sh_orders.worksheet(TAB_ORDERS)
-    except Exception:
-        raise HTTPException(status_code=404, detail=f"Orders tab not found in tenant sheet: {TAB_ORDERS}")
+    # 2) calcular total_amount
+    total_amount = calc_total_amount(payload.items, price_map)
 
-    headers = ws_get_headers(ws_orders)
-    if not headers or not any(headers):
-        raise HTTPException(status_code=400, detail="Orders sheet has no headers in row 1")
+    # 3) crear order_id + status
+    order_id = uuid.uuid4().hex[:7]
+    status = "PENDING_PAYMENT"
 
-    order_id = norm(payload.get("order_id")) or str(uuid.uuid4())[:8]
+    # 4) guardar en Orders (incluye total_amount)
+    append_order_row(client, tenant, order_id, payload, status, total_amount)
 
-    record = {
-        "order_id": order_id,
-        "created_at": utc_now_iso(),
-        "tenant_id": tenant_id,
-        "customer_name": norm(payload.get("customer_name")),
-        "customer_contact": norm(payload.get("customer_contact")),
-        "items": norm(payload.get("items")),  # texto o json string
-        "notes": norm(payload.get("notes")),
-        "delivery_type": norm(payload.get("delivery_type")) or "pickup",
-        "requested_time": norm(payload.get("requested_time")),
-        "status": "PENDING_PAYMENT",
-        "source": norm(payload.get("source")) or "telegram",
-        "total_amount": norm(payload.get("total_amount")),
-    }
-
-    # Construimos la fila en el orden exacto de los headers
-    row = [record.get(h.strip(), "") for h in headers]
-    ws_orders.append_row(row, value_input_option="USER_ENTERED")
-
-    return {"ok": True, "tenant_id": tenant_id, "order_id": order_id, "status": "PENDING_PAYMENT"}
+    return CreateOrderOut(
+        ok=True,
+        tenant_id=payload.tenant_id,
+        order_id=order_id,
+        status=status,
+        total_amount=total_amount,
+    )
 
 
-@app.post("/orders/mark_paid")
-def mark_order_paid(payload: Dict[str, Any]):
-    tenant_id = norm(payload.get("tenant_id")).lower()
-    order_id = norm(payload.get("order_id"))
-    if not tenant_id or not order_id:
-        raise HTTPException(status_code=400, detail="tenant_id and order_id are required")
+@app.post("/orders/mark_paid", response_model=MarkPaidOut)
+def mark_paid(payload: MarkPaidIn):
+    tenant = get_tenant(payload.tenant_id)
+    ensure_orders_enabled(tenant)
 
-    tenant = get_tenant_or_404(tenant_id)
-    if not tenant.get("orders_enabled_bool", False):
-        raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {tenant_id}")
+    client = get_gspread_client()
+    update_order_status(client, tenant, payload.order_id, "PAID")
 
-    orders_sheet_id = get_orders_sheet_id_or_400(tenant)
-    sh_orders = open_sheet_by_id(orders_sheet_id)
-
-    try:
-        ws_orders = sh_orders.worksheet(TAB_ORDERS)
-    except Exception:
-        raise HTTPException(status_code=404, detail=f"Orders tab not found in tenant sheet: {TAB_ORDERS}")
-
-    values = ws_orders.get_all_values()
-    if len(values) < 3:
-        raise HTTPException(status_code=400, detail="Orders sheet has no data rows (expected row 3+)")
-
-    headers = [h.strip() for h in values[0]]
-    col_order_id = find_col_index(headers, "order_id")
-    col_status = find_col_index(headers, "status")
-
-    if col_order_id == -1:
-        raise HTTPException(status_code=400, detail="Orders sheet missing 'order_id' header in row 1")
-    if col_status == -1:
-        raise HTTPException(status_code=400, detail="Orders sheet missing 'status' header in row 1")
-
-    # Orders: datos reales desde fila 3 (fila 2 es descriptiva)
-    found_row_idx = -1
-    for i in range(2, len(values)):  # i=2 corresponde a fila 3
-        row = values[i]
-        # aseguramos largo suficiente
-        row_extended = row + [""] * (len(headers) - len(row))
-        if row_extended[col_order_id - 1].strip() == order_id:
-            found_row_idx = i + 1  # convertir índice de lista a fila real (1-based)
-            break
-
-    if found_row_idx == -1:
-        raise HTTPException(status_code=404, detail=f"order_id not found: {order_id}")
-
-    ws_orders.update_cell(found_row_idx, col_status, "PAID")
-    return {"ok": True, "tenant_id": tenant_id, "order_id": order_id, "new_status": "PAID"}
+    return MarkPaidOut(ok=True, tenant_id=payload.tenant_id, order_id=payload.order_id, new_status="PAID")
