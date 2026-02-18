@@ -2,7 +2,7 @@ import os
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import gspread
 from fastapi import FastAPI, HTTPException, Query
@@ -16,6 +16,12 @@ APP_NAME = "proyecto-reservas"
 
 ENV_CONFIG_SPREADSHEET_ID = "RESERVACIONES_CONFIG"  # <- ID del spreadsheet "reservaciones_config"
 ENV_GCP_CREDS_JSON = "GCP_CREDENTIALS_JSON"          # <- JSON service account (string)
+ENV_ADMIN_TOKEN = "ADMIN_TOKEN"                      # <- token simple para endpoints admin
+
+MAX_ITEMS_PER_ORDER = 30
+MAX_NAME_LEN = 80
+MAX_CONTACT_LEN = 30
+MAX_NOTES_LEN = 500
 
 
 def now_iso_utc() -> str:
@@ -35,7 +41,6 @@ def normalize(s: Any) -> str:
     if s is None:
         return ""
     s = str(s).strip().lower()
-    # quitar tildes simple
     replacements = {
         "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u",
         "ä": "a", "ë": "e", "ï": "i", "ö": "o", "ü": "u",
@@ -43,32 +48,31 @@ def normalize(s: Any) -> str:
     }
     for a, b in replacements.items():
         s = s.replace(a, b)
-    # quitar puntuación
     s = re.sub(r"[^\w\s-]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
+def log_event(event: str, **fields: Any) -> None:
+    """
+    Logging mínimo en stdout (Render lo captura).
+    Evita loguear secretos.
+    """
+    safe = {k: v for k, v in fields.items() if k not in ("creds", "token")}
+    print(json.dumps({"ts": now_iso_utc(), "event": event, **safe}, ensure_ascii=False))
+
+
 def detect_header_row(values: List[List[Any]], required_headers: List[str], max_scan: int = 10) -> int:
-    """
-    Detecta en qué fila (1-indexed) están los headers técnicos.
-    Busca en las primeras max_scan filas.
-    """
     req = [normalize(h) for h in required_headers]
     scan = values[:max_scan]
     for idx, row in enumerate(scan, start=1):
         row_norm = [normalize(x) for x in row]
         if all(h in row_norm for h in req):
             return idx
-    # fallback: fila 1
     return 1
 
 
 def read_records_manual(ws: gspread.Worksheet, required_headers: List[str]) -> List[Dict[str, Any]]:
-    """
-    Lee todos los registros de una worksheet detectando headers.
-    Devuelve lista de dicts (header -> value).
-    """
     values = ws.get_all_values()
     if not values:
         return []
@@ -93,7 +97,6 @@ def get_gspread_client() -> gspread.Client:
     creds = os.getenv(ENV_GCP_CREDS_JSON, "").strip()
     if not creds:
         raise RuntimeError(f"Missing env var: {ENV_GCP_CREDS_JSON}")
-
     try:
         info = json.loads(creds)
     except Exception as e:
@@ -103,15 +106,13 @@ def get_gspread_client() -> gspread.Client:
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    gc = gspread.service_account_from_dict(info, scopes=scopes)
-    return gc
+    return gspread.service_account_from_dict(info, scopes=scopes)
 
 
 def get_config_spreadsheet(gc: gspread.Client) -> gspread.Spreadsheet:
     sid = os.getenv(ENV_CONFIG_SPREADSHEET_ID, "").strip()
     if not sid:
         raise RuntimeError(f"Missing env var: {ENV_CONFIG_SPREADSHEET_ID}")
-
     try:
         return gc.open_by_key(sid)
     except gspread.exceptions.SpreadsheetNotFound:
@@ -128,7 +129,7 @@ def get_ws(spreadsheet: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
         raise RuntimeError(f"No existe la pestaña '{title}' en el spreadsheet '{spreadsheet.title}'")
 
 
-# Cache simple en memoria (opcional)
+# Cache simple en memoria
 _TENANTS_CACHE: Dict[str, Dict[str, Any]] = {}
 _TENANTS_CACHE_AT: Optional[str] = None
 
@@ -162,7 +163,7 @@ def load_tenants(gc: gspread.Client, force: bool = False) -> Dict[str, Dict[str,
             "orders_enabled": to_bool(r.get("orders_enabled", "")),
             "bot_token": r.get("bot_token", ""),
             "webhook_secret": r.get("webhook_secret", ""),
-            "admin_chat_id": r.get("admin_chat_id", ""),
+            "admin_chat_id": str(r.get("admin_chat_id", "")).strip(),
             "timezone": r.get("timezone", "America/La_Paz"),
             "active": to_bool(r.get("active", "")),
             "admin_whatsapp": r.get("admin_whatsapp", ""),
@@ -170,6 +171,7 @@ def load_tenants(gc: gspread.Client, force: bool = False) -> Dict[str, Dict[str,
 
     _TENANTS_CACHE = tenants
     _TENANTS_CACHE_AT = now_iso_utc()
+    log_event("tenants_loaded", cached_at=_TENANTS_CACHE_AT, tenants_count=len(tenants))
     return tenants
 
 
@@ -210,7 +212,6 @@ def load_menu_index(orders_sh: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]
         if not sku:
             continue
 
-        # Importante: fila 2 (human) debe tener active != TRUE para no entrar aquí
         if not to_bool(r.get("active", "")):
             continue
 
@@ -218,7 +219,6 @@ def load_menu_index(orders_sh: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]
         try:
             price = float(price_raw)
         except Exception:
-            # si el precio no es número, ignoramos
             continue
 
         idx[sku] = {
@@ -233,7 +233,7 @@ def load_menu_index(orders_sh: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]
 
 def group_menu_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     cats: Dict[str, List[Dict[str, Any]]] = {}
-    for sku, item in menu_idx.items():
+    for _, item in menu_idx.items():
         cat = item.get("category", "") or "Otros"
         cats.setdefault(cat, []).append({
             "sku": item["sku"],
@@ -241,7 +241,6 @@ def group_menu_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, Lis
             "price": item.get("price", 0),
             "category": cat,
         })
-    # orden por nombre dentro de categoría
     for cat in cats:
         cats[cat] = sorted(cats[cat], key=lambda x: normalize(x.get("name", "")))
     return cats
@@ -268,7 +267,6 @@ def calc_total_amount(items: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str,
         price = float(menu_idx[sku]["price"])
         total += price * qty_i
 
-    # Si trabajas con enteros (BOB), devolvemos redondeo a 2 decimales
     return round(total, 2)
 
 
@@ -288,8 +286,7 @@ def ensure_orders_headers(ws: gspread.Worksheet, required: List[str]) -> List[st
     if missing:
         raise HTTPException(
             status_code=500,
-            detail=f"Orders sheet missing required headers in row 1: {missing}. "
-                   f"Headers actuales: {headers}"
+            detail=f"Orders sheet missing required headers in row 1: {missing}. Headers actuales: {headers}"
         )
     return headers_norm
 
@@ -309,7 +306,7 @@ def append_order_row(
     total_amount: float,
 ):
     ws = get_ws(orders_sh, "Orders")
-    headers_norm = ensure_orders_headers(
+    ensure_orders_headers(
         ws,
         required=[
             "order_id", "created_at", "tenant_id", "customer_name", "customer_contact",
@@ -317,7 +314,6 @@ def append_order_row(
         ],
     )
 
-    # Armamos row respetando el orden de headers existentes
     created_at = now_iso_utc()
     payload_map: Dict[str, Any] = {
         "order_id": order_id,
@@ -334,7 +330,6 @@ def append_order_row(
         "total_amount": total_amount,
     }
 
-    # Fila con la misma cantidad de columnas que el header original (fila 1)
     header_raw = ws.row_values(1)
     row: List[Any] = []
     for h_raw in header_raw:
@@ -344,11 +339,16 @@ def append_order_row(
     ws.append_row(row, value_input_option="USER_ENTERED")
 
 
-def update_order_status(orders_sh: gspread.Spreadsheet, order_id: str, new_status: str) -> bool:
+def update_order_status(orders_sh: gspread.Spreadsheet, order_id: str, new_status: str) -> Dict[str, Any]:
+    """
+    Devuelve dict con:
+      found: bool
+      old_status: str
+    """
     ws = get_ws(orders_sh, "Orders")
     values = ws.get_all_values()
     if not values:
-        return False
+        return {"found": False}
 
     headers = values[0]
     headers_norm = [normalize(h) for h in headers]
@@ -362,24 +362,46 @@ def update_order_status(orders_sh: gspread.Spreadsheet, order_id: str, new_statu
     for r_idx in range(2, len(values) + 1):
         oid = ws.cell(r_idx, col_order_id).value
         if str(oid).strip() == order_id:
-            ws.update_cell(r_idx, col_status, new_status)
-            return True
-    return False
+            old_status = ws.cell(r_idx, col_status).value or ""
+            if normalize(old_status) != normalize(new_status):
+                ws.update_cell(r_idx, col_status, new_status)
+            return {"found": True, "old_status": old_status}
+    return {"found": False}
 
 
 def gen_order_id() -> str:
-    # simple id (hex corto)
     import secrets
     return secrets.token_hex(4)
+
+
+def validate_contact(contact: str) -> None:
+    c = contact.strip()
+    if len(c) > MAX_CONTACT_LEN:
+        raise HTTPException(status_code=422, detail="customer_contact too long")
+    if not re.match(r"^\+?\d{6,20}$", c):
+        raise HTTPException(status_code=422, detail="customer_contact must be digits (optionally starting with +)")
+
+
+def require_admin_token(token: str) -> None:
+    expected = os.getenv(ENV_ADMIN_TOKEN, "").strip()
+    if not expected:
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN is not configured in env")
+    if token.strip() != expected:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
 
 
 # =========================
 # API Models
 # =========================
 
+class AdminTokenIn(BaseModel):
+    token: str
+
+
 class OrderItem(BaseModel):
     sku: str = Field(..., min_length=1)
     qty: int = Field(..., ge=1)
+
 
 class OrderCreateIn(BaseModel):
     tenant_id: str
@@ -387,9 +409,10 @@ class OrderCreateIn(BaseModel):
     customer_contact: str
     items: List[OrderItem]
     notes: Optional[str] = ""
-    delivery_type: Optional[str] = "pickup"   # pickup / delivery
+    delivery_type: Optional[str] = "pickup"
     requested_time: Optional[str] = "ahora"
     source: Optional[str] = "api"
+
 
 class OrderCreateOut(BaseModel):
     ok: bool
@@ -397,21 +420,26 @@ class OrderCreateOut(BaseModel):
     total_amount: float
     currency: str = "BOB"
 
+
 class MarkPaidIn(BaseModel):
     tenant_id: str
     order_id: str
+    admin_chat_id: str  # <- blindaje clave
+
 
 class MarkPaidOut(BaseModel):
     ok: bool
     order_id: str
     status: str
+    old_status: Optional[str] = None
+    already_paid: Optional[bool] = None
 
 
 # =========================
 # FastAPI App
 # =========================
 
-app = FastAPI(title=APP_NAME, version="1.0.0")
+app = FastAPI(title=APP_NAME, version="1.1.0")
 
 
 @app.get("/")
@@ -420,10 +448,11 @@ def root():
 
 
 @app.post("/admin/reload_tenants")
-def admin_reload_tenants():
+def admin_reload_tenants(payload: AdminTokenIn):
     """
-    Útil para cuando cambias Tenants/Config y quieres recargar cache sin redeploy.
+    Recarga cache de tenants (requiere ADMIN_TOKEN).
     """
+    require_admin_token(payload.token)
     gc = get_gspread_client()
     load_tenants(gc, force=True)
     return {"ok": True, "cached_at": _TENANTS_CACHE_AT, "tenants_count": len(_TENANTS_CACHE)}
@@ -441,6 +470,7 @@ def get_menu(tenant_id: str = Query(..., description="tenant_id, ej: resto_demo"
     menu_idx = load_menu_index(orders_sh)
     categories = group_menu_by_category(menu_idx)
 
+    log_event("menu_ok", tenant_id=tenant_id, categories=len(categories))
     return {"ok": True, "tenant_id": tenant_id, "categories": categories}
 
 
@@ -452,10 +482,23 @@ def create_order(payload: OrderCreateIn):
     if not tenant.get("orders_enabled", False):
         raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {payload.tenant_id}")
 
+    name = (payload.customer_name or "").strip()
+    if not name or len(name) > MAX_NAME_LEN:
+        raise HTTPException(status_code=422, detail="customer_name missing or too long")
+
+    contact = (payload.customer_contact or "").strip()
+    validate_contact(contact)
+
+    if not payload.items or len(payload.items) > MAX_ITEMS_PER_ORDER:
+        raise HTTPException(status_code=422, detail=f"items must be 1..{MAX_ITEMS_PER_ORDER}")
+
+    notes = (payload.notes or "").strip()
+    if len(notes) > MAX_NOTES_LEN:
+        raise HTTPException(status_code=422, detail="notes too long")
+
     orders_sh = open_orders_spreadsheet(gc, tenant)
     menu_idx = load_menu_index(orders_sh)
 
-    # Convertimos a dicts básicos para cálculo
     items_list = [{"sku": it.sku.strip(), "qty": int(it.qty)} for it in payload.items]
     total_amount = calc_total_amount(items_list, menu_idx)
 
@@ -465,17 +508,18 @@ def create_order(payload: OrderCreateIn):
         orders_sh=orders_sh,
         tenant_id=payload.tenant_id,
         order_id=order_id,
-        customer_name=payload.customer_name.strip(),
-        customer_contact=payload.customer_contact.strip(),
+        customer_name=name,
+        customer_contact=contact,
         items=items_list,
-        notes=(payload.notes or "").strip(),
+        notes=notes,
         delivery_type=(payload.delivery_type or "pickup").strip(),
         requested_time=(payload.requested_time or "ahora").strip(),
-        status="PENDING_PAYMENT",  # flujo: PENDING_PAYMENT -> PAID
+        status="PENDING_PAYMENT",
         source=(payload.source or "api").strip(),
         total_amount=total_amount,
     )
 
+    log_event("order_created", tenant_id=payload.tenant_id, order_id=order_id, total_amount=total_amount)
     return OrderCreateOut(ok=True, order_id=order_id, total_amount=total_amount, currency="BOB")
 
 
@@ -487,10 +531,21 @@ def mark_paid(payload: MarkPaidIn):
     if not tenant.get("orders_enabled", False):
         raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {payload.tenant_id}")
 
-    orders_sh = open_orders_spreadsheet(gc, tenant)
-    updated = update_order_status(orders_sh, payload.order_id, "PAID")
+    expected_admin_chat_id = str(tenant.get("admin_chat_id", "")).strip()
+    if not expected_admin_chat_id:
+        raise HTTPException(status_code=500, detail="admin_chat_id is not set for this tenant")
 
-    if not updated:
+    if str(payload.admin_chat_id).strip() != expected_admin_chat_id:
+        raise HTTPException(status_code=403, detail="Invalid admin_chat_id for this tenant")
+
+    orders_sh = open_orders_spreadsheet(gc, tenant)
+    result = update_order_status(orders_sh, payload.order_id, "PAID")
+
+    if not result.get("found"):
         raise HTTPException(status_code=404, detail=f"Order not found: {payload.order_id}")
 
-    return MarkPaidOut(ok=True, order_id=payload.order_id, status="PAID")
+    old_status = str(result.get("old_status", "") or "")
+    already_paid = normalize(old_status) == "paid"
+
+    log_event("order_mark_paid", tenant_id=payload.tenant_id, order_id=payload.order_id, already_paid=already_paid)
+    return MarkPaidOut(ok=True, order_id=payload.order_id, status="PAID", old_status=old_status, already_paid=already_paid)
