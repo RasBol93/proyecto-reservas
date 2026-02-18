@@ -2,11 +2,11 @@ import os
 import json
 import re
 import time
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from collections import deque
 
-import requests
 import gspread
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -17,9 +17,9 @@ from pydantic import BaseModel, Field
 
 APP_NAME = "proyecto-reservas"
 
-ENV_CONFIG_SPREADSHEET_ID = "RESERVACIONES_CONFIG"  # <- ID del spreadsheet "reservaciones_config"
-ENV_GCP_CREDS_JSON = "GCP_CREDENTIALS_JSON"          # <- JSON service account (string)
-ENV_ADMIN_TOKEN = "ADMIN_TOKEN"                      # <- token simple para endpoints admin
+ENV_CONFIG_SPREADSHEET_ID = "RESERVACIONES_CONFIG"  # ID del spreadsheet "reservaciones_config"
+ENV_GCP_CREDS_JSON = "GCP_CREDENTIALS_JSON"          # JSON service account (string)
+ENV_ADMIN_TOKEN = "ADMIN_TOKEN"                      # token simple para endpoints admin
 
 MAX_ITEMS_PER_ORDER = 30
 MAX_NAME_LEN = 80
@@ -34,14 +34,13 @@ ORDER_ID_RE = re.compile(r"^[a-f0-9]{8}$")  # secrets.token_hex(4) => 8 chars he
 ALLOWED_DELIVERY_TYPES = {"pickup", "delivery"}
 ALLOWED_SOURCES = {"api", "swagger", "telegram", "whatsapp"}
 
-# Rate limits (por tenant, por minuto) - ajustables
+# Rate limits (por tenant, por minuto)
 RL_MENU_PER_MIN = 120
 RL_CREATE_PER_MIN = 60
 RL_MARKPAID_PER_MIN = 60
 
 # Telegram
-TG_API_BASE = "https://api.telegram.org/bot"
-TG_TIMEOUT_SEC = 12  # timeout requests a Telegram
+TELEGRAM_API_BASE = "https://api.telegram.org"
 
 
 def now_iso_utc() -> str:
@@ -74,8 +73,7 @@ def normalize(s: Any) -> str:
 
 
 def log_event(event: str, **fields: Any) -> None:
-    safe = {k: v for k, v in fields.items()
-            if k not in ("creds", "token", "GCP_CREDENTIALS_JSON", "ADMIN_TOKEN", "bot_token")}
+    safe = {k: v for k, v in fields.items() if k not in ("creds", "token", "GCP_CREDENTIALS_JSON", "ADMIN_TOKEN")}
     print(json.dumps({"ts": now_iso_utc(), "event": event, **safe}, ensure_ascii=False))
 
 
@@ -254,7 +252,7 @@ def load_tenants(gc: gspread.Client, force: bool = False) -> Dict[str, Dict[str,
             "admin_chat_id": str(r.get("admin_chat_id", "")).strip(),
             "timezone": r.get("timezone", "America/La_Paz"),
             "active": to_bool(r.get("active", "")),
-            "admin_whatsapp": r.get("admin_whatsapp", ""),
+            "admin_whatsapp": (r.get("admin_whatsapp", "") or "").strip(),
         }
 
     _TENANTS_CACHE = tenants
@@ -309,7 +307,6 @@ def load_menu_index(orders_sh: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]
             "price": price,
             "category": r.get("category", ""),
         }
-
     return idx
 
 
@@ -449,105 +446,88 @@ def gen_order_id() -> str:
 
 
 # =========================
-# Telegram helpers (Long Polling)
+# Telegram helpers
 # =========================
 
-# offset por tenant (RAM). Si reinicia el server, se reinicia el offset (ok para demo).
-_TG_OFFSETS: Dict[str, int] = {}
+def telegram_api_call(bot_token: str, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Llamada HTTP simple a Telegram API usando urllib (sin requests).
+    """
+    if not bot_token:
+        raise RuntimeError("bot_token missing")
 
+    url = f"{TELEGRAM_API_BASE}/bot{bot_token}/{method}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
 
-def tg_call(token: str, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{TG_API_BASE}{token}/{method}"
     try:
-        r = requests.post(url, json=payload, timeout=TG_TIMEOUT_SEC)
-        data = r.json()
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Telegram API error: {e}")
-    if not isinstance(data, dict) or not data.get("ok", False):
-        # Telegram devuelve ok=false con description
-        desc = (data or {}).get("description", "unknown telegram error")
-        raise HTTPException(status_code=502, detail=f"Telegram API not ok: {desc}")
-    return data
+        log_event("telegram_api_error", method=method, error=str(e))
+        return {"ok": False, "error": str(e)}
 
 
-def tg_send_message(token: str, chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return tg_call(token, "sendMessage", payload)
-
-
-def tg_answer_callback(token: str, callback_query_id: str, text: str = "OK") -> None:
-    tg_call(token, "answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
-
-
-def tg_edit_message(token: str, chat_id: str, message_id: int, text: str) -> None:
-    tg_call(token, "editMessageText", {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    })
-
-
-def fmt_items(items_list: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str, Any]]) -> str:
+def format_order_message(tenant: Dict[str, Any], order_id: str, customer_name: str, customer_contact: str,
+                         items_list: List[Dict[str, Any]], total_amount: float, notes: str,
+                         delivery_type: str, requested_time: str) -> str:
     lines = []
+    lines.append(f"🧾 *Nuevo pedido*")
+    lines.append(f"🏷️ Tenant: `{tenant.get('tenant_id','')}`")
+    lines.append(f"🆔 Order ID: `{order_id}`")
+    lines.append(f"👤 Cliente: {customer_name}")
+    lines.append(f"📞 Contacto: {customer_contact}")
+    lines.append(f"🚚 Tipo: {delivery_type}")
+    lines.append(f"⏰ Hora: {requested_time}")
+    lines.append("")
+    lines.append("*Items:*")
     for it in items_list:
-        sku = it["sku"]
-        qty = int(it["qty"])
-        name = menu_idx.get(sku, {}).get("name", sku)
-        price = float(menu_idx.get(sku, {}).get("price", 0))
-        lines.append(f"• {qty} × {name}  (SKU {sku})  = {qty*price:.2f} BOB")
+        lines.append(f"• `{it['sku']}` x{it['qty']}")
+    lines.append("")
+    lines.append(f"💰 Total: *{total_amount} BOB*")
+    if notes:
+        lines.append("")
+        lines.append(f"📝 Nota: {notes}")
     return "\n".join(lines)
 
 
-def build_paid_button_cb(tenant_id: str, order_id: str, admin_chat_id: str) -> str:
-    # callback_data máx 64 bytes aprox; esto entra bien.
-    return f"PAID|{tenant_id}|{order_id}|{admin_chat_id}"
+def send_order_to_admin_telegram(tenant: Dict[str, Any], order_id: str, customer_name: str, customer_contact: str,
+                                 items_list: List[Dict[str, Any]], total_amount: float, notes: str,
+                                 delivery_type: str, requested_time: str) -> None:
+    bot_token = (tenant.get("bot_token", "") or "").strip()
+    admin_chat_id = str(tenant.get("admin_chat_id", "")).strip()
+    if not bot_token or not admin_chat_id:
+        log_event("telegram_skip_missing_config", tenant_id=tenant.get("tenant_id"), has_token=bool(bot_token), has_admin=bool(admin_chat_id))
+        return
 
+    text = format_order_message(
+        tenant=tenant,
+        order_id=order_id,
+        customer_name=customer_name,
+        customer_contact=customer_contact,
+        items_list=items_list,
+        total_amount=total_amount,
+        notes=notes,
+        delivery_type=delivery_type,
+        requested_time=requested_time,
+    )
 
-def parse_callback_data(data: str) -> Dict[str, str]:
-    parts = (data or "").split("|")
-    if len(parts) != 4:
-        return {}
-    return {"action": parts[0], "tenant_id": parts[1], "order_id": parts[2], "admin_chat_id": parts[3]}
+    callback_data = f"paid|{tenant['tenant_id']}|{order_id}"
 
+    payload = {
+        "chat_id": int(admin_chat_id),
+        "text": text,
+        "parse_mode": "Markdown",
+        "reply_markup": {
+            "inline_keyboard": [
+                [{"text": "✅ Pagado", "callback_data": callback_data}]
+            ]
+        }
+    }
 
-def mark_paid_internal(gc: gspread.Client, tenant_id: str, order_id: str, admin_chat_id: str) -> Dict[str, Any]:
-    validate_tenant_id(tenant_id)
-    validate_order_id(order_id)
-
-    tenant = get_tenant_or_404(gc, tenant_id)
-    if not tenant.get("orders_enabled", False):
-        raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {tenant_id}")
-
-    expected_admin_chat_id = str(tenant.get("admin_chat_id", "")).strip()
-    if not expected_admin_chat_id:
-        raise HTTPException(status_code=500, detail="admin_chat_id is not set for this tenant")
-    if str(admin_chat_id).strip() != expected_admin_chat_id:
-        raise HTTPException(status_code=403, detail="Invalid admin_chat_id for this tenant")
-
-    orders_sh = open_orders_spreadsheet(gc, tenant)
-    result = update_order_status(orders_sh, order_id, "PAID")
-    if not result.get("found"):
-        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
-
-    old_status = str(result.get("old_status", "") or "")
-    old_norm = normalize(old_status)
-
-    if old_norm == "paid":
-        return {"ok": True, "already_paid": True, "old_status": old_status}
-
-    if old_norm not in ("pending_payment", "pendingpayment", ""):
-        raise HTTPException(status_code=409, detail=f"Cannot mark paid from status={old_status}")
-
-    return {"ok": True, "already_paid": False, "old_status": old_status}
+    res = telegram_api_call(bot_token, "sendMessage", payload)
+    log_event("telegram_send_order", tenant_id=tenant.get("tenant_id"), order_id=order_id, ok=res.get("ok", False))
 
 
 # =========================
@@ -580,7 +560,7 @@ class OrderCreateOut(BaseModel):
 class MarkPaidIn(BaseModel):
     tenant_id: str
     order_id: str
-    admin_chat_id: str  # <- blindaje clave
+    admin_chat_id: str  # blindaje clave
 
 class MarkPaidOut(BaseModel):
     ok: bool
@@ -588,15 +568,6 @@ class MarkPaidOut(BaseModel):
     status: str
     old_status: Optional[str] = None
     already_paid: Optional[bool] = None
-
-class TelegramPollIn(BaseModel):
-    token: str
-    tenant_id: str
-
-class TelegramTestSendIn(BaseModel):
-    token: str
-    tenant_id: str
-    text: str
 
 
 # =========================
@@ -690,38 +661,23 @@ def create_order(payload: OrderCreateIn):
         total_amount=total_amount,
     )
 
-    # ---- Telegram notify admin (si está configurado) ----
-    bot_token = str(tenant.get("bot_token", "")).strip()
-    admin_chat_id = str(tenant.get("admin_chat_id", "")).strip()
-    if bot_token and admin_chat_id:
-        try:
-            items_txt = fmt_items(items_list, menu_idx)
-            text = (
-                f"<b>🧾 Nuevo pedido</b>\n"
-                f"<b>Tenant:</b> {payload.tenant_id}\n"
-                f"<b>Order ID:</b> <code>{order_id}</code>\n"
-                f"<b>Total:</b> {total_amount:.2f} BOB\n\n"
-                f"<b>Items:</b>\n{items_txt}\n\n"
-                f"<b>Cliente:</b> {name}\n"
-                f"<b>Contacto:</b> {contact}\n"
-                f"<b>Tipo:</b> {delivery_type}\n"
-                f"<b>Hora:</b> {requested_time}\n"
-                f"<b>Notas:</b> {notes or '-'}"
-            )
+    # 🔥 Enviar al admin (Telegram) con botón Pagado
+    try:
+        send_order_to_admin_telegram(
+            tenant=tenant,
+            order_id=order_id,
+            customer_name=name,
+            customer_contact=contact,
+            items_list=items_list,
+            total_amount=total_amount,
+            notes=notes,
+            delivery_type=delivery_type,
+            requested_time=requested_time,
+        )
+    except Exception as e:
+        log_event("telegram_send_exception", tenant_id=payload.tenant_id, order_id=order_id, error=str(e))
 
-            cb = build_paid_button_cb(payload.tenant_id, order_id, admin_chat_id)
-            reply_markup = {
-                "inline_keyboard": [
-                    [{"text": "✅ Pagado", "callback_data": cb}]
-                ]
-            }
-            tg_send_message(bot_token, admin_chat_id, text, reply_markup=reply_markup)
-            log_event("telegram_notified", tenant_id=payload.tenant_id, order_id=order_id)
-        except Exception as e:
-            # No rompemos el flujo de creación por un fallo de Telegram
-            log_event("telegram_notify_failed", tenant_id=payload.tenant_id, order_id=order_id, error=str(e))
-
-    log_event("order_created", tenant_id=payload.tenant_id, order_id=order_id, total_amount=total_amount)
+    log_event("order_created", tenant_id=payload.tenant_id, order_id=order_id, total_amount=total_amount, source=source)
     return OrderCreateOut(ok=True, order_id=order_id, total_amount=total_amount, currency="BOB")
 
 
@@ -765,117 +721,75 @@ def mark_paid(payload: MarkPaidIn):
 
 
 # =========================
-# Telegram Admin Endpoints (Long Polling)
+# Telegram webhook
 # =========================
 
-@app.post("/admin/telegram/test_send")
-def admin_telegram_test_send(payload: TelegramTestSendIn):
-    require_admin_token(payload.token)
-
-    validate_tenant_id(payload.tenant_id)
-    gc = get_gspread_client()
-    tenant = get_tenant_or_404(gc, payload.tenant_id)
-
-    bot_token = str(tenant.get("bot_token", "")).strip()
-    admin_chat_id = str(tenant.get("admin_chat_id", "")).strip()
-    if not bot_token:
-        raise HTTPException(status_code=500, detail="bot_token is not set for this tenant")
-    if not admin_chat_id:
-        raise HTTPException(status_code=500, detail="admin_chat_id is not set for this tenant")
-
-    tg_send_message(bot_token, admin_chat_id, payload.text.strip() or "Test")
-    return {"ok": True}
-
-
-@app.post("/admin/telegram/poll_once")
-def admin_telegram_poll_once(payload: TelegramPollIn):
+@app.post("/telegram/webhook/{tenant_id}/{secret}")
+async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
     """
-    Long polling manual (demo). Llamas esto desde Swagger cada vez que quieras procesar:
-    - mensajes normales
-    - callbacks de botones (✅ Pagado)
+    Webhook por tenant.
+    Blindaje:
+      - Valida tenant activo
+      - Valida webhook_secret
+      - Solo acepta callback_query del admin_chat_id
     """
-    require_admin_token(payload.token)
-    validate_tenant_id(payload.tenant_id)
+    validate_tenant_id(tenant_id)
 
     gc = get_gspread_client()
-    tenant = get_tenant_or_404(gc, payload.tenant_id)
+    tenant = get_tenant_or_404(gc, tenant_id)
 
-    bot_token = str(tenant.get("bot_token", "")).strip()
-    if not bot_token:
-        raise HTTPException(status_code=500, detail="bot_token is not set for this tenant")
+    expected_secret = (tenant.get("webhook_secret", "") or "").strip()
+    if not expected_secret or secret.strip() != expected_secret:
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
-    offset = _TG_OFFSETS.get(payload.tenant_id, 0)
+    # Solo nos interesa callback_query del botón
+    cb = update.get("callback_query")
+    if not cb:
+        # opcional: ignorar mensajes normales
+        return {"ok": True}
 
-    data = tg_call(bot_token, "getUpdates", {"timeout": 0, "offset": offset})
-    updates = data.get("result", []) or []
+    data = (cb.get("data") or "").strip()
+    from_user = cb.get("from") or {}
+    from_id = str(from_user.get("id", "")).strip()
 
-    processed = 0
-    actions = []
+    expected_admin_chat_id = str(tenant.get("admin_chat_id", "")).strip()
+    if not expected_admin_chat_id:
+        raise HTTPException(status_code=500, detail="admin_chat_id not configured")
 
-    for upd in updates:
-        processed += 1
-        update_id = int(upd.get("update_id", 0))
-        # avanzamos offset
-        if update_id >= offset:
-            offset = update_id + 1
+    # Blindaje: solo el admin puede ejecutar pagos
+    if from_id != expected_admin_chat_id:
+        log_event("telegram_callback_forbidden", tenant_id=tenant_id, from_id=from_id)
+        raise HTTPException(status_code=403, detail="Not allowed")
 
-        # callback de botón
-        if "callback_query" in upd:
-            cq = upd["callback_query"]
-            cq_id = cq.get("id", "")
-            cb_data = (cq.get("data") or "").strip()
-            msg = cq.get("message") or {}
-            chat = msg.get("chat") or {}
-            chat_id = str(chat.get("id", "")).strip()
-            message_id = msg.get("message_id")
+    # data: paid|tenant_id|order_id
+    parts = data.split("|")
+    if len(parts) != 3 or parts[0] != "paid":
+        return {"ok": True}
 
-            parsed = parse_callback_data(cb_data)
-            if not parsed:
-                tg_answer_callback(bot_token, cq_id, "Callback inválido")
-                actions.append({"type": "callback_invalid"})
-                continue
+    cb_tenant_id = parts[1].strip()
+    order_id = parts[2].strip().lower()
 
-            if parsed.get("action") != "PAID":
-                tg_answer_callback(bot_token, cq_id, "Acción no soportada")
-                actions.append({"type": "callback_unsupported"})
-                continue
+    if cb_tenant_id != tenant_id:
+        raise HTTPException(status_code=400, detail="Tenant mismatch in callback data")
 
-            tenant_id = parsed["tenant_id"]
-            order_id = parsed["order_id"]
-            admin_chat_id = parsed["admin_chat_id"]
+    validate_order_id(order_id)
 
-            try:
-                res = mark_paid_internal(gc, tenant_id, order_id, admin_chat_id)
-                tg_answer_callback(bot_token, cq_id, "Marcado como pagado ✅")
+    orders_sh = open_orders_spreadsheet(gc, tenant)
+    result = update_order_status(orders_sh, order_id, "PAID")
+    if not result.get("found"):
+        # Respondemos OK igual (Telegram no necesita error)
+        log_event("telegram_paid_not_found", tenant_id=tenant_id, order_id=order_id)
+        return {"ok": True, "status": "not_found"}
 
-                # Editar el mensaje para que quede claro
-                if chat_id and isinstance(message_id, int):
-                    suffix = "\n\n<b>✅ Estado:</b> PAID"
-                    new_text = (msg.get("text") or "") + suffix
-                    tg_edit_message(bot_token, chat_id, message_id, new_text)
+    old_status = str(result.get("old_status", "") or "")
+    already_paid = normalize(old_status) == "paid"
 
-                actions.append({"type": "paid_ok", "order_id": order_id, "already_paid": res.get("already_paid", False)})
-            except Exception as e:
-                tg_answer_callback(bot_token, cq_id, "Error al marcar pagado")
-                actions.append({"type": "paid_error", "error": str(e)})
+    # Responder al callback (quita “loading…”)
+    bot_token = (tenant.get("bot_token", "") or "").strip()
+    callback_query_id = cb.get("id")
+    if bot_token and callback_query_id:
+        text = "✅ Marcado como PAID" if not already_paid else "✅ Ya estaba PAID"
+        telegram_api_call(bot_token, "answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
 
-            continue
-
-        # mensaje normal (texto)
-        if "message" in upd:
-            m = upd["message"]
-            chat = m.get("chat") or {}
-            chat_id = str(chat.get("id", "")).strip()
-            text = (m.get("text") or "").strip()
-
-            if chat_id and text:
-                # Respuesta mínima demo
-                tg_send_message(
-                    bot_token,
-                    chat_id,
-                    "Hola 👋\nEste bot está en modo DEMO.\nPara probar pedidos, créalos desde Swagger (/orders/create)."
-                )
-                actions.append({"type": "msg_replied", "chat_id": chat_id})
-
-    _TG_OFFSETS[payload.tenant_id] = offset
-    return {"ok": True, "processed": processed, "actions": actions, "next_offset": offset}
+    log_event("telegram_paid_ok", tenant_id=tenant_id, order_id=order_id, old_status=old_status, already_paid=already_paid)
+    return {"ok": True, "order_id": order_id, "already_paid": already_paid}
