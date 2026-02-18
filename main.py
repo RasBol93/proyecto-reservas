@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from collections import deque
 
+import requests
 import gspread
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -38,6 +39,10 @@ RL_MENU_PER_MIN = 120
 RL_CREATE_PER_MIN = 60
 RL_MARKPAID_PER_MIN = 60
 
+# Telegram
+TG_API_BASE = "https://api.telegram.org/bot"
+TG_TIMEOUT_SEC = 12  # timeout requests a Telegram
+
 
 def now_iso_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -69,11 +74,8 @@ def normalize(s: Any) -> str:
 
 
 def log_event(event: str, **fields: Any) -> None:
-    """
-    Logging mínimo en stdout (Render lo captura).
-    Evita loguear secretos.
-    """
-    safe = {k: v for k, v in fields.items() if k not in ("creds", "token", "GCP_CREDENTIALS_JSON", "ADMIN_TOKEN")}
+    safe = {k: v for k, v in fields.items()
+            if k not in ("creds", "token", "GCP_CREDENTIALS_JSON", "ADMIN_TOKEN", "bot_token")}
     print(json.dumps({"ts": now_iso_utc(), "event": event, **safe}, ensure_ascii=False))
 
 
@@ -138,7 +140,6 @@ def validate_contact(contact: str) -> None:
     c = (contact or "").strip()
     if len(c) > MAX_CONTACT_LEN:
         raise HTTPException(status_code=422, detail="customer_contact too long")
-    # 6..20 dígitos, opcional +
     if not re.match(r"^\+?\d{6,20}$", c):
         raise HTTPException(status_code=422, detail="customer_contact must be digits (optionally starting with +)")
 
@@ -156,10 +157,6 @@ def require_admin_token(token: str) -> None:
 # =========================
 
 def detect_header_row(values: List[List[Any]], required_headers: List[str], max_scan: int = 10) -> int:
-    """
-    Detecta en qué fila (1-indexed) están los headers técnicos.
-    Busca en las primeras max_scan filas.
-    """
     req = [normalize(h) for h in required_headers]
     scan = values[:max_scan]
     for idx, row in enumerate(scan, start=1):
@@ -170,10 +167,6 @@ def detect_header_row(values: List[List[Any]], required_headers: List[str], max_
 
 
 def read_records_manual(ws: gspread.Worksheet, required_headers: List[str]) -> List[Dict[str, Any]]:
-    """
-    Lee todos los registros de una worksheet detectando headers.
-    Devuelve lista de dicts (header -> value).
-    """
     values = ws.get_all_values()
     if not values:
         return []
@@ -236,12 +229,6 @@ _TENANTS_CACHE_AT: Optional[str] = None
 
 
 def load_tenants(gc: gspread.Client, force: bool = False) -> Dict[str, Dict[str, Any]]:
-    """
-    Lee Tenants desde el spreadsheet de config:
-    columnas esperadas:
-      tenant_id, name, business_type, orders_sheet_id, bookings_enabled, orders_enabled,
-      bot_token, webhook_secret, admin_chat_id, timezone, active, admin_whatsapp
-    """
     global _TENANTS_CACHE, _TENANTS_CACHE_AT
     if _TENANTS_CACHE and not force:
         return _TENANTS_CACHE
@@ -262,8 +249,8 @@ def load_tenants(gc: gspread.Client, force: bool = False) -> Dict[str, Dict[str,
             "orders_sheet_id": str(r.get("orders_sheet_id", "")).strip(),
             "bookings_enabled": to_bool(r.get("bookings_enabled", "")),
             "orders_enabled": to_bool(r.get("orders_enabled", "")),
-            "bot_token": r.get("bot_token", ""),
-            "webhook_secret": r.get("webhook_secret", ""),
+            "bot_token": (r.get("bot_token", "") or "").strip(),
+            "webhook_secret": (r.get("webhook_secret", "") or "").strip(),
             "admin_chat_id": str(r.get("admin_chat_id", "")).strip(),
             "timezone": r.get("timezone", "America/La_Paz"),
             "active": to_bool(r.get("active", "")),
@@ -299,11 +286,6 @@ def open_orders_spreadsheet(gc: gspread.Client, tenant: Dict[str, Any]) -> gspre
 
 
 def load_menu_index(orders_sh: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]:
-    """
-    Carga Menu y devuelve índice por sku:
-      { "H01": {"sku":"H01","name":"...","price":25.0,"category":"Hamburguesas"} }
-    Solo filas con active=TRUE.
-    """
     ws = get_ws(orders_sh, "Menu")
     rows = read_records_manual(ws, required_headers=["sku", "name", "price", "active", "category"])
 
@@ -312,8 +294,6 @@ def load_menu_index(orders_sh: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]
         sku = str(r.get("sku", "")).strip()
         if not sku:
             continue
-
-        # Importante: fila 2 (human) debe tener active != TRUE para no entrar aquí
         if not to_bool(r.get("active", "")):
             continue
 
@@ -373,10 +353,6 @@ def calc_total_amount(items: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str,
 
 
 def ensure_orders_headers(ws: gspread.Worksheet, required: List[str]) -> List[str]:
-    """
-    Verifica headers técnicos en fila 1. Si faltan, lanza error con mensaje claro.
-    Devuelve lista headers (normalizados) de fila 1.
-    """
     values = ws.get_all_values()
     if not values or not values[0]:
         raise HTTPException(status_code=500, detail="Orders sheet is empty or missing headers in row 1")
@@ -432,7 +408,6 @@ def append_order_row(
         "total_amount": total_amount,
     }
 
-    # Respeta el orden real del header fila 1
     header_raw = ws.row_values(1)
     row: List[Any] = []
     for h_raw in header_raw:
@@ -443,11 +418,6 @@ def append_order_row(
 
 
 def update_order_status(orders_sh: gspread.Spreadsheet, order_id: str, new_status: str) -> Dict[str, Any]:
-    """
-    Devuelve dict con:
-      found: bool
-      old_status: str
-    """
     ws = get_ws(orders_sh, "Orders")
     values = ws.get_all_values()
     if not values:
@@ -466,7 +436,6 @@ def update_order_status(orders_sh: gspread.Spreadsheet, order_id: str, new_statu
         oid = ws.cell(r_idx, col_order_id).value
         if str(oid).strip() == order_id:
             old_status = ws.cell(r_idx, col_status).value or ""
-            # Solo escribe si cambia
             if normalize(old_status) != normalize(new_status):
                 ws.update_cell(r_idx, col_status, new_status)
             return {"found": True, "old_status": old_status}
@@ -477,6 +446,108 @@ def update_order_status(orders_sh: gspread.Spreadsheet, order_id: str, new_statu
 def gen_order_id() -> str:
     import secrets
     return secrets.token_hex(4)
+
+
+# =========================
+# Telegram helpers (Long Polling)
+# =========================
+
+# offset por tenant (RAM). Si reinicia el server, se reinicia el offset (ok para demo).
+_TG_OFFSETS: Dict[str, int] = {}
+
+
+def tg_call(token: str, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{TG_API_BASE}{token}/{method}"
+    try:
+        r = requests.post(url, json=payload, timeout=TG_TIMEOUT_SEC)
+        data = r.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Telegram API error: {e}")
+    if not isinstance(data, dict) or not data.get("ok", False):
+        # Telegram devuelve ok=false con description
+        desc = (data or {}).get("description", "unknown telegram error")
+        raise HTTPException(status_code=502, detail=f"Telegram API not ok: {desc}")
+    return data
+
+
+def tg_send_message(token: str, chat_id: str, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return tg_call(token, "sendMessage", payload)
+
+
+def tg_answer_callback(token: str, callback_query_id: str, text: str = "OK") -> None:
+    tg_call(token, "answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
+
+
+def tg_edit_message(token: str, chat_id: str, message_id: int, text: str) -> None:
+    tg_call(token, "editMessageText", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    })
+
+
+def fmt_items(items_list: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str, Any]]) -> str:
+    lines = []
+    for it in items_list:
+        sku = it["sku"]
+        qty = int(it["qty"])
+        name = menu_idx.get(sku, {}).get("name", sku)
+        price = float(menu_idx.get(sku, {}).get("price", 0))
+        lines.append(f"• {qty} × {name}  (SKU {sku})  = {qty*price:.2f} BOB")
+    return "\n".join(lines)
+
+
+def build_paid_button_cb(tenant_id: str, order_id: str, admin_chat_id: str) -> str:
+    # callback_data máx 64 bytes aprox; esto entra bien.
+    return f"PAID|{tenant_id}|{order_id}|{admin_chat_id}"
+
+
+def parse_callback_data(data: str) -> Dict[str, str]:
+    parts = (data or "").split("|")
+    if len(parts) != 4:
+        return {}
+    return {"action": parts[0], "tenant_id": parts[1], "order_id": parts[2], "admin_chat_id": parts[3]}
+
+
+def mark_paid_internal(gc: gspread.Client, tenant_id: str, order_id: str, admin_chat_id: str) -> Dict[str, Any]:
+    validate_tenant_id(tenant_id)
+    validate_order_id(order_id)
+
+    tenant = get_tenant_or_404(gc, tenant_id)
+    if not tenant.get("orders_enabled", False):
+        raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {tenant_id}")
+
+    expected_admin_chat_id = str(tenant.get("admin_chat_id", "")).strip()
+    if not expected_admin_chat_id:
+        raise HTTPException(status_code=500, detail="admin_chat_id is not set for this tenant")
+    if str(admin_chat_id).strip() != expected_admin_chat_id:
+        raise HTTPException(status_code=403, detail="Invalid admin_chat_id for this tenant")
+
+    orders_sh = open_orders_spreadsheet(gc, tenant)
+    result = update_order_status(orders_sh, order_id, "PAID")
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"Order not found: {order_id}")
+
+    old_status = str(result.get("old_status", "") or "")
+    old_norm = normalize(old_status)
+
+    if old_norm == "paid":
+        return {"ok": True, "already_paid": True, "old_status": old_status}
+
+    if old_norm not in ("pending_payment", "pendingpayment", ""):
+        raise HTTPException(status_code=409, detail=f"Cannot mark paid from status={old_status}")
+
+    return {"ok": True, "already_paid": False, "old_status": old_status}
 
 
 # =========================
@@ -518,12 +589,21 @@ class MarkPaidOut(BaseModel):
     old_status: Optional[str] = None
     already_paid: Optional[bool] = None
 
+class TelegramPollIn(BaseModel):
+    token: str
+    tenant_id: str
+
+class TelegramTestSendIn(BaseModel):
+    token: str
+    tenant_id: str
+    text: str
+
 
 # =========================
 # FastAPI App
 # =========================
 
-app = FastAPI(title=APP_NAME, version="1.2.0")
+app = FastAPI(title=APP_NAME, version="1.3.0")
 
 
 @app.get("/")
@@ -533,9 +613,6 @@ def root():
 
 @app.post("/admin/reload_tenants")
 def admin_reload_tenants(payload: AdminTokenIn):
-    """
-    Recarga cache de tenants (requiere ADMIN_TOKEN).
-    """
     require_admin_token(payload.token)
     gc = get_gspread_client()
     load_tenants(gc, force=True)
@@ -613,6 +690,37 @@ def create_order(payload: OrderCreateIn):
         total_amount=total_amount,
     )
 
+    # ---- Telegram notify admin (si está configurado) ----
+    bot_token = str(tenant.get("bot_token", "")).strip()
+    admin_chat_id = str(tenant.get("admin_chat_id", "")).strip()
+    if bot_token and admin_chat_id:
+        try:
+            items_txt = fmt_items(items_list, menu_idx)
+            text = (
+                f"<b>🧾 Nuevo pedido</b>\n"
+                f"<b>Tenant:</b> {payload.tenant_id}\n"
+                f"<b>Order ID:</b> <code>{order_id}</code>\n"
+                f"<b>Total:</b> {total_amount:.2f} BOB\n\n"
+                f"<b>Items:</b>\n{items_txt}\n\n"
+                f"<b>Cliente:</b> {name}\n"
+                f"<b>Contacto:</b> {contact}\n"
+                f"<b>Tipo:</b> {delivery_type}\n"
+                f"<b>Hora:</b> {requested_time}\n"
+                f"<b>Notas:</b> {notes or '-'}"
+            )
+
+            cb = build_paid_button_cb(payload.tenant_id, order_id, admin_chat_id)
+            reply_markup = {
+                "inline_keyboard": [
+                    [{"text": "✅ Pagado", "callback_data": cb}]
+                ]
+            }
+            tg_send_message(bot_token, admin_chat_id, text, reply_markup=reply_markup)
+            log_event("telegram_notified", tenant_id=payload.tenant_id, order_id=order_id)
+        except Exception as e:
+            # No rompemos el flujo de creación por un fallo de Telegram
+            log_event("telegram_notify_failed", tenant_id=payload.tenant_id, order_id=order_id, error=str(e))
+
     log_event("order_created", tenant_id=payload.tenant_id, order_id=order_id, total_amount=total_amount)
     return OrderCreateOut(ok=True, order_id=order_id, total_amount=total_amount, currency="BOB")
 
@@ -638,7 +746,6 @@ def mark_paid(payload: MarkPaidIn):
 
     orders_sh = open_orders_spreadsheet(gc, tenant)
 
-    # 1) Leemos el estado anterior y (si aplica) actualizamos
     result = update_order_status(orders_sh, payload.order_id, "PAID")
     if not result.get("found"):
         raise HTTPException(status_code=404, detail=f"Order not found: {payload.order_id}")
@@ -646,14 +753,129 @@ def mark_paid(payload: MarkPaidIn):
     old_status = str(result.get("old_status", "") or "")
     old_norm = normalize(old_status)
 
-    # 2) Idempotencia: si ya estaba PAID, respondemos ok y no “forzamos” nada más
     if old_norm == "paid":
         log_event("order_mark_paid_idempotent", tenant_id=payload.tenant_id, order_id=payload.order_id)
         return MarkPaidOut(ok=True, order_id=payload.order_id, status="PAID", old_status=old_status, already_paid=True)
 
-    # 3) Control de transición: solo permitimos pagar desde PENDING_PAYMENT (o vacío si tu sheet estaba “nuevo”)
     if old_norm not in ("pending_payment", "pendingpayment", ""):
         raise HTTPException(status_code=409, detail=f"Cannot mark paid from status={old_status}")
 
     log_event("order_mark_paid", tenant_id=payload.tenant_id, order_id=payload.order_id, old_status=old_status)
     return MarkPaidOut(ok=True, order_id=payload.order_id, status="PAID", old_status=old_status, already_paid=False)
+
+
+# =========================
+# Telegram Admin Endpoints (Long Polling)
+# =========================
+
+@app.post("/admin/telegram/test_send")
+def admin_telegram_test_send(payload: TelegramTestSendIn):
+    require_admin_token(payload.token)
+
+    validate_tenant_id(payload.tenant_id)
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(gc, payload.tenant_id)
+
+    bot_token = str(tenant.get("bot_token", "")).strip()
+    admin_chat_id = str(tenant.get("admin_chat_id", "")).strip()
+    if not bot_token:
+        raise HTTPException(status_code=500, detail="bot_token is not set for this tenant")
+    if not admin_chat_id:
+        raise HTTPException(status_code=500, detail="admin_chat_id is not set for this tenant")
+
+    tg_send_message(bot_token, admin_chat_id, payload.text.strip() or "Test")
+    return {"ok": True}
+
+
+@app.post("/admin/telegram/poll_once")
+def admin_telegram_poll_once(payload: TelegramPollIn):
+    """
+    Long polling manual (demo). Llamas esto desde Swagger cada vez que quieras procesar:
+    - mensajes normales
+    - callbacks de botones (✅ Pagado)
+    """
+    require_admin_token(payload.token)
+    validate_tenant_id(payload.tenant_id)
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(gc, payload.tenant_id)
+
+    bot_token = str(tenant.get("bot_token", "")).strip()
+    if not bot_token:
+        raise HTTPException(status_code=500, detail="bot_token is not set for this tenant")
+
+    offset = _TG_OFFSETS.get(payload.tenant_id, 0)
+
+    data = tg_call(bot_token, "getUpdates", {"timeout": 0, "offset": offset})
+    updates = data.get("result", []) or []
+
+    processed = 0
+    actions = []
+
+    for upd in updates:
+        processed += 1
+        update_id = int(upd.get("update_id", 0))
+        # avanzamos offset
+        if update_id >= offset:
+            offset = update_id + 1
+
+        # callback de botón
+        if "callback_query" in upd:
+            cq = upd["callback_query"]
+            cq_id = cq.get("id", "")
+            cb_data = (cq.get("data") or "").strip()
+            msg = cq.get("message") or {}
+            chat = msg.get("chat") or {}
+            chat_id = str(chat.get("id", "")).strip()
+            message_id = msg.get("message_id")
+
+            parsed = parse_callback_data(cb_data)
+            if not parsed:
+                tg_answer_callback(bot_token, cq_id, "Callback inválido")
+                actions.append({"type": "callback_invalid"})
+                continue
+
+            if parsed.get("action") != "PAID":
+                tg_answer_callback(bot_token, cq_id, "Acción no soportada")
+                actions.append({"type": "callback_unsupported"})
+                continue
+
+            tenant_id = parsed["tenant_id"]
+            order_id = parsed["order_id"]
+            admin_chat_id = parsed["admin_chat_id"]
+
+            try:
+                res = mark_paid_internal(gc, tenant_id, order_id, admin_chat_id)
+                tg_answer_callback(bot_token, cq_id, "Marcado como pagado ✅")
+
+                # Editar el mensaje para que quede claro
+                if chat_id and isinstance(message_id, int):
+                    suffix = "\n\n<b>✅ Estado:</b> PAID"
+                    new_text = (msg.get("text") or "") + suffix
+                    tg_edit_message(bot_token, chat_id, message_id, new_text)
+
+                actions.append({"type": "paid_ok", "order_id": order_id, "already_paid": res.get("already_paid", False)})
+            except Exception as e:
+                tg_answer_callback(bot_token, cq_id, "Error al marcar pagado")
+                actions.append({"type": "paid_error", "error": str(e)})
+
+            continue
+
+        # mensaje normal (texto)
+        if "message" in upd:
+            m = upd["message"]
+            chat = m.get("chat") or {}
+            chat_id = str(chat.get("id", "")).strip()
+            text = (m.get("text") or "").strip()
+
+            if chat_id and text:
+                # Respuesta mínima demo
+                tg_send_message(
+                    bot_token,
+                    chat_id,
+                    "Hola 👋\nEste bot está en modo DEMO.\nPara probar pedidos, créalos desde Swagger (/orders/create)."
+                )
+                actions.append({"type": "msg_replied", "chat_id": chat_id})
+
+    _TG_OFFSETS[payload.tenant_id] = offset
+    return {"ok": True, "processed": processed, "actions": actions, "next_offset": offset}
