@@ -1,8 +1,10 @@
 import os
 import json
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from collections import deque
 
 import gspread
 from fastapi import FastAPI, HTTPException, Query
@@ -22,6 +24,19 @@ MAX_ITEMS_PER_ORDER = 30
 MAX_NAME_LEN = 80
 MAX_CONTACT_LEN = 30
 MAX_NOTES_LEN = 500
+MAX_REQUESTED_TIME_LEN = 60
+MAX_SOURCE_LEN = 20
+
+TENANT_ID_RE = re.compile(r"^[a-z0-9_]{2,40}$")
+ORDER_ID_RE = re.compile(r"^[a-f0-9]{8}$")  # secrets.token_hex(4) => 8 chars hex
+
+ALLOWED_DELIVERY_TYPES = {"pickup", "delivery"}
+ALLOWED_SOURCES = {"api", "swagger", "telegram", "whatsapp"}
+
+# Rate limits (por tenant, por minuto) - ajustables
+RL_MENU_PER_MIN = 120
+RL_CREATE_PER_MIN = 60
+RL_MARKPAID_PER_MIN = 60
 
 
 def now_iso_utc() -> str:
@@ -58,11 +73,93 @@ def log_event(event: str, **fields: Any) -> None:
     Logging mínimo en stdout (Render lo captura).
     Evita loguear secretos.
     """
-    safe = {k: v for k, v in fields.items() if k not in ("creds", "token")}
+    safe = {k: v for k, v in fields.items() if k not in ("creds", "token", "GCP_CREDENTIALS_JSON", "ADMIN_TOKEN")}
     print(json.dumps({"ts": now_iso_utc(), "event": event, **safe}, ensure_ascii=False))
 
 
+# =========================
+# Rate limiting (simple)
+# =========================
+
+class TenantRateLimiter:
+    def __init__(self):
+        self.buckets: Dict[str, deque] = {}
+        self.window_sec = 60
+
+    def hit(self, key: str, limit: int):
+        now = time.time()
+        dq = self.buckets.setdefault(key, deque())
+        while dq and (now - dq[0]) > self.window_sec:
+            dq.popleft()
+        if len(dq) >= limit:
+            raise HTTPException(status_code=429, detail="Rate limit exceeded for this tenant")
+        dq.append(now)
+
+
+_rate_limiter = TenantRateLimiter()
+
+
+def validate_tenant_id(tenant_id: str) -> None:
+    tid = (tenant_id or "").strip()
+    if not TENANT_ID_RE.match(tid):
+        raise HTTPException(status_code=422, detail="Invalid tenant_id format")
+
+
+def validate_order_id(order_id: str) -> None:
+    oid = (order_id or "").strip().lower()
+    if not ORDER_ID_RE.match(oid):
+        raise HTTPException(status_code=422, detail="Invalid order_id format")
+
+
+def validate_delivery_type(v: str) -> str:
+    dv = (v or "pickup").strip().lower()
+    if dv not in ALLOWED_DELIVERY_TYPES:
+        raise HTTPException(status_code=422, detail=f"delivery_type must be one of {sorted(ALLOWED_DELIVERY_TYPES)}")
+    return dv
+
+
+def validate_source(v: str) -> str:
+    sv = (v or "api").strip().lower()
+    if len(sv) > MAX_SOURCE_LEN:
+        raise HTTPException(status_code=422, detail="source too long")
+    if sv not in ALLOWED_SOURCES:
+        raise HTTPException(status_code=422, detail=f"source must be one of {sorted(ALLOWED_SOURCES)}")
+    return sv
+
+
+def validate_requested_time(v: str) -> str:
+    rv = (v or "ahora").strip()
+    if len(rv) > MAX_REQUESTED_TIME_LEN:
+        raise HTTPException(status_code=422, detail="requested_time too long")
+    return rv
+
+
+def validate_contact(contact: str) -> None:
+    c = (contact or "").strip()
+    if len(c) > MAX_CONTACT_LEN:
+        raise HTTPException(status_code=422, detail="customer_contact too long")
+    # 6..20 dígitos, opcional +
+    if not re.match(r"^\+?\d{6,20}$", c):
+        raise HTTPException(status_code=422, detail="customer_contact must be digits (optionally starting with +)")
+
+
+def require_admin_token(token: str) -> None:
+    expected = os.getenv(ENV_ADMIN_TOKEN, "").strip()
+    if not expected:
+        raise HTTPException(status_code=500, detail="ADMIN_TOKEN is not configured in env")
+    if (token or "").strip() != expected:
+        raise HTTPException(status_code=403, detail="Invalid admin token")
+
+
+# =========================
+# Sheets helpers
+# =========================
+
 def detect_header_row(values: List[List[Any]], required_headers: List[str], max_scan: int = 10) -> int:
+    """
+    Detecta en qué fila (1-indexed) están los headers técnicos.
+    Busca en las primeras max_scan filas.
+    """
     req = [normalize(h) for h in required_headers]
     scan = values[:max_scan]
     for idx, row in enumerate(scan, start=1):
@@ -73,6 +170,10 @@ def detect_header_row(values: List[List[Any]], required_headers: List[str], max_
 
 
 def read_records_manual(ws: gspread.Worksheet, required_headers: List[str]) -> List[Dict[str, Any]]:
+    """
+    Lee todos los registros de una worksheet detectando headers.
+    Devuelve lista de dicts (header -> value).
+    """
     values = ws.get_all_values()
     if not values:
         return []
@@ -212,6 +313,7 @@ def load_menu_index(orders_sh: gspread.Spreadsheet) -> Dict[str, Dict[str, Any]]
         if not sku:
             continue
 
+        # Importante: fila 2 (human) debe tener active != TRUE para no entrar aquí
         if not to_bool(r.get("active", "")):
             continue
 
@@ -330,6 +432,7 @@ def append_order_row(
         "total_amount": total_amount,
     }
 
+    # Respeta el orden real del header fila 1
     header_raw = ws.row_values(1)
     row: List[Any] = []
     for h_raw in header_raw:
@@ -363,31 +466,17 @@ def update_order_status(orders_sh: gspread.Spreadsheet, order_id: str, new_statu
         oid = ws.cell(r_idx, col_order_id).value
         if str(oid).strip() == order_id:
             old_status = ws.cell(r_idx, col_status).value or ""
+            # Solo escribe si cambia
             if normalize(old_status) != normalize(new_status):
                 ws.update_cell(r_idx, col_status, new_status)
             return {"found": True, "old_status": old_status}
+
     return {"found": False}
 
 
 def gen_order_id() -> str:
     import secrets
     return secrets.token_hex(4)
-
-
-def validate_contact(contact: str) -> None:
-    c = contact.strip()
-    if len(c) > MAX_CONTACT_LEN:
-        raise HTTPException(status_code=422, detail="customer_contact too long")
-    if not re.match(r"^\+?\d{6,20}$", c):
-        raise HTTPException(status_code=422, detail="customer_contact must be digits (optionally starting with +)")
-
-
-def require_admin_token(token: str) -> None:
-    expected = os.getenv(ENV_ADMIN_TOKEN, "").strip()
-    if not expected:
-        raise HTTPException(status_code=500, detail="ADMIN_TOKEN is not configured in env")
-    if token.strip() != expected:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
 
 
 # =========================
@@ -397,11 +486,9 @@ def require_admin_token(token: str) -> None:
 class AdminTokenIn(BaseModel):
     token: str
 
-
 class OrderItem(BaseModel):
     sku: str = Field(..., min_length=1)
     qty: int = Field(..., ge=1)
-
 
 class OrderCreateIn(BaseModel):
     tenant_id: str
@@ -413,19 +500,16 @@ class OrderCreateIn(BaseModel):
     requested_time: Optional[str] = "ahora"
     source: Optional[str] = "api"
 
-
 class OrderCreateOut(BaseModel):
     ok: bool
     order_id: str
     total_amount: float
     currency: str = "BOB"
 
-
 class MarkPaidIn(BaseModel):
     tenant_id: str
     order_id: str
     admin_chat_id: str  # <- blindaje clave
-
 
 class MarkPaidOut(BaseModel):
     ok: bool
@@ -439,7 +523,7 @@ class MarkPaidOut(BaseModel):
 # FastAPI App
 # =========================
 
-app = FastAPI(title=APP_NAME, version="1.1.0")
+app = FastAPI(title=APP_NAME, version="1.2.0")
 
 
 @app.get("/")
@@ -460,6 +544,9 @@ def admin_reload_tenants(payload: AdminTokenIn):
 
 @app.get("/menu")
 def get_menu(tenant_id: str = Query(..., description="tenant_id, ej: resto_demo")):
+    validate_tenant_id(tenant_id)
+    _rate_limiter.hit(f"menu:{tenant_id}", RL_MENU_PER_MIN)
+
     gc = get_gspread_client()
     tenant = get_tenant_or_404(gc, tenant_id)
 
@@ -476,6 +563,9 @@ def get_menu(tenant_id: str = Query(..., description="tenant_id, ej: resto_demo"
 
 @app.post("/orders/create", response_model=OrderCreateOut)
 def create_order(payload: OrderCreateIn):
+    validate_tenant_id(payload.tenant_id)
+    _rate_limiter.hit(f"create:{payload.tenant_id}", RL_CREATE_PER_MIN)
+
     gc = get_gspread_client()
     tenant = get_tenant_or_404(gc, payload.tenant_id)
 
@@ -496,6 +586,10 @@ def create_order(payload: OrderCreateIn):
     if len(notes) > MAX_NOTES_LEN:
         raise HTTPException(status_code=422, detail="notes too long")
 
+    delivery_type = validate_delivery_type(payload.delivery_type)
+    requested_time = validate_requested_time(payload.requested_time)
+    source = validate_source(payload.source)
+
     orders_sh = open_orders_spreadsheet(gc, tenant)
     menu_idx = load_menu_index(orders_sh)
 
@@ -512,10 +606,10 @@ def create_order(payload: OrderCreateIn):
         customer_contact=contact,
         items=items_list,
         notes=notes,
-        delivery_type=(payload.delivery_type or "pickup").strip(),
-        requested_time=(payload.requested_time or "ahora").strip(),
+        delivery_type=delivery_type,
+        requested_time=requested_time,
         status="PENDING_PAYMENT",
-        source=(payload.source or "api").strip(),
+        source=source,
         total_amount=total_amount,
     )
 
@@ -525,6 +619,10 @@ def create_order(payload: OrderCreateIn):
 
 @app.post("/orders/mark_paid", response_model=MarkPaidOut)
 def mark_paid(payload: MarkPaidIn):
+    validate_tenant_id(payload.tenant_id)
+    validate_order_id(payload.order_id)
+    _rate_limiter.hit(f"mark_paid:{payload.tenant_id}", RL_MARKPAID_PER_MIN)
+
     gc = get_gspread_client()
     tenant = get_tenant_or_404(gc, payload.tenant_id)
 
@@ -539,13 +637,23 @@ def mark_paid(payload: MarkPaidIn):
         raise HTTPException(status_code=403, detail="Invalid admin_chat_id for this tenant")
 
     orders_sh = open_orders_spreadsheet(gc, tenant)
-    result = update_order_status(orders_sh, payload.order_id, "PAID")
 
+    # 1) Leemos el estado anterior y (si aplica) actualizamos
+    result = update_order_status(orders_sh, payload.order_id, "PAID")
     if not result.get("found"):
         raise HTTPException(status_code=404, detail=f"Order not found: {payload.order_id}")
 
     old_status = str(result.get("old_status", "") or "")
-    already_paid = normalize(old_status) == "paid"
+    old_norm = normalize(old_status)
 
-    log_event("order_mark_paid", tenant_id=payload.tenant_id, order_id=payload.order_id, already_paid=already_paid)
-    return MarkPaidOut(ok=True, order_id=payload.order_id, status="PAID", old_status=old_status, already_paid=already_paid)
+    # 2) Idempotencia: si ya estaba PAID, respondemos ok y no “forzamos” nada más
+    if old_norm == "paid":
+        log_event("order_mark_paid_idempotent", tenant_id=payload.tenant_id, order_id=payload.order_id)
+        return MarkPaidOut(ok=True, order_id=payload.order_id, status="PAID", old_status=old_status, already_paid=True)
+
+    # 3) Control de transición: solo permitimos pagar desde PENDING_PAYMENT (o vacío si tu sheet estaba “nuevo”)
+    if old_norm not in ("pending_payment", "pendingpayment", ""):
+        raise HTTPException(status_code=409, detail=f"Cannot mark paid from status={old_status}")
+
+    log_event("order_mark_paid", tenant_id=payload.tenant_id, order_id=payload.order_id, old_status=old_status)
+    return MarkPaidOut(ok=True, order_id=payload.order_id, status="PAID", old_status=old_status, already_paid=False)
