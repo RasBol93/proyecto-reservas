@@ -1,5 +1,5 @@
 # =========================
-# PROYECTO RESERVAS v2.2
+# PROYECTO RESERVAS v2.2 (FULL)
 # Admin + Client Telegram Bots + Sheets Orders
 # (Cliente crea pedido REAL en Sheets + notifica Admin con botón ✅ Pagado)
 # =========================
@@ -51,7 +51,7 @@ def to_bool(v: Any) -> bool:
 
 
 def log_event(event: str, **fields: Any) -> None:
-    # No loguees secretos
+    # No loguees secretos (pero sí permite ver update si lo pasas como "update" sin tokens)
     safe = {k: v for k, v in fields.items() if "token" not in k and "secret" not in k and "creds" not in k}
     print(json.dumps({"ts": now_iso_utc(), "event": event, **safe}, ensure_ascii=False))
 
@@ -356,7 +356,7 @@ def send_admin_order_message(
     text = "\n".join(lines)
     callback_data = f"paid|{tenant['tenant_id']}|{order_id}"
 
-    telegram_api_call(bot_token, "sendMessage", {
+    res = telegram_api_call(bot_token, "sendMessage", {
         "chat_id": int(admin_chat_id),
         "text": text,
         "parse_mode": "Markdown",
@@ -366,6 +366,7 @@ def send_admin_order_message(
             ]
         }
     })
+    log_event("admin_notify_result", tenant_id=tenant.get("tenant_id"), order_id=order_id, ok=res.get("ok", False))
 
 
 # =========================
@@ -418,6 +419,9 @@ async def telegram_client_webhook(tenant_id: str, secret: str, update: Dict[str,
     validate_tenant_id(tenant_id)
     _rate.hit(f"client:{tenant_id}", RL_CLIENT_WEBHOOK_PER_MIN)
 
+    # DEBUG (clave): vemos qué llega desde Telegram
+    log_event("client_update", tenant_id=tenant_id, update=update)
+
     gc = get_gspread_client()
     tenant = get_tenant(gc, tenant_id)
 
@@ -445,7 +449,7 @@ async def telegram_client_webhook(tenant_id: str, secret: str, update: Dict[str,
 
         if normalize(text) in ("hola", "/start", "start"):
             state["cart"] = []  # reset demo
-            telegram_api_call(bot_token, "sendMessage", {
+            res = telegram_api_call(bot_token, "sendMessage", {
                 "chat_id": chat_id,
                 "text": "Bienvenido 👋\nSelecciona una opción:",
                 "reply_markup": {
@@ -455,6 +459,7 @@ async def telegram_client_webhook(tenant_id: str, secret: str, update: Dict[str,
                     ]
                 }
             })
+            log_event("client_send_welcome", tenant_id=tenant_id, chat_id=chat_id, ok=res.get("ok", False))
         return {"ok": True}
 
     # ========= CALLBACK =========
