@@ -66,7 +66,7 @@ def normalize(s: Any) -> str:
     }
     for a, b in replacements.items():
         s = s.replace(a, b)
-    s = re.sub(r"[^\w\s-]", "", s)   # mantiene "_" porque \w lo incluye
+    s = re.sub(r"[^\w\s-]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -137,7 +137,7 @@ def validate_contact(contact: str) -> None:
     c = (contact or "").strip()
     if len(c) > MAX_CONTACT_LEN:
         raise HTTPException(status_code=422, detail="customer_contact too long")
-    # Telegram chat_id no es teléfono, pero lo aceptamos como "contact"
+    # Para Telegram, esto es chat_id (número). Para otros canales puede variar más adelante.
     if not re.match(r"^\+?\d{3,20}$", c):
         raise HTTPException(status_code=422, detail="customer_contact must be digits (optionally starting with +)")
 
@@ -155,12 +155,6 @@ def require_admin_token(token: str) -> None:
 # =========================
 
 def detect_header_row(values: List[List[Any]], required_headers: List[str], max_scan: int = 10) -> int:
-    """
-    Soporta el patrón:
-      - fila 1: headers técnicos (EN)
-      - fila 2: traducción / etiquetas (ES)
-    Detecta la fila de headers técnicos buscando required_headers.
-    """
     req = [normalize(h) for h in required_headers]
     scan = values[:max_scan]
     for idx, row in enumerate(scan, start=1):
@@ -448,19 +442,57 @@ def update_order_status(orders_sh: gspread.Spreadsheet, order_id: str, new_statu
     return {"found": False}
 
 
+def find_order_fields(orders_sh: gspread.Spreadsheet, order_id: str) -> Dict[str, Any]:
+    """
+    Devuelve campos útiles del pedido buscándolo en la hoja Orders.
+    Necesario para notificar al cliente al marcar PAID.
+    """
+    ws = get_ws(orders_sh, "Orders")
+    values = ws.get_all_values()
+    if not values:
+        return {"found": False}
+
+    headers = values[0]
+    headers_norm = [normalize(h) for h in headers]
+
+    def get_col(name: str) -> int:
+        if name in headers_norm:
+            return headers_norm.index(name)
+        return -1
+
+    i_order = get_col("order_id")
+    if i_order < 0:
+        return {"found": False}
+
+    # campos opcionales
+    i_contact = get_col("customer_contact")
+    i_name = get_col("customer_name")
+    i_total = get_col("total_amount")
+
+    for row in values[1:]:
+        if i_order < len(row) and str(row[i_order]).strip().lower() == order_id.lower():
+            out = {"found": True, "order_id": order_id}
+            if i_contact >= 0 and i_contact < len(row):
+                out["customer_contact"] = str(row[i_contact]).strip()
+            if i_name >= 0 and i_name < len(row):
+                out["customer_name"] = str(row[i_name]).strip()
+            if i_total >= 0 and i_total < len(row):
+                out["total_amount"] = str(row[i_total]).strip()
+            return out
+
+    return {"found": False}
+
+
 def gen_order_id() -> str:
     import secrets
     return secrets.token_hex(4)
 
 
 # ---------- Content / FAQ (desde Sheets) ----------
-# IMPORTANTE: soporta fila 2 "traducción" porque filtramos por active=TRUE.
 
 def load_content_map(orders_sh: gspread.Spreadsheet) -> Dict[str, str]:
     """
-    Lee tab Content (fila 1 headers técnicos, fila 2 traducción opcional):
-      key, value, active
-    Devuelve dict {key: value} solo si active=TRUE.
+    Lee tab Content: key,value,active
     """
     ws = get_ws(orders_sh, "Content")
     rows = read_records_manual(ws, required_headers=["key", "value", "active"])
@@ -468,19 +500,16 @@ def load_content_map(orders_sh: gspread.Spreadsheet) -> Dict[str, str]:
     for r in rows:
         if not to_bool(r.get("active", "")):
             continue
-        # NO normalizar a algo raro: solo lower/strip para mantener keys exactas (location_text, etc.)
-        k = str(r.get("key", "")).strip().lower()
+        k = normalize(r.get("key", ""))
         v = str(r.get("value", "")).strip()
-        if k:
+        if k and v:
             out[k] = v
     return out
 
 
 def load_faq_list(orders_sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
     """
-    Lee tab FAQ (fila 1 headers técnicos, fila 2 traducción opcional):
-      id, question, answer, active, priority
-    Devuelve FAQs activas ordenadas por priority asc.
+    Lee tab FAQ: id,question,answer,active,priority
     """
     ws = get_ws(orders_sh, "FAQ")
     rows = read_records_manual(ws, required_headers=["id", "question", "answer", "active", "priority"])
@@ -499,6 +528,39 @@ def load_faq_list(orders_sh: gspread.Spreadsheet) -> List[Dict[str, Any]]:
             out.append({"id": fid, "question": q, "answer": a, "priority": p})
     out.sort(key=lambda x: x["priority"])
     return out
+
+
+def load_pickup_slots(orders_sh: gspread.Spreadsheet) -> List[str]:
+    """
+    Desde Content:
+      pickup_time_mode = slots
+      pickup_time_slots = "12:00,12:30,13:00"
+    """
+    try:
+        content = load_content_map(orders_sh)
+    except Exception:
+        return []
+
+    mode = normalize(content.get("pickup_time_mode", ""))
+    if mode != "slots":
+        return []
+
+    raw = content.get("pickup_time_slots", "").strip()
+    if not raw:
+        return []
+
+    slots = []
+    for part in raw.split(","):
+        s = part.strip()
+        if not s:
+            continue
+        # validación liviana (HH:MM o "ahora")
+        if s.lower() == "ahora":
+            slots.append("ahora")
+            continue
+        if re.match(r"^\d{1,2}:\d{2}$", s):
+            slots.append(s)
+    return slots[:24]  # límite razonable
 
 
 # =========================
@@ -599,6 +661,38 @@ def send_order_to_admin_telegram(
     log_event("telegram_send_order", tenant_id=tenant.get("tenant_id"), order_id=order_id, ok=res.get("ok", False))
 
 
+def notify_client_paid(tenant: Dict[str, Any], orders_sh: gspread.Spreadsheet, order_id: str) -> None:
+    """
+    Al marcar PAID, avisa al cliente por el bot CLIENT, si customer_contact es chat_id numérico.
+    """
+    client_token = (tenant.get("client_bot_token", "") or "").strip()
+    if not client_token:
+        log_event("client_notify_skip_missing_token", tenant_id=tenant.get("tenant_id"), order_id=order_id)
+        return
+
+    info = find_order_fields(orders_sh, order_id)
+    if not info.get("found"):
+        log_event("client_notify_skip_order_not_found", tenant_id=tenant.get("tenant_id"), order_id=order_id)
+        return
+
+    contact = str(info.get("customer_contact", "")).strip()
+    if not contact or not re.match(r"^\d{3,20}$", contact):
+        # si no es chat_id numérico, no podemos mandar por Telegram
+        log_event("client_notify_skip_invalid_contact", tenant_id=tenant.get("tenant_id"), order_id=order_id, contact=contact)
+        return
+
+    chat_id = int(contact)
+    name = info.get("customer_name", "") or "cliente"
+    total = info.get("total_amount", "")
+
+    msg = f"✅ ¡Listo, {name}! Tu pedido *{order_id}* fue marcado como *PAGADO*."
+    if total:
+        msg += f"\n💰 Total: {total} BOB"
+    msg += "\n\nGracias. 🙌"
+
+    telegram_send_text(client_token, chat_id, msg)
+
+
 def resolve_bot_by_secret(tenant: Dict[str, Any], secret: str) -> Tuple[str, str]:
     s = (secret or "").strip()
     admin_secret = (tenant.get("webhook_secret_admin", "") or "").strip()
@@ -663,6 +757,7 @@ def cart_text_and_total(state: Dict[str, Any], menu_idx: Dict[str, Dict[str, Any
     lines.append(f"\nTotal: {total:.2f} BOB")
     return ("\n".join(lines), round(total, 2))
 
+
 # =========================
 # API Models
 # =========================
@@ -706,7 +801,7 @@ class MarkPaidOut(BaseModel):
 # FastAPI App
 # =========================
 
-app = FastAPI(title=APP_NAME, version="2.0.1-client-pro-contentfaq")
+app = FastAPI(title=APP_NAME, version="2.0.1-client-pro")
 
 
 @app.get("/")
@@ -834,6 +929,12 @@ def mark_paid(payload: MarkPaidIn):
     if normalize(old_status) not in ("pending_payment", "pendingpayment", ""):
         raise HTTPException(status_code=409, detail=f"Cannot mark paid from status={old_status}")
 
+    # ✅ NEW: notificar cliente si es pedido Telegram (chat_id numérico)
+    try:
+        notify_client_paid(tenant, orders_sh, payload.order_id)
+    except Exception as e:
+        log_event("client_notify_exception", tenant_id=payload.tenant_id, order_id=payload.order_id, error=str(e))
+
     return MarkPaidOut(ok=True, order_id=payload.order_id, status="PAID", old_status=old_status, already_paid=False)
 
 
@@ -842,9 +943,6 @@ def mark_paid(payload: MarkPaidIn):
 # =========================
 
 def kb(rows: List[List[Tuple[str, str]]]) -> Dict[str, Any]:
-    """
-    rows: [[(text, callback_data), ...], ...]
-    """
     return {"inline_keyboard": [[{"text": t, "callback_data": c} for (t, c) in row] for row in rows]}
 
 def main_menu_kb() -> Dict[str, Any]:
@@ -854,6 +952,23 @@ def main_menu_kb() -> Dict[str, Any]:
         [("❓ Preguntas Frecuentes", "faq")],
         [("🛒 Carrito", "cart")],
     ])
+
+def polite_use_buttons(bot_token: str, chat_id: int) -> None:
+    telegram_send_text(bot_token, chat_id, "Por favor usa los botones para continuar 👇", main_menu_kb())
+
+def pickup_time_kb(slots: List[str]) -> Dict[str, Any]:
+    # 2 botones por fila
+    rows = []
+    row = []
+    for s in slots[:24]:
+        row.append((s, f"time|{s}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([("⬅️ Volver", "cart")])
+    return kb(rows)
 
 @app.post("/telegram/webhook/{tenant_id}/{secret}")
 async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
@@ -905,6 +1020,13 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 already_paid = normalize(old_status) == "paid"
                 if cb_id:
                     telegram_answer_callback(bot_token, cb_id, "✅ Marcado como PAID" if not already_paid else "✅ Ya estaba PAID")
+
+                # ✅ NEW: notificar cliente
+                try:
+                    notify_client_paid(tenant, orders_sh, order_id)
+                except Exception as e:
+                    log_event("client_notify_exception", tenant_id=tenant_id, order_id=order_id, error=str(e))
+
                 return {"ok": True}
 
             return {"ok": True}
@@ -923,12 +1045,10 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     return {"ok": True}
 
                 if data == "menu":
-                    # categorías desde sheets
                     if not cats:
                         telegram_send_text(bot_token, chat_id, "No hay menú activo.", main_menu_kb())
                         return {"ok": True}
                     rows = []
-                    # 1 botón por fila para evitar overflow
                     for c in sorted(cats.keys(), key=lambda x: normalize(x)):
                         rows.append([(c, f"cat|{normalize(c)}")])
                     rows.append([("⬅️ Volver", "home"), ("🛒 Carrito", "cart")])
@@ -937,7 +1057,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     return {"ok": True}
 
                 if data == "loc":
-                    # desde Content (fila 2 se ignora por active=FALSE)
                     try:
                         content = load_content_map(orders_sh)
                         text = content.get("location_text", "Ubicación no configurada.")
@@ -950,7 +1069,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     return {"ok": True}
 
                 if data == "faq":
-                    # botones de FAQ desde sheet (fila 2 se ignora por active=FALSE)
                     try:
                         faqs = load_faq_list(orders_sh)
                         if not faqs:
@@ -989,7 +1107,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             # category -> products
             if data.startswith("cat|"):
                 cat_norm = data.split("|", 1)[1].strip()
-                # encontrar la categoría real
                 real_cat = None
                 for c in cats.keys():
                     if normalize(c) == cat_norm:
@@ -1065,6 +1182,71 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, "Por favor escribe tu *nombre* (solo texto):")
                 return {"ok": True}
 
+            # time selected from slots
+            if data.startswith("time|"):
+                if state.get("step") != "ASK_TIME":
+                    # si llega fuera de lugar, volvemos al home
+                    polite_use_buttons(bot_token, chat_id)
+                    return {"ok": True}
+                selected = data.split("|", 1)[1].strip()
+                selected = validate_requested_time(selected)
+                state["requested_time"] = selected
+                # Forzamos creación como si hubiera escrito texto
+                # Simulamos entrada en la misma lógica de mensajes (abajo)
+                # (La creación final ocurre en el bloque ASK_TIME de mensajes)
+                # Aquí solo pedimos que escriba cualquier cosa? No.
+                # Mejor: creamos pedido aquí.
+                menu_idx2 = load_menu_index(orders_sh)
+                if not state["cart"]:
+                    state["step"] = "HOME"
+                    telegram_send_text(bot_token, chat_id, "Tu carrito está vacío.", main_menu_kb())
+                    return {"ok": True}
+
+                total_amount = calc_total_amount(state["cart"], menu_idx2)
+                order_id = gen_order_id()
+                customer_contact = str(chat_id)
+                validate_contact(customer_contact)
+
+                append_order_row(
+                    orders_sh=orders_sh,
+                    tenant_id=tenant_id,
+                    order_id=order_id,
+                    customer_name=state["customer_name"],
+                    customer_contact=customer_contact,
+                    items=state["cart"],
+                    delivery_type="pickup",
+                    requested_time=state["requested_time"],
+                    status="PENDING_PAYMENT",
+                    source="telegram",
+                    total_amount=total_amount,
+                )
+
+                try:
+                    send_order_to_admin_telegram(
+                        tenant=tenant,
+                        order_id=order_id,
+                        customer_name=state["customer_name"],
+                        customer_contact=customer_contact,
+                        items_list=state["cart"],
+                        total_amount=total_amount,
+                        requested_time=state["requested_time"],
+                    )
+                except Exception as e:
+                    log_event("telegram_send_exception", tenant_id=tenant_id, order_id=order_id, error=str(e))
+
+                cart_clear(state)
+                state["customer_name"] = ""
+                state["requested_time"] = ""
+                state["step"] = "HOME"
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    f"✅ Pedido creado\nID: {order_id}\nTotal: {total_amount:.2f} BOB\nEstado: PENDING_PAYMENT",
+                    main_menu_kb(),
+                )
+                return {"ok": True}
+
             return {"ok": True}
 
         return {"ok": True}
@@ -1090,18 +1272,19 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             telegram_send_text(bot_token, chat_id_int, "OK admin ✅")
         return {"ok": True}
 
-    # Client bot: /start o flujo de captura (nombre/hora)
+    # Client bot
     state = get_client_state(tenant_id, chat_id_int)
 
-    if normalize(text_in) in ("start", "/start", "hola"):
+    # /start
+    if normalize(text_in) in ("start", "/start"):
         state["step"] = "HOME"
-        # welcome desde Content si existe
-        try:
-            content = load_content_map(orders_sh)
-            welcome = content.get("welcome_text", "Bienvenido. Elige una opción:")
-        except Exception:
-            welcome = "Bienvenido. Elige una opción:"
-        telegram_send_text(bot_token, chat_id_int, welcome, main_menu_kb())
+        telegram_send_text(bot_token, chat_id_int, "Bienvenido. Elige una opción:", main_menu_kb())
+        return {"ok": True}
+
+    # Si escribe "hola" u otra cosa en cualquier estado donde deben usarse botones:
+    if state["step"] in ("HOME", "PICK_CAT", "PICK_PROD", "PICK_QTY"):
+        # ✅ NEW: instrucción clara
+        polite_use_buttons(bot_token, chat_id_int)
         return {"ok": True}
 
     # Captura nombre
@@ -1111,12 +1294,24 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             telegram_send_text(bot_token, chat_id_int, "Nombre inválido. Intenta nuevamente:")
             return {"ok": True}
         state["customer_name"] = name
+
+        # ✅ NEW: si hay slots configurados, mostramos botones
+        slots = load_pickup_slots(orders_sh)
         state["step"] = "ASK_TIME"
-        telegram_send_text(bot_token, chat_id_int, "¿A qué hora deseas recoger? (ej: ahora, 19:30)")
+        if slots:
+            telegram_send_text(bot_token, chat_id_int, "Elige la hora de recojo:", pickup_time_kb(slots))
+        else:
+            telegram_send_text(bot_token, chat_id_int, "¿A qué hora deseas recoger? (ej: ahora, 19:30)")
         return {"ok": True}
 
-    # Captura hora y crea orden
+    # Captura hora (modo libre) y crea orden
     if state["step"] == "ASK_TIME":
+        slots = load_pickup_slots(orders_sh)
+        if slots:
+            # Si hay slots, no aceptamos texto libre: debe usar botones
+            polite_use_buttons(bot_token, chat_id_int)
+            return {"ok": True}
+
         requested = validate_requested_time(text_in)
         state["requested_time"] = requested
 
@@ -1129,7 +1324,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         total_amount = calc_total_amount(state["cart"], menu_idx)
         order_id = gen_order_id()
 
-        # contacto = chat_id (por ahora)
         customer_contact = str(chat_id_int)
         validate_contact(customer_contact)
 
@@ -1147,7 +1341,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             total_amount=total_amount,
         )
 
-        # notificar admin
         try:
             send_order_to_admin_telegram(
                 tenant=tenant,
@@ -1161,7 +1354,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         except Exception as e:
             log_event("telegram_send_exception", tenant_id=tenant_id, order_id=order_id, error=str(e))
 
-        # limpiar carrito y reset
         cart_clear(state)
         state["customer_name"] = ""
         state["requested_time"] = ""
@@ -1175,6 +1367,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         )
         return {"ok": True}
 
-    # fallback mínimo (no hardcode de negocio)
-    telegram_send_text(bot_token, chat_id_int, "Usa /start para ver el menú.", main_menu_kb())
+    # fallback final
+    polite_use_buttons(bot_token, chat_id_int)
     return {"ok": True}
