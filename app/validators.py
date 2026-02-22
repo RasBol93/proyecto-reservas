@@ -3,6 +3,14 @@
 import re
 from fastapi import HTTPException
 
+from app.config import (
+    MAX_CONTACT_LEN,
+    MAX_REQUESTED_TIME_LEN,
+    MAX_SOURCE_LEN,
+    ALLOWED_DELIVERY_TYPES,
+    ALLOWED_SOURCES,
+)
+
 
 # =========================
 # Tenant
@@ -29,12 +37,13 @@ def validate_order_id(order_id: str) -> None:
     if not order_id:
         raise HTTPException(status_code=400, detail="order_id is required")
 
-    order_id = order_id.strip()
+    order_id = order_id.strip().lower()
 
-    if len(order_id) < 4:
-        raise HTTPException(status_code=400, detail="order_id too short")
+    # gen_order_id() = token_hex(4) => 8 caracteres hex
+    if len(order_id) != 8:
+        raise HTTPException(status_code=400, detail="order_id must be 8 hex chars")
 
-    if not re.match(r"^[a-f0-9]+$", order_id.lower()):
+    if not re.fullmatch(r"[a-f0-9]{8}", order_id):
         raise HTTPException(status_code=400, detail="order_id invalid format")
 
 
@@ -48,8 +57,11 @@ def validate_contact(contact: str) -> None:
 
     contact = contact.strip()
 
-    if len(contact) < 5:
+    if len(contact) < 3:
         raise HTTPException(status_code=400, detail="customer_contact too short")
+
+    if len(contact) > MAX_CONTACT_LEN:
+        raise HTTPException(status_code=422, detail="customer_contact too long")
 
 
 # =========================
@@ -57,15 +69,17 @@ def validate_contact(contact: str) -> None:
 # =========================
 
 def validate_delivery_type(delivery_type: str) -> str:
-    allowed = {"pickup", "delivery"}
-
+    # En tu proyecto: SOLO pickup
     if not delivery_type:
-        return "pickup"
+        return next(iter(ALLOWED_DELIVERY_TYPES))  # "pickup"
 
     delivery_type = delivery_type.strip().lower()
 
-    if delivery_type not in allowed:
-        raise HTTPException(status_code=422, detail=f"delivery_type must be one of {allowed}")
+    if delivery_type not in ALLOWED_DELIVERY_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"delivery_type must be one of {sorted(ALLOWED_DELIVERY_TYPES)}",
+        )
 
     return delivery_type
 
@@ -80,7 +94,7 @@ def validate_requested_time(requested_time: str) -> str:
 
     requested_time = requested_time.strip()
 
-    if len(requested_time) > 100:
+    if len(requested_time) > MAX_REQUESTED_TIME_LEN:
         raise HTTPException(status_code=422, detail="requested_time too long")
 
     return requested_time
@@ -91,14 +105,18 @@ def validate_requested_time(requested_time: str) -> str:
 # =========================
 
 def validate_source(source: str) -> str:
-    allowed = {"api", "telegram", "web", "manychat"}
-
     if not source:
         return "api"
 
     source = source.strip().lower()
 
-    if source not in allowed:
-        raise HTTPException(status_code=422, detail=f"source must be one of {allowed}")
+    if len(source) > MAX_SOURCE_LEN:
+        raise HTTPException(status_code=422, detail="source too long")
+
+    if source not in ALLOWED_SOURCES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"source must be one of {sorted(ALLOWED_SOURCES)}",
+        )
 
     return source
