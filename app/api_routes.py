@@ -1,6 +1,6 @@
 # app/api_routes.py
 
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -12,14 +12,13 @@ from app.config import (
     RL_CREATE_PER_MIN,
     RL_MARKPAID_PER_MIN,
 )
+
 from app.rate_limit import rate_limiter
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
 from app.tenants import get_tenant_or_404, load_tenants, tenants_cache_info
 from app.menu import load_menu_index, group_menu_by_category, calc_total_amount
-from app.orders import (
-    append_order_row,
-    update_order_status,
-    gen_order_id,
+from app.orders import append_order_row, update_order_status, gen_order_id
+from app.validators import (
     validate_tenant_id,
     validate_order_id,
     validate_contact,
@@ -82,9 +81,12 @@ class MarkPaidOut(BaseModel):
 
 @router.post("/admin/reload_tenants")
 def admin_reload_tenants(payload: AdminTokenIn):
+    # OJO: este require_admin_token debe aceptar token string (no Header)
     require_admin_token(payload.token)
+
     gc = get_gspread_client()
-    load_tenants(gc, force=True)
+    load_tenants(gc=gc, force=True)
+
     return {"ok": True, **tenants_cache_info()}
 
 
@@ -94,7 +96,7 @@ def get_menu(tenant_id: str = Query(..., description="tenant_id, ej: resto_demo"
     rate_limiter.hit(f"menu:{tenant_id}", RL_MENU_PER_MIN)
 
     gc = get_gspread_client()
-    tenant = get_tenant_or_404(tenant_id)
+    tenant = get_tenant_or_404(tenant_id, gc=gc)
 
     if not tenant.get("orders_enabled", False):
         raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {tenant_id}")
@@ -112,7 +114,7 @@ def create_order(payload: OrderCreateIn):
     rate_limiter.hit(f"create:{payload.tenant_id}", RL_CREATE_PER_MIN)
 
     gc = get_gspread_client()
-    tenant = get_tenant_or_404(payload.tenant_id)
+    tenant = get_tenant_or_404(payload.tenant_id, gc=gc)
 
     if not tenant.get("orders_enabled", False):
         raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {payload.tenant_id}")
@@ -163,7 +165,7 @@ def mark_paid(payload: MarkPaidIn):
     rate_limiter.hit(f"mark_paid:{payload.tenant_id}", RL_MARKPAID_PER_MIN)
 
     gc = get_gspread_client()
-    tenant = get_tenant_or_404(payload.tenant_id)
+    tenant = get_tenant_or_404(payload.tenant_id, gc=gc)
 
     expected_admin_chat_id = str(tenant.get("admin_chat_id", "")).strip()
     if not expected_admin_chat_id:
