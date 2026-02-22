@@ -1,27 +1,55 @@
-# app/validators.py
+# app/sheets.py
 
-from fastapi import Header, HTTPException
-from typing import Optional
-from app.config import ADMIN_TOKEN
+import os
+import json
+from typing import Any
+
+import gspread
+
+from app.config import ENV_GCP_CREDS_JSON
 
 
-def require_admin_token(x_admin_token: Optional[str] = Header(default=None)) -> None:
+def get_gspread_client() -> gspread.Client:
     """
-    Valida que el header X-Admin-Token coincida con el ADMIN_TOKEN
+    Crea un cliente de gspread usando el JSON (service account) guardado en la env var.
+    Env var esperada: GCP_CREDENTIALS_JSON
     """
-    if not x_admin_token:
-        raise HTTPException(status_code=401, detail="Missing X-Admin-Token header")
+    creds_raw = (os.getenv(ENV_GCP_CREDS_JSON, "") or "").strip()
+    if not creds_raw:
+        raise RuntimeError(f"Missing env var: {ENV_GCP_CREDS_JSON}")
 
-    if x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid admin token")
+    info = json.loads(creds_raw)
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    return gspread.service_account_from_dict(info, scopes=scopes)
 
 
-def validate_tenant_id(tenant_id: str) -> None:
+def open_spreadsheet_by_key(gc: gspread.Client, spreadsheet_id: str) -> gspread.Spreadsheet:
     """
-    Validación básica de tenant_id
+    Abre un Spreadsheet por su key/id.
     """
-    if not tenant_id:
-        raise HTTPException(status_code=400, detail="tenant_id is required")
+    sid = (spreadsheet_id or "").strip()
+    if not sid:
+        raise RuntimeError("spreadsheet_id is required to open spreadsheet")
+    return gc.open_by_key(sid)
 
-    if len(tenant_id) < 3:
-        raise HTTPException(status_code=400, detail="tenant_id too short")
+
+def get_worksheet(sh: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
+    """
+    Obtiene una worksheet por título.
+    """
+    t = (title or "").strip()
+    if not t:
+        raise RuntimeError("worksheet title is required")
+    return sh.worksheet(t)
+
+
+def get_all_values(ws: gspread.Worksheet) -> list[list[Any]]:
+    """
+    Wrapper simple por si luego quieres interceptar logs/errores.
+    """
+    return ws.get_all_values()
