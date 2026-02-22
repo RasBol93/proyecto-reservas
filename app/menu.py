@@ -4,7 +4,15 @@ from typing import Any, Dict, List
 
 from fastapi import HTTPException
 
-from app.sheets import get_ws, read_records_manual, to_bool, normalize
+from app.sheets import get_ws, read_records_manual
+from app.utils import to_bool, normalize
+
+
+def _ensure_ws(spreadsheet, title: str):
+    try:
+        return get_ws(spreadsheet, title)
+    except Exception:
+        raise HTTPException(status_code=500, detail=f"Worksheet '{title}' not found in tenant spreadsheet")
 
 
 # -------------------------
@@ -17,7 +25,8 @@ def load_menu_index(orders_sh) -> Dict[str, Dict[str, Any]]:
     Espera headers técnicos:
       sku, name, price, active, category
     """
-    ws = get_ws(orders_sh, "Menu")
+    ws = _ensure_ws(orders_sh, "Menu")
+
     rows = read_records_manual(
         ws,
         required_headers=["sku", "name", "price", "active", "category"],
@@ -34,7 +43,6 @@ def load_menu_index(orders_sh) -> Dict[str, Dict[str, Any]]:
             continue
 
         price_raw = str(r.get("price", "")).strip()
-
         try:
             price = float(price_raw)
         except Exception:
@@ -42,9 +50,9 @@ def load_menu_index(orders_sh) -> Dict[str, Dict[str, Any]]:
 
         idx[sku] = {
             "sku": sku,
-            "name": r.get("name", ""),
+            "name": str(r.get("name", "")).strip(),
             "price": price,
-            "category": r.get("category", "") or "Otros",
+            "category": str(r.get("category", "")).strip() or "Otros",
         }
 
     return idx
@@ -59,20 +67,18 @@ def group_menu_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, Lis
 
     for item in menu_idx.values():
         cat = item.get("category", "") or "Otros"
-
-        cats.setdefault(cat, []).append({
-            "sku": item["sku"],
-            "name": item.get("name", ""),
-            "price": item.get("price", 0),
-            "category": cat,
-        })
+        cats.setdefault(cat, []).append(
+            {
+                "sku": item["sku"],
+                "name": item.get("name", ""),
+                "price": item.get("price", 0),
+                "category": cat,
+            }
+        )
 
     # ordenar productos por nombre normalizado
     for cat in cats:
-        cats[cat] = sorted(
-            cats[cat],
-            key=lambda x: normalize(x.get("name", ""))
-        )
+        cats[cat] = sorted(cats[cat], key=lambda x: normalize(x.get("name", "")))
 
     return cats
 
@@ -91,7 +97,11 @@ def calc_total_amount(items: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str,
         if sku not in menu_idx:
             raise HTTPException(status_code=422, detail=f"Unknown sku: {sku}")
 
-        qty_i = int(qty)
+        try:
+            qty_i = int(qty)
+        except Exception:
+            raise HTTPException(status_code=422, detail=f"qty must be an integer for sku={sku}")
+
         if qty_i <= 0:
             raise HTTPException(status_code=422, detail=f"qty must be >= 1 for sku={sku}")
 
