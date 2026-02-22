@@ -5,7 +5,8 @@ from typing import Any, Dict, List
 
 from fastapi import HTTPException
 
-from app.sheets import get_ws, normalize, now_iso_utc
+from app.sheets import get_ws
+from app.utils import normalize, now_iso_utc
 
 
 def gen_order_id() -> str:
@@ -97,9 +98,10 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
     col_status = headers_norm.index("status") + 1
 
     # Buscar order_id desde fila 2
+    oid_target = str(order_id).strip().lower()
     for r_idx in range(2, len(values) + 1):
         oid = ws.cell(r_idx, col_order_id).value
-        if str(oid).strip().lower() == str(order_id).strip().lower():
+        if str(oid).strip().lower() == oid_target:
             old_status = ws.cell(r_idx, col_status).value or ""
             if normalize(old_status) != normalize(new_status):
                 ws.update_cell(r_idx, col_status, new_status)
