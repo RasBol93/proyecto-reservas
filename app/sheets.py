@@ -9,10 +9,6 @@ from app.config import ENV_GCP_CREDS_JSON, ENV_CONFIG_SPREADSHEET_ID, env_requir
 from app.utils import normalize
 
 
-# -------------------------
-# Gspread client
-# -------------------------
-
 def get_gspread_client() -> gspread.Client:
     """
     Crea un cliente de gspread usando el JSON de service account guardado en env.
@@ -47,28 +43,19 @@ def open_config_spreadsheet(gc: gspread.Client) -> gspread.Spreadsheet:
     return gc.open_by_key(config_id)
 
 
-# -------------------------
-# Worksheet helpers
-# -------------------------
-
 def get_ws(spreadsheet: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
     """
-    Devuelve una worksheet por nombre.
+    Obtiene una worksheet por título.
     """
     return spreadsheet.worksheet(title)
 
 
-# -------------------------
-# Reading helpers (headers desplazados)
-# -------------------------
-
 def detect_header_row(values: List[List[Any]], required_headers: List[str], max_scan: int = 10) -> int:
     """
-    Soporta el patrón típico:
+    Soporta el patrón:
       - fila 1: headers técnicos (EN)
       - fila 2: traducción / etiquetas (ES)
-    Detecta la fila de headers técnicos buscando required_headers.
-    Retorna índice 1-based.
+    Detecta la fila de headers técnicos buscando required_headers normalizados.
     """
     req = [normalize(h) for h in required_headers]
     scan = values[:max_scan]
@@ -78,14 +65,13 @@ def detect_header_row(values: List[List[Any]], required_headers: List[str], max_
         if all(h in row_norm for h in req):
             return idx
 
-    # fallback: fila 1
     return 1
 
 
 def read_records_manual(ws: gspread.Worksheet, required_headers: List[str]) -> List[Dict[str, Any]]:
     """
-    Lee una worksheet y devuelve una lista de dicts usando headers normalizados.
-    Detecta automáticamente la fila de headers.
+    Lee registros detectando automáticamente la fila de headers técnicos.
+    Devuelve lista de dicts con keys normalizadas (lower, sin tildes, etc.).
     """
     values = ws.get_all_values()
     if not values:
@@ -96,7 +82,6 @@ def read_records_manual(ws: gspread.Worksheet, required_headers: List[str]) -> L
     headers_norm = [normalize(h) for h in headers]
 
     records: List[Dict[str, Any]] = []
-
     for row in values[header_row:]:
         if not any(str(x).strip() for x in row):
             continue
