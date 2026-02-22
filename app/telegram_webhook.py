@@ -12,7 +12,7 @@ from app.sheets import get_gspread_client, open_spreadsheet_by_key
 from app.menu import load_menu_index, group_menu_by_category, calc_total_amount
 from app.orders import append_order_row, update_order_status, gen_order_id
 from app.telegram_keyboard import kb, main_menu_kb
-from app.utils import normalize
+from app.utils import normalize, log_event
 
 router = APIRouter()
 
@@ -35,13 +35,9 @@ def telegram_api_call(bot_token: str, method: str, payload: Dict[str, Any]) -> D
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw)
-    except Exception as e:
-        # No explotar el webhook por un fallo de Telegram
-        return {"ok": False, "error": str(e)}
+    with urllib.request.urlopen(req, timeout=12) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw)
 
 
 def telegram_send_text(
@@ -56,11 +52,23 @@ def telegram_send_text(
         payload["reply_markup"] = reply_markup
     if parse_mode:
         payload["parse_mode"] = parse_mode
-    telegram_api_call(bot_token, "sendMessage", payload)
+
+    try:
+        res = telegram_api_call(bot_token, "sendMessage", payload)
+        if not res.get("ok", True):
+            log_event("telegram_send_failed", chat_id=chat_id, error=res.get("description") or res)
+    except Exception as e:
+        # No explotar el webhook por un fallo de Telegram, pero loguear
+        log_event("telegram_send_exception", chat_id=chat_id, error=str(e))
 
 
 def telegram_answer_callback(bot_token: str, callback_query_id: str, text: str = "OK") -> None:
-    telegram_api_call(bot_token, "answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
+    try:
+        res = telegram_api_call(bot_token, "answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
+        if not res.get("ok", True):
+            log_event("telegram_ack_failed", error=res.get("description") or res)
+    except Exception as e:
+        log_event("telegram_ack_exception", error=str(e))
 
 
 # -------------------------
@@ -75,14 +83,18 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
     gc = get_gspread_client()
 
-    # ✅ FIRMA CORRECTA: (tenant_id, gc=gc)
+    # Firma correcta
     tenant = get_tenant_or_404(tenant_id, gc=gc)
 
     mode, bot_token = resolve_bot_by_secret(tenant, secret)
     if not bot_token:
         return {"ok": True}
 
-    orders_sh = open_spreadsheet_by_key(gc, tenant["orders_sheet_id"])
+    orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
+    if not orders_sheet_id:
+        raise HTTPException(status_code=500, detail=f"orders_sheet_id missing for tenant: {tenant_id}")
+
+    orders_sh = open_spreadsheet_by_key(gc, orders_sheet_id)
 
     # -------------------------
     # 1) CALLBACK QUERY
@@ -93,14 +105,11 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         cb_id = cb.get("id")
         chat_id = int(cb["message"]["chat"]["id"])
 
-        # ACK rápido (evita “loading” eterno)
+        # ACK rápido
         if cb_id:
-            try:
-                telegram_answer_callback(bot_token, cb_id, "OK")
-            except Exception:
-                pass
+            telegram_answer_callback(bot_token, cb_id, "OK")
 
-        # ✅ ADMIN: paid|tenant|order_id (solo si este webhook es el ADMIN bot)
+        # ADMIN: paid|tenant|order_id
         if mode == "admin" and data.startswith("paid|"):
             parts = data.split("|")
             if len(parts) != 3:
@@ -113,18 +122,12 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 raise HTTPException(status_code=400, detail="Tenant mismatch in callback")
 
             update_order_status(orders_sh, order_id, "PAID")
-
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                f"✅ Pedido {order_id} marcado como PAID",
-            )
+            telegram_send_text(bot_token, chat_id, f"✅ Pedido {order_id} marcado como PAID")
             return {"ok": True}
 
-        # ✅ CLIENT callbacks (solo si este webhook es el CLIENT bot)
+        # CLIENT callbacks
         if mode == "client":
 
-            # HOME / MENU
             if data in ("home", "menu"):
                 if data == "home":
                     telegram_send_text(bot_token, chat_id, "Elige una opción:", main_menu_kb())
@@ -145,7 +148,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, "📋 Elige una categoría:", kb(rows))
                 return {"ok": True}
 
-            # CATEGORY -> PRODUCTS
             if data.startswith("cat|"):
                 cat_norm = data.split("|", 1)[1].strip()
 
@@ -175,7 +177,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, f"🍽 {real_cat} — elige un producto:", kb(rows))
                 return {"ok": True}
 
-            # PRODUCT -> QTY
             if data.startswith("prd|"):
                 sku = data.split("|", 1)[1].strip()
 
@@ -183,11 +184,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     [("1", f"qty|{sku}|1"), ("2", f"qty|{sku}|2"), ("3", f"qty|{sku}|3"), ("4", f"qty|{sku}|4")],
                     [("⬅️ Volver", "menu")],
                 ]
-
                 telegram_send_text(bot_token, chat_id, "Selecciona cantidad:", kb(rows))
                 return {"ok": True}
 
-            # QTY -> CREATE ORDER (simple: 1 item)
             if data.startswith("qty|"):
                 parts = data.split("|")
                 if len(parts) != 3:
@@ -241,15 +240,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         text = (msg.get("text") or "").strip()
 
         if mode == "client" and normalize(text) in ("start", "/start", "hola"):
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                "Bienvenido 👋\nElige una opción:",
-                main_menu_kb(),
-            )
+            telegram_send_text(bot_token, chat_id, "Bienvenido 👋\nElige una opción:", main_menu_kb())
             return {"ok": True}
 
-        # fallback
         if mode == "client":
             telegram_send_text(bot_token, chat_id, "Usa /start para ver el menú.", main_menu_kb())
         else:
