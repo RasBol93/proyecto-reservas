@@ -10,7 +10,7 @@ from app.utils import now_iso_utc, to_bool, normalize
 
 
 # Cache simple en memoria
-_TENANTS_CACHE: Dict[str, Dict[str, Any]] = {}
+_TENANTS_CACHE: Dict[str, Dict[str, Any]] = {}   # key = tenant_id_normalizado
 _TENANTS_CACHE_AT: Optional[str] = None
 
 
@@ -18,6 +18,7 @@ def tenants_cache_info() -> Dict[str, Any]:
     return {
         "cached_at": _TENANTS_CACHE_AT,
         "tenants_count": len(_TENANTS_CACHE),
+        "tenant_ids": list(_TENANTS_CACHE.keys()),
     }
 
 
@@ -39,11 +40,23 @@ def _detect_header_row(values: list, required_headers: list, max_scan: int = 10)
     """
     req = [normalize(h) for h in required_headers]
     scan = values[:max_scan]
+
     for idx, row in enumerate(scan):
         row_norm = [normalize(x) for x in row]
         if all(h in row_norm for h in req):
             return idx
+
     return 0
+
+
+def _norm_tenant_id(tenant_id: Any) -> str:
+    """
+    tenant_id NORMALIZADO para que:
+    - no dependa de mayúsculas/minúsculas
+    - no dependa de tildes
+    - sea consistente con el resto del sistema
+    """
+    return normalize(tenant_id).replace(" ", "")
 
 
 def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -82,13 +95,17 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
         k = normalize(key)
         if k not in headers_norm:
             return ""
-        idx = headers_norm.index(k)
-        return row[idx] if idx < len(row) else ""
+        i = headers_norm.index(k)
+        return row[i] if i < len(row) else ""
 
     tenants: Dict[str, Dict[str, Any]] = {}
 
     for row in values[header_idx + 1:]:
-        tid = str(get(row, "tenant_id")).strip()
+        tid_raw = str(get(row, "tenant_id")).strip()
+        if not tid_raw:
+            continue
+
+        tid = _norm_tenant_id(tid_raw)
         if not tid:
             continue
 
@@ -103,16 +120,17 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
         webhook_secret_client = _pick_first_nonempty(get(row, "webhook_secret_client"))
 
         tenants[tid] = {
-            "tenant_id": tid,
+            "tenant_id": tid,                 # normalizado (clave real)
+            "tenant_id_raw": tid_raw,         # original (solo para referencia/debug)
             "name": get(row, "name"),
             "business_type": get(row, "business_type"),
             "orders_sheet_id": str(get(row, "orders_sheet_id")).strip(),
             "orders_enabled": to_bool(get(row, "orders_enabled")),
             "bookings_enabled": to_bool(get(row, "bookings_enabled")),
-            "admin_bot_token": admin_bot_token,
-            "client_bot_token": client_bot_token,
-            "webhook_secret_admin": webhook_secret_admin,
-            "webhook_secret_client": webhook_secret_client,
+            "admin_bot_token": (admin_bot_token or "").strip(),
+            "client_bot_token": (client_bot_token or "").strip(),
+            "webhook_secret_admin": (webhook_secret_admin or "").strip(),
+            "webhook_secret_client": (webhook_secret_client or "").strip(),
             "admin_chat_id": str(get(row, "admin_chat_id")).strip(),
             "timezone": (get(row, "timezone") or "America/La_Paz").strip(),
             "admin_whatsapp": str(get(row, "admin_whatsapp")).strip(),
@@ -123,24 +141,17 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
     return _TENANTS_CACHE
 
 
-def get_tenant_or_404(*args, gc=None) -> Dict[str, Any]:
+def get_tenant_or_404(tenant_id: str, gc=None) -> Dict[str, Any]:
     """
-    Compatibilidad con ambas llamadas:
-      - get_tenant_or_404(tenant_id, gc=gc)
-      - get_tenant_or_404(gc, tenant_id)
+    Firma ÚNICA y coherente.
+    (Se acabó el *args porque generaba llamadas ambiguas y bugs difíciles.)
     """
-    if len(args) == 2:
-        # forma vieja: (gc, tenant_id)
-        gc_local = args[0]
-        tenant_id = args[1]
-    elif len(args) == 1:
-        tenant_id = args[0]
-        gc_local = gc
-    else:
-        raise HTTPException(status_code=500, detail="get_tenant_or_404() invalid arguments")
+    tid = _norm_tenant_id(tenant_id)
+    if not tid:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
 
-    tenants = load_tenants(gc=gc_local)
-    t = tenants.get((tenant_id or "").strip())
+    tenants = load_tenants(gc=gc)
+    t = tenants.get(tid)
     if not t:
         raise HTTPException(status_code=404, detail=f"Tenant not found or inactive: {tenant_id}")
     return t
