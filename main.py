@@ -1,9 +1,4 @@
-from fastapi import FastAPI
-from app.config import APP_NAME, APP_VERSION
-from app.telegram_webhook import router as telegram_router
-from app.api_routes import router as api_router
+# main.py
+from app.app_factory import create_app
 
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
-
-app.include_router(api_router)
-app.include_router(telegram_router)
+app = create_app()
