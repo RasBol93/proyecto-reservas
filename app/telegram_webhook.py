@@ -58,7 +58,6 @@ def telegram_send_text(
         if not res.get("ok", True):
             log_event("telegram_send_failed", chat_id=chat_id, error=res.get("description") or res)
     except Exception as e:
-        # No explotar el webhook por un fallo de Telegram, pero loguear
         log_event("telegram_send_exception", chat_id=chat_id, error=str(e))
 
 
@@ -72,6 +71,58 @@ def telegram_answer_callback(bot_token: str, callback_query_id: str, text: str =
 
 
 # -------------------------
+# helpers tenant fields
+# -------------------------
+
+def get_admin_bot_token(tenant: Dict[str, Any]) -> str:
+    # soporta nombres antiguos y nuevos
+    return (tenant.get("admin_bot_token") or tenant.get("bot_token_admin") or "").strip()
+
+
+def get_client_bot_token(tenant: Dict[str, Any]) -> str:
+    return (tenant.get("client_bot_token") or tenant.get("bot_token_client") or "").strip()
+
+
+def get_admin_chat_id(tenant: Dict[str, Any]) -> Optional[int]:
+    raw = (tenant.get("admin_chat_id") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def notify_admin_new_order(tenant: Dict[str, Any], tenant_id: str, order_id: str, total: float, items: list) -> None:
+    admin_token = get_admin_bot_token(tenant)
+    admin_chat_id = get_admin_chat_id(tenant)
+
+    if not admin_token or not admin_chat_id:
+        log_event(
+            "admin_notify_skipped",
+            tenant_id=tenant_id,
+            reason="missing admin_bot_token or admin_chat_id",
+            admin_chat_id=str(admin_chat_id),
+        )
+        return
+
+    # Botón de pago (callback_data <= 64 bytes; esto entra perfecto)
+    pay_btn = kb([[("✅ Pagado", f"paid|{tenant_id}|{order_id}")]])
+
+    # Mensaje simple (puedes enriquecer luego)
+    txt = (
+        f"🧾 *Nuevo pedido*\n"
+        f"Tenant: `{tenant_id}`\n"
+        f"ID: `{order_id}`\n"
+        f"Total: *{total:.2f}* BOB\n"
+        f"Items: {len(items)}\n\n"
+        f"Pulsa ✅ Pagado cuando confirmes el pago."
+    )
+
+    telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=pay_btn, parse_mode="Markdown")
+
+
+# -------------------------
 # Webhook endpoint
 # -------------------------
 
@@ -82,8 +133,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         return {"ok": True}
 
     gc = get_gspread_client()
-
-    # Firma correcta
     tenant = get_tenant_or_404(tenant_id, gc=gc)
 
     mode, bot_token = resolve_bot_by_secret(tenant, secret)
@@ -105,7 +154,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         cb_id = cb.get("id")
         chat_id = int(cb["message"]["chat"]["id"])
 
-        # ACK rápido
         if cb_id:
             telegram_answer_callback(bot_token, cb_id, "OK")
 
@@ -220,6 +268,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     source="telegram",
                     total_amount=total,
                 )
+
+                # ✅ NUEVO: avisar al admin
+                notify_admin_new_order(tenant, tenant_id, order_id, total, items)
 
                 telegram_send_text(
                     bot_token,
