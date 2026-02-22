@@ -35,9 +35,13 @@ def telegram_api_call(bot_token: str, method: str, payload: Dict[str, Any]) -> D
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        raw = resp.read().decode("utf-8")
-        return json.loads(raw)
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw)
+    except Exception as e:
+        # No explotar el webhook por un fallo de Telegram
+        return {"ok": False, "error": str(e)}
 
 
 def telegram_send_text(
@@ -66,9 +70,13 @@ def telegram_answer_callback(bot_token: str, callback_query_id: str, text: str =
 @router.post("/telegram/webhook/{tenant_id}/{secret}")
 async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
     tenant_id = (tenant_id or "").strip()
+    if not tenant_id:
+        return {"ok": True}
 
     gc = get_gspread_client()
-    tenant = get_tenant_or_404(gc, tenant_id)
+
+    # ✅ FIRMA CORRECTA: (tenant_id, gc=gc)
+    tenant = get_tenant_or_404(tenant_id, gc=gc)
 
     mode, bot_token = resolve_bot_by_secret(tenant, secret)
     if not bot_token:
@@ -92,8 +100,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             except Exception:
                 pass
 
-        # ADMIN: paid|tenant|order_id
-        if data.startswith("paid|"):
+        # ✅ ADMIN: paid|tenant|order_id (solo si este webhook es el ADMIN bot)
+        if mode == "admin" and data.startswith("paid|"):
             parts = data.split("|")
             if len(parts) != 3:
                 return {"ok": True}
@@ -113,128 +121,114 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             )
             return {"ok": True}
 
-        # CLIENT MENU
-        if data in ("home", "menu"):
-            if data == "home":
-                telegram_send_text(bot_token, chat_id, "Elige una opción:", main_menu_kb())
+        # ✅ CLIENT callbacks (solo si este webhook es el CLIENT bot)
+        if mode == "client":
+
+            # HOME / MENU
+            if data in ("home", "menu"):
+                if data == "home":
+                    telegram_send_text(bot_token, chat_id, "Elige una opción:", main_menu_kb())
+                    return {"ok": True}
+
+                menu_idx = load_menu_index(orders_sh)
+                cats = group_menu_by_category(menu_idx)
+
+                if not cats:
+                    telegram_send_text(bot_token, chat_id, "No hay menú activo.", main_menu_kb())
+                    return {"ok": True}
+
+                rows = []
+                for c in sorted(cats.keys(), key=lambda x: normalize(x)):
+                    rows.append([(c, f"cat|{normalize(c)}")])
+                rows.append([("⬅️ Volver", "home")])
+
+                telegram_send_text(bot_token, chat_id, "📋 Elige una categoría:", kb(rows))
                 return {"ok": True}
 
-            menu_idx = load_menu_index(orders_sh)
-            cats = group_menu_by_category(menu_idx)
+            # CATEGORY -> PRODUCTS
+            if data.startswith("cat|"):
+                cat_norm = data.split("|", 1)[1].strip()
 
-            if not cats:
-                telegram_send_text(bot_token, chat_id, "No hay menú activo.", main_menu_kb())
+                menu_idx = load_menu_index(orders_sh)
+                cats = group_menu_by_category(menu_idx)
+
+                real_cat = None
+                for c in cats.keys():
+                    if normalize(c) == cat_norm:
+                        real_cat = c
+                        break
+
+                if not real_cat:
+                    telegram_send_text(bot_token, chat_id, "Categoría no encontrada.", main_menu_kb())
+                    return {"ok": True}
+
+                items = cats.get(real_cat, [])
+                if not items:
+                    telegram_send_text(bot_token, chat_id, "No hay productos activos.", main_menu_kb())
+                    return {"ok": True}
+
+                rows = []
+                for it in items[:20]:
+                    rows.append([(f"{it['name']} ({it['price']:.0f})", f"prd|{it['sku']}")])
+                rows.append([("⬅️ Categorías", "menu")])
+
+                telegram_send_text(bot_token, chat_id, f"🍽 {real_cat} — elige un producto:", kb(rows))
                 return {"ok": True}
 
-            rows = []
-            for c in sorted(cats.keys(), key=lambda x: normalize(x)):
-                rows.append([(c, f"cat|{normalize(c)}")])
+            # PRODUCT -> QTY
+            if data.startswith("prd|"):
+                sku = data.split("|", 1)[1].strip()
 
-            rows.append([("⬅️ Volver", "home")])
+                rows = [
+                    [("1", f"qty|{sku}|1"), ("2", f"qty|{sku}|2"), ("3", f"qty|{sku}|3"), ("4", f"qty|{sku}|4")],
+                    [("⬅️ Volver", "menu")],
+                ]
 
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                "📋 Elige una categoría:",
-                kb(rows),
-            )
-            return {"ok": True}
-
-        # CATEGORY -> PRODUCTS
-        if data.startswith("cat|"):
-            cat_norm = data.split("|", 1)[1].strip()
-
-            menu_idx = load_menu_index(orders_sh)
-            cats = group_menu_by_category(menu_idx)
-
-            real_cat = None
-            for c in cats.keys():
-                if normalize(c) == cat_norm:
-                    real_cat = c
-                    break
-
-            if not real_cat:
-                telegram_send_text(bot_token, chat_id, "Categoría no encontrada.", main_menu_kb())
+                telegram_send_text(bot_token, chat_id, "Selecciona cantidad:", kb(rows))
                 return {"ok": True}
 
-            items = cats.get(real_cat, [])
-            if not items:
-                telegram_send_text(bot_token, chat_id, "No hay productos activos.", main_menu_kb())
+            # QTY -> CREATE ORDER (simple: 1 item)
+            if data.startswith("qty|"):
+                parts = data.split("|")
+                if len(parts) != 3:
+                    return {"ok": True}
+
+                _, sku, qty_s = parts
+                try:
+                    qty = int(qty_s)
+                except Exception:
+                    qty = 1
+
+                menu_idx = load_menu_index(orders_sh)
+                if sku not in menu_idx:
+                    telegram_send_text(bot_token, chat_id, "Producto no disponible.", main_menu_kb())
+                    return {"ok": True}
+
+                items = [{"sku": sku, "qty": max(1, qty)}]
+                total = calc_total_amount(items, menu_idx)
+                order_id = gen_order_id()
+
+                append_order_row(
+                    orders_sh=orders_sh,
+                    tenant_id=tenant_id,
+                    order_id=order_id,
+                    customer_name="Cliente Telegram",
+                    customer_contact=str(chat_id),
+                    items=items,
+                    delivery_type="pickup",
+                    requested_time="ahora",
+                    status="PENDING_PAYMENT",
+                    source="telegram",
+                    total_amount=total,
+                )
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    f"✅ Pedido creado\nID: {order_id}\nTotal: {total:.2f} BOB\nEstado: PENDING_PAYMENT",
+                    main_menu_kb(),
+                )
                 return {"ok": True}
-
-            rows = []
-            for it in items[:20]:
-                rows.append([(f"{it['name']} ({it['price']:.0f})", f"prd|{it['sku']}")])
-
-            rows.append([("⬅️ Categorías", "menu")])
-
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                f"🍽 {real_cat} — elige un producto:",
-                kb(rows),
-            )
-            return {"ok": True}
-
-        # PRODUCT -> QTY
-        if data.startswith("prd|"):
-            sku = data.split("|", 1)[1].strip()
-
-            rows = [
-                [("1", f"qty|{sku}|1"), ("2", f"qty|{sku}|2"), ("3", f"qty|{sku}|3"), ("4", f"qty|{sku}|4")],
-                [("⬅️ Volver", "menu")],
-            ]
-
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                "Selecciona cantidad:",
-                kb(rows),
-            )
-            return {"ok": True}
-
-        # QTY -> CREATE ORDER (simple: 1 item)
-        if data.startswith("qty|"):
-            parts = data.split("|")
-            if len(parts) != 3:
-                return {"ok": True}
-
-            _, sku, qty_s = parts
-            try:
-                qty = int(qty_s)
-            except Exception:
-                qty = 1
-
-            menu_idx = load_menu_index(orders_sh)
-            if sku not in menu_idx:
-                telegram_send_text(bot_token, chat_id, "Producto no disponible.", main_menu_kb())
-                return {"ok": True}
-
-            items = [{"sku": sku, "qty": max(1, qty)}]
-            total = calc_total_amount(items, menu_idx)
-            order_id = gen_order_id()
-
-            append_order_row(
-                orders_sh=orders_sh,
-                tenant_id=tenant_id,
-                order_id=order_id,
-                customer_name="Cliente Telegram",
-                customer_contact=str(chat_id),
-                items=items,
-                delivery_type="pickup",
-                requested_time="ahora",
-                status="PENDING_PAYMENT",
-                source="telegram",
-                total_amount=total,
-            )
-
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                f"✅ Pedido creado\nID: {order_id}\nTotal: {total:.2f} BOB\nEstado: PENDING_PAYMENT",
-                main_menu_kb(),
-            )
-            return {"ok": True}
 
         return {"ok": True}
 
@@ -246,7 +240,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         chat_id = int(msg["chat"]["id"])
         text = (msg.get("text") or "").strip()
 
-        if normalize(text) in ("start", "/start", "hola"):
+        if mode == "client" and normalize(text) in ("start", "/start", "hola"):
             telegram_send_text(
                 bot_token,
                 chat_id,
@@ -256,7 +250,11 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             return {"ok": True}
 
         # fallback
-        telegram_send_text(bot_token, chat_id, "Usa /start para ver el menú.", main_menu_kb())
+        if mode == "client":
+            telegram_send_text(bot_token, chat_id, "Usa /start para ver el menú.", main_menu_kb())
+        else:
+            telegram_send_text(bot_token, chat_id, "OK admin ✅")
+
         return {"ok": True}
 
     return {"ok": True}
