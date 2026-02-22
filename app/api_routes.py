@@ -81,7 +81,7 @@ class MarkPaidOut(BaseModel):
 
 @router.post("/admin/reload_tenants")
 def admin_reload_tenants(payload: AdminTokenIn):
-    # OJO: este require_admin_token debe aceptar token string (no Header)
+    # Admin auth por token en body (no header)
     require_admin_token(payload.token)
 
     gc = get_gspread_client()
