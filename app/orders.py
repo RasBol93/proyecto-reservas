@@ -14,19 +14,30 @@ def gen_order_id() -> str:
     return secrets.token_hex(4)  # 8 chars hex
 
 
+def _ensure_ws(spreadsheet, title: str):
+    """
+    Obtiene worksheet por título. Si no existe, lanza error claro.
+    """
+    try:
+        return get_ws(spreadsheet, title)
+    except Exception:
+        raise HTTPException(status_code=500, detail=f"Worksheet '{title}' not found in tenant spreadsheet")
+
+
 def ensure_orders_headers(ws, required: List[str]) -> List[str]:
     values = ws.get_all_values()
     if not values or not values[0]:
         raise HTTPException(status_code=500, detail="Orders sheet is empty or missing headers in row 1")
 
-    headers = values[0]
-    headers_norm = [normalize(h) for h in headers]
+    headers_raw = values[0]
+    headers_norm = [normalize(h) for h in headers_raw]
 
-    missing = [h for h in required if normalize(h) not in headers_norm]
+    required_norm = [normalize(h) for h in required]
+    missing = [h for h in required_norm if h not in headers_norm]
     if missing:
         raise HTTPException(
             status_code=500,
-            detail=f"Orders sheet missing required headers in row 1: {missing}. Headers actuales: {headers}",
+            detail=f"Orders sheet missing required headers in row 1: {missing}. Headers actuales: {headers_raw}",
         )
 
     return headers_norm
@@ -45,7 +56,7 @@ def append_order_row(
     source: str,
     total_amount: float,
 ) -> None:
-    ws = get_ws(orders_sh, "Orders")
+    ws = _ensure_ws(orders_sh, "Orders")
 
     ensure_orders_headers(
         ws,
@@ -83,28 +94,39 @@ def append_order_row(
 
 
 def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, Any]:
-    ws = get_ws(orders_sh, "Orders")
+    ws = _ensure_ws(orders_sh, "Orders")
+
     values = ws.get_all_values()
-    if not values:
+    if not values or not values[0]:
         return {"found": False}
 
-    headers = values[0]
-    headers_norm = [normalize(h) for h in headers]
+    headers_raw = values[0]
+    headers_norm = [normalize(h) for h in headers_raw]
 
     if "order_id" not in headers_norm or "status" not in headers_norm:
         raise HTTPException(status_code=500, detail="Orders sheet must have order_id and status headers in row 1")
 
-    col_order_id = headers_norm.index("order_id") + 1
-    col_status = headers_norm.index("status") + 1
+    col_order_id = headers_norm.index("order_id")  # 0-based en values
+    col_status = headers_norm.index("status")      # 0-based en values
 
-    # Buscar order_id desde fila 2
-    oid_target = str(order_id).strip().lower()
-    for r_idx in range(2, len(values) + 1):
-        oid = ws.cell(r_idx, col_order_id).value
-        if str(oid).strip().lower() == oid_target:
-            old_status = ws.cell(r_idx, col_status).value or ""
-            if normalize(old_status) != normalize(new_status):
-                ws.update_cell(r_idx, col_status, new_status)
-            return {"found": True, "old_status": old_status}
+    oid_target = normalize(order_id)
 
-    return {"found": False}
+    # Buscar en values (rápido, 0 llamadas extra)
+    found_row_index_1based = None
+    old_status = ""
+    for i in range(1, len(values)):  # desde fila 2 (índice 1)
+        row = values[i]
+        oid = row[col_order_id] if col_order_id < len(row) else ""
+        if normalize(oid) == oid_target:
+            found_row_index_1based = i + 1  # convertir a 1-based para Sheets
+            old_status = row[col_status] if col_status < len(row) else ""
+            break
+
+    if not found_row_index_1based:
+        return {"found": False}
+
+    # Solo actualizar si cambia
+    if normalize(old_status) != normalize(new_status):
+        ws.update_cell(found_row_index_1based, col_status + 1, new_status)
+
+    return {"found": True, "old_status": old_status}
