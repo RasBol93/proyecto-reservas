@@ -1,11 +1,11 @@
 # app/orders.py
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from fastapi import HTTPException
 
-from app.sheets import get_ws
+from app.sheets import get_ws, detect_header_row
 from app.utils import normalize, now_iso_utc
 
 
@@ -24,23 +24,40 @@ def _ensure_ws(spreadsheet, title: str):
         raise HTTPException(status_code=500, detail=f"Worksheet '{title}' not found in tenant spreadsheet")
 
 
-def ensure_orders_headers(ws, required: List[str]) -> List[str]:
+def _get_orders_header(ws, required: List[str]) -> Tuple[int, List[str], List[str]]:
+    """
+    Devuelve:
+      - header_row (1-based)
+      - headers_raw (tal cual en el sheet)
+      - headers_norm (normalizados)
+    Detecta automáticamente la fila de headers (para soportar fila 1 o fila 2).
+    """
     values = ws.get_all_values()
-    if not values or not values[0]:
-        raise HTTPException(status_code=500, detail="Orders sheet is empty or missing headers in row 1")
+    if not values:
+        raise HTTPException(status_code=500, detail="Orders sheet is empty")
 
-    headers_raw = values[0]
+    header_row = detect_header_row(values, required_headers=required)  # 1-based
+    if header_row < 1 or header_row > len(values):
+        header_row = 1
+
+    headers_raw = values[header_row - 1]
+    if not headers_raw:
+        raise HTTPException(status_code=500, detail=f"Orders sheet missing headers in row {header_row}")
+
     headers_norm = [normalize(h) for h in headers_raw]
-
     required_norm = [normalize(h) for h in required]
+
     missing = [h for h in required_norm if h not in headers_norm]
     if missing:
         raise HTTPException(
             status_code=500,
-            detail=f"Orders sheet missing required headers in row 1: {missing}. Headers actuales: {headers_raw}",
+            detail=(
+                f"Orders sheet missing required headers in row {header_row}: {missing}. "
+                f"Headers actuales: {headers_raw}"
+            ),
         )
 
-    return headers_norm
+    return header_row, headers_raw, headers_norm
 
 
 def append_order_row(
@@ -58,19 +75,16 @@ def append_order_row(
 ) -> None:
     ws = _ensure_ws(orders_sh, "Orders")
 
-    ensure_orders_headers(
-        ws,
-        required=[
-            "order_id", "created_at", "tenant_id", "customer_name", "customer_contact",
-            "items", "notes", "delivery_type", "requested_time", "status", "source", "total_amount",
-        ],
-    )
+    required = [
+        "order_id", "created_at", "tenant_id", "customer_name", "customer_contact",
+        "items", "notes", "delivery_type", "requested_time", "status", "source", "total_amount",
+    ]
 
-    created_at = now_iso_utc()
+    header_row, headers_raw, headers_norm = _get_orders_header(ws, required=required)
 
     payload_map: Dict[str, Any] = {
         "order_id": order_id,
-        "created_at": created_at,
+        "created_at": now_iso_utc(),
         "tenant_id": tenant_id,
         "customer_name": customer_name,
         "customer_contact": customer_contact,
@@ -83,12 +97,13 @@ def append_order_row(
         "total_amount": total_amount,
     }
 
-    # Mantener el orden EXACTO de columnas según la fila 1 del Sheet
-    header_raw = ws.row_values(1)
+    # Mantener EXACTO el orden de columnas según la fila real de headers detectada
+    # (no asumas fila 1)
+    header_cells = ws.row_values(header_row)
     row: List[Any] = []
-    for h_raw in header_raw:
-        h = normalize(h_raw)
-        row.append(payload_map.get(h, ""))
+    for h_raw in header_cells:
+        key = normalize(h_raw)
+        row.append(payload_map.get(key, ""))
 
     ws.append_row(row, value_input_option="USER_ENTERED")
 
@@ -96,37 +111,34 @@ def append_order_row(
 def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, Any]:
     ws = _ensure_ws(orders_sh, "Orders")
 
+    required = ["order_id", "status"]
+    header_row, headers_raw, headers_norm = _get_orders_header(ws, required=required)
+
     values = ws.get_all_values()
-    if not values or not values[0]:
+    if not values:
         return {"found": False}
 
-    headers_raw = values[0]
-    headers_norm = [normalize(h) for h in headers_raw]
-
-    if "order_id" not in headers_norm or "status" not in headers_norm:
-        raise HTTPException(status_code=500, detail="Orders sheet must have order_id and status headers in row 1")
-
-    col_order_id = headers_norm.index("order_id")  # 0-based en values
-    col_status = headers_norm.index("status")      # 0-based en values
+    col_order_id = headers_norm.index("order_id")  # 0-based en la fila header
+    col_status = headers_norm.index("status")      # 0-based
 
     oid_target = normalize(order_id)
-
-    # Buscar en values (rápido, 0 llamadas extra)
-    found_row_index_1based = None
     old_status = ""
-    for i in range(1, len(values)):  # desde fila 2 (índice 1)
+    found_row_1based = None
+
+    # data empieza después de header_row
+    start_idx = header_row  # porque values es 0-based y header_row es 1-based
+    for i in range(start_idx, len(values)):
         row = values[i]
         oid = row[col_order_id] if col_order_id < len(row) else ""
         if normalize(oid) == oid_target:
-            found_row_index_1based = i + 1  # convertir a 1-based para Sheets
+            found_row_1based = i + 1
             old_status = row[col_status] if col_status < len(row) else ""
             break
 
-    if not found_row_index_1based:
+    if not found_row_1based:
         return {"found": False}
 
-    # Solo actualizar si cambia
     if normalize(old_status) != normalize(new_status):
-        ws.update_cell(found_row_index_1based, col_status + 1, new_status)
+        ws.update_cell(found_row_1based, col_status + 1, new_status)
 
     return {"found": True, "old_status": old_status}
