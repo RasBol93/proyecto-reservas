@@ -12,10 +12,6 @@ from app.config import (
 )
 
 
-# =========================
-# Tenant
-# =========================
-
 def validate_tenant_id(tenant_id: str) -> None:
     if not tenant_id:
         raise HTTPException(status_code=400, detail="tenant_id is required")
@@ -28,10 +24,6 @@ def validate_tenant_id(tenant_id: str) -> None:
     if not re.match(r"^[a-zA-Z0-9_\-]+$", tenant_id):
         raise HTTPException(status_code=400, detail="tenant_id has invalid characters")
 
-
-# =========================
-# Order ID
-# =========================
 
 def validate_order_id(order_id: str) -> None:
     if not order_id:
@@ -47,10 +39,6 @@ def validate_order_id(order_id: str) -> None:
         raise HTTPException(status_code=400, detail="order_id invalid format")
 
 
-# =========================
-# Contact
-# =========================
-
 def validate_contact(contact: str) -> None:
     if not contact:
         raise HTTPException(status_code=400, detail="customer_contact is required")
@@ -64,14 +52,10 @@ def validate_contact(contact: str) -> None:
         raise HTTPException(status_code=422, detail="customer_contact too long")
 
 
-# =========================
-# Delivery Type
-# =========================
-
 def validate_delivery_type(delivery_type: str) -> str:
     # En tu proyecto: SOLO pickup
     if not delivery_type:
-        return next(iter(ALLOWED_DELIVERY_TYPES))  # "pickup"
+        return "pickup"
 
     delivery_type = delivery_type.strip().lower()
 
@@ -84,10 +68,6 @@ def validate_delivery_type(delivery_type: str) -> str:
     return delivery_type
 
 
-# =========================
-# Requested Time
-# =========================
-
 def validate_requested_time(requested_time: str) -> str:
     if not requested_time:
         return "ahora"
@@ -99,10 +79,6 @@ def validate_requested_time(requested_time: str) -> str:
 
     return requested_time
 
-
-# =========================
-# Source
-# =========================
 
 def validate_source(source: str) -> str:
     if not source:
