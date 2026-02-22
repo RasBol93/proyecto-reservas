@@ -12,7 +12,6 @@ from app.config import (
     RL_CREATE_PER_MIN,
     RL_MARKPAID_PER_MIN,
 )
-
 from app.rate_limit import rate_limiter
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
 from app.tenants import get_tenant_or_404, load_tenants, tenants_cache_info
@@ -36,7 +35,7 @@ router = APIRouter()
 # =========================
 
 class AdminTokenIn(BaseModel):
-    token: str
+    token: str = Field(..., min_length=1)
 
 
 class OrderItem(BaseModel):
@@ -81,12 +80,10 @@ class MarkPaidOut(BaseModel):
 
 @router.post("/admin/reload_tenants")
 def admin_reload_tenants(payload: AdminTokenIn):
-    # Admin auth por token en body (no header)
     require_admin_token(payload.token)
 
     gc = get_gspread_client()
     load_tenants(gc=gc, force=True)
-
     return {"ok": True, **tenants_cache_info()}
 
 
@@ -129,9 +126,9 @@ def create_order(payload: OrderCreateIn):
     if not payload.items or len(payload.items) > MAX_ITEMS_PER_ORDER:
         raise HTTPException(status_code=422, detail=f"items must be 1..{MAX_ITEMS_PER_ORDER}")
 
-    delivery_type = validate_delivery_type(payload.delivery_type)
-    requested_time = validate_requested_time(payload.requested_time)
-    source = validate_source(payload.source)
+    delivery_type = validate_delivery_type(payload.delivery_type or "pickup")
+    requested_time = validate_requested_time(payload.requested_time or "ahora")
+    source = validate_source(payload.source or "api")
 
     orders_sh = open_spreadsheet_by_key(gc, tenant["orders_sheet_id"])
     menu_idx = load_menu_index(orders_sh)
