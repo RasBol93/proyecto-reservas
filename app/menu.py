@@ -8,25 +8,13 @@ from app.sheets import get_ws, read_records_manual
 from app.utils import to_bool, normalize
 
 
-def _ensure_ws(spreadsheet, title: str):
-    try:
-        return get_ws(spreadsheet, title)
-    except Exception:
-        raise HTTPException(status_code=500, detail=f"Worksheet '{title}' not found in tenant spreadsheet")
-
-
-# -------------------------
-# Menu index
-# -------------------------
-
 def load_menu_index(orders_sh) -> Dict[str, Dict[str, Any]]:
     """
     Lee la hoja 'Menu' del sheet del tenant.
     Espera headers técnicos:
       sku, name, price, active, category
     """
-    ws = _ensure_ws(orders_sh, "Menu")
-
+    ws = get_ws(orders_sh, "Menu")
     rows = read_records_manual(
         ws,
         required_headers=["sku", "name", "price", "active", "category"],
@@ -58,10 +46,6 @@ def load_menu_index(orders_sh) -> Dict[str, Dict[str, Any]]:
     return idx
 
 
-# -------------------------
-# Agrupar por categoría
-# -------------------------
-
 def group_menu_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     cats: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -76,16 +60,11 @@ def group_menu_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, Lis
             }
         )
 
-    # ordenar productos por nombre normalizado
     for cat in cats:
         cats[cat] = sorted(cats[cat], key=lambda x: normalize(x.get("name", "")))
 
     return cats
 
-
-# -------------------------
-# Calcular total
-# -------------------------
 
 def calc_total_amount(items: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str, Any]]) -> float:
     total = 0.0
@@ -100,7 +79,7 @@ def calc_total_amount(items: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str,
         try:
             qty_i = int(qty)
         except Exception:
-            raise HTTPException(status_code=422, detail=f"qty must be an integer for sku={sku}")
+            raise HTTPException(status_code=422, detail=f"qty must be integer for sku={sku}")
 
         if qty_i <= 0:
             raise HTTPException(status_code=422, detail=f"qty must be >= 1 for sku={sku}")
