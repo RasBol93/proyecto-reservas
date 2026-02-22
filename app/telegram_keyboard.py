@@ -16,9 +16,8 @@ def kb(rows: List[List[Tuple[str, str]]]) -> Dict[str, Any]:
 
 
 def main_menu_kb() -> Dict[str, Any]:
+    # Solo botones que tu webhook ya entiende: menu y home
     return kb([
         [("📋 Ver Menú", "menu")],
-        [("📍 Ver Ubicación", "loc")],
-        [("❓ Preguntas Frecuentes", "faq")],
-        [("🛒 Carrito", "cart")],
+        [("🏠 Inicio", "home")],
     ])
