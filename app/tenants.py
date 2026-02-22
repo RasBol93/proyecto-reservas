@@ -1,104 +1,160 @@
 # app/tenants.py
 
-from typing import Dict, Tuple, Optional
+from typing import Any, Dict, Optional, Tuple
+
 from fastapi import HTTPException
 
 from app.config import TENANTS_SHEET_NAME
-from app.sheets import open_spreadsheet_by_key
+from app.sheets import get_gspread_client, open_config_spreadsheet
+from app.utils import now_iso_utc, to_bool, normalize
 
 
-# -------------------------
-# Cache en memoria
-# -------------------------
-
-_TENANTS_CACHE: Dict[str, Dict] = {}
-_TENANTS_LOADED: bool = False
+# Cache simple en memoria
+_TENANTS_CACHE: Dict[str, Dict[str, Any]] = {}
+_TENANTS_CACHE_AT: Optional[str] = None
 
 
-# -------------------------
-# Loaders
-# -------------------------
-
-def load_tenants(gc, force: bool = False) -> Dict[str, Dict]:
-    """
-    Carga tenants desde Google Sheets y los cachea.
-    """
-    global _TENANTS_CACHE, _TENANTS_LOADED
-
-    if _TENANTS_LOADED and not force:
-        return _TENANTS_CACHE
-
-    sh = open_spreadsheet_by_key(gc, TENANTS_SHEET_NAME)
-    ws = sh.sheet1
-
-    rows = ws.get_all_records()
-    tenants: Dict[str, Dict] = {}
-
-    for row in rows:
-        tenant_id = str(row.get("tenant_id", "")).strip()
-        if not tenant_id:
-            continue
-
-        tenants[tenant_id] = row
-
-    _TENANTS_CACHE = tenants
-    _TENANTS_LOADED = True
-    return tenants
-
-
-def tenants_cache_info() -> Dict[str, int]:
+def tenants_cache_info() -> Dict[str, Any]:
     return {
-        "tenants_loaded": int(_TENANTS_LOADED),
+        "cached_at": _TENANTS_CACHE_AT,
         "tenants_count": len(_TENANTS_CACHE),
     }
 
 
-# -------------------------
-# Access helpers
-# -------------------------
+def _pick_first_nonempty(*vals: Any) -> str:
+    for v in vals:
+        s = str(v or "").strip()
+        if s:
+            return s
+    return ""
 
-def get_tenant_or_404(gc, tenant_id: str) -> Dict:
+
+def _detect_header_row(values: list, required_headers: list, max_scan: int = 10) -> int:
     """
-    Devuelve tenant o lanza 404.
+    Soporta:
+      - Fila 1: headers técnicos
+      - Fila 2: traducción/etiquetas
+    Encuentra la fila que contiene required_headers.
+    Devuelve índice 0-based.
     """
-    tenant_id = (tenant_id or "").strip()
-    if not tenant_id:
-        raise HTTPException(status_code=400, detail="tenant_id missing")
-
-    tenants = load_tenants(gc)
-
-    tenant = tenants.get(tenant_id)
-    if not tenant:
-        raise HTTPException(status_code=404, detail=f"Tenant not found: {tenant_id}")
-
-    return tenant
+    req = [normalize(h) for h in required_headers]
+    scan = values[:max_scan]
+    for idx, row in enumerate(scan):
+        row_norm = [normalize(x) for x in row]
+        if all(h in row_norm for h in req):
+            return idx
+    return 0
 
 
-# -------------------------
-# Telegram helpers
-# -------------------------
-
-def resolve_bot_by_secret(tenant: Dict, secret: str) -> Tuple[str, Optional[str]]:
+def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
     """
-    Devuelve (mode, bot_token) según el secret recibido.
-
-    mode: "admin" | "client" | "none"
+    Lee Tenants desde el spreadsheet de configuración (RESERVACIONES_CONFIG).
+    Soporta compatibilidad:
+      - admin_bot_token + webhook_secret_admin (nuevo)
+      - bot_token + webhook_secret (viejo fallback)
     """
+    global _TENANTS_CACHE, _TENANTS_CACHE_AT
 
-    secret = (secret or "").strip()
-    if not secret:
-        return ("none", None)
+    if _TENANTS_CACHE and not force:
+        return _TENANTS_CACHE
 
-    # Admin bot
-    admin_secret = str(tenant.get("admin_webhook_secret", "")).strip()
-    if admin_secret and secret == admin_secret:
-        token = str(tenant.get("admin_bot_token", "")).strip()
-        return ("admin", token if token else None)
+    if gc is None:
+        gc = get_gspread_client()
 
-    # Client bot
-    client_secret = str(tenant.get("client_webhook_secret", "")).strip()
-    if client_secret and secret == client_secret:
-        token = str(tenant.get("client_bot_token", "")).strip()
-        return ("client", token if token else None)
+    sh = open_config_spreadsheet(gc)
 
-    return ("none", None)
+    try:
+        ws = sh.worksheet(TENANTS_SHEET_NAME)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Missing worksheet '{TENANTS_SHEET_NAME}': {e}")
+
+    values = ws.get_all_values()
+    if not values:
+        _TENANTS_CACHE = {}
+        _TENANTS_CACHE_AT = now_iso_utc()
+        return _TENANTS_CACHE
+
+    header_idx = _detect_header_row(values, required_headers=["tenant_id", "orders_sheet_id", "active"])
+    headers_raw = values[header_idx]
+    headers_norm = [normalize(h) for h in headers_raw]
+
+    def get(row: list, key: str) -> str:
+        k = normalize(key)
+        if k not in headers_norm:
+            return ""
+        idx = headers_norm.index(k)
+        return row[idx] if idx < len(row) else ""
+
+    tenants: Dict[str, Dict[str, Any]] = {}
+
+    for row in values[header_idx + 1:]:
+        tid = str(get(row, "tenant_id")).strip()
+        if not tid:
+            continue
+
+        active = to_bool(get(row, "active"))
+        if not active:
+            continue
+
+        admin_bot_token = _pick_first_nonempty(get(row, "admin_bot_token"), get(row, "bot_token"))
+        client_bot_token = _pick_first_nonempty(get(row, "client_bot_token"))
+
+        webhook_secret_admin = _pick_first_nonempty(get(row, "webhook_secret_admin"), get(row, "webhook_secret"))
+        webhook_secret_client = _pick_first_nonempty(get(row, "webhook_secret_client"))
+
+        tenants[tid] = {
+            "tenant_id": tid,
+            "name": get(row, "name"),
+            "business_type": get(row, "business_type"),
+            "orders_sheet_id": str(get(row, "orders_sheet_id")).strip(),
+            "orders_enabled": to_bool(get(row, "orders_enabled")),
+            "bookings_enabled": to_bool(get(row, "bookings_enabled")),
+            "admin_bot_token": admin_bot_token,
+            "client_bot_token": client_bot_token,
+            "webhook_secret_admin": webhook_secret_admin,
+            "webhook_secret_client": webhook_secret_client,
+            "admin_chat_id": str(get(row, "admin_chat_id")).strip(),
+            "timezone": (get(row, "timezone") or "America/La_Paz").strip(),
+            "admin_whatsapp": str(get(row, "admin_whatsapp")).strip(),
+        }
+
+    _TENANTS_CACHE = tenants
+    _TENANTS_CACHE_AT = now_iso_utc()
+    return _TENANTS_CACHE
+
+
+def get_tenant_or_404(*args, gc=None) -> Dict[str, Any]:
+    """
+    Compatibilidad con ambas llamadas:
+      - get_tenant_or_404(tenant_id, gc=gc)
+      - get_tenant_or_404(gc, tenant_id)
+    """
+    if len(args) == 2:
+        # forma vieja: (gc, tenant_id)
+        gc_local = args[0]
+        tenant_id = args[1]
+    elif len(args) == 1:
+        tenant_id = args[0]
+        gc_local = gc
+    else:
+        raise HTTPException(status_code=500, detail="get_tenant_or_404() invalid arguments")
+
+    tenants = load_tenants(gc=gc_local)
+    t = tenants.get((tenant_id or "").strip())
+    if not t:
+        raise HTTPException(status_code=404, detail=f"Tenant not found or inactive: {tenant_id}")
+    return t
+
+
+def resolve_bot_by_secret(tenant: Dict[str, Any], secret: str) -> Tuple[str, str]:
+    s = (secret or "").strip()
+    admin_secret = (tenant.get("webhook_secret_admin") or "").strip()
+    client_secret = (tenant.get("webhook_secret_client") or "").strip()
+
+    if admin_secret and s == admin_secret:
+        return ("admin", (tenant.get("admin_bot_token") or "").strip())
+
+    if client_secret and s == client_secret:
+        return ("client", (tenant.get("client_bot_token") or "").strip())
+
+    raise HTTPException(status_code=403, detail="Invalid webhook secret")
