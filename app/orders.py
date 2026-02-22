@@ -1,13 +1,19 @@
+# app/orders.py
+
 import json
 from typing import Any, Dict, List
 
-import gspread
 from fastapi import HTTPException
 
-from app.utils import normalize, now_iso_utc
+from app.sheets import get_ws, normalize, now_iso_utc
 
 
-def ensure_orders_headers(ws: gspread.Worksheet, required: List[str]) -> List[str]:
+def gen_order_id() -> str:
+    import secrets
+    return secrets.token_hex(4)  # 8 chars hex
+
+
+def ensure_orders_headers(ws, required: List[str]) -> List[str]:
     values = ws.get_all_values()
     if not values or not values[0]:
         raise HTTPException(status_code=500, detail="Orders sheet is empty or missing headers in row 1")
@@ -19,13 +25,14 @@ def ensure_orders_headers(ws: gspread.Worksheet, required: List[str]) -> List[st
     if missing:
         raise HTTPException(
             status_code=500,
-            detail=f"Orders sheet missing required headers in row 1: {missing}. Headers actuales: {headers}"
+            detail=f"Orders sheet missing required headers in row 1: {missing}. Headers actuales: {headers}",
         )
+
     return headers_norm
 
 
 def append_order_row(
-    orders_sh: gspread.Spreadsheet,
+    orders_sh,
     tenant_id: str,
     order_id: str,
     customer_name: str,
@@ -36,17 +43,19 @@ def append_order_row(
     status: str,
     source: str,
     total_amount: float,
-):
-    ws = orders_sh.worksheet("Orders")
+) -> None:
+    ws = get_ws(orders_sh, "Orders")
+
     ensure_orders_headers(
         ws,
         required=[
             "order_id", "created_at", "tenant_id", "customer_name", "customer_contact",
-            "items", "notes", "delivery_type", "requested_time", "status", "source", "total_amount"
+            "items", "notes", "delivery_type", "requested_time", "status", "source", "total_amount",
         ],
     )
 
     created_at = now_iso_utc()
+
     payload_map: Dict[str, Any] = {
         "order_id": order_id,
         "created_at": created_at,
@@ -62,6 +71,7 @@ def append_order_row(
         "total_amount": total_amount,
     }
 
+    # Mantener el orden EXACTO de columnas según la fila 1 del Sheet
     header_raw = ws.row_values(1)
     row: List[Any] = []
     for h_raw in header_raw:
@@ -71,8 +81,8 @@ def append_order_row(
     ws.append_row(row, value_input_option="USER_ENTERED")
 
 
-def update_order_status(orders_sh: gspread.Spreadsheet, order_id: str, new_status: str) -> Dict[str, Any]:
-    ws = orders_sh.worksheet("Orders")
+def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, Any]:
+    ws = get_ws(orders_sh, "Orders")
     values = ws.get_all_values()
     if not values:
         return {"found": False}
@@ -86,9 +96,10 @@ def update_order_status(orders_sh: gspread.Spreadsheet, order_id: str, new_statu
     col_order_id = headers_norm.index("order_id") + 1
     col_status = headers_norm.index("status") + 1
 
+    # Buscar order_id desde fila 2
     for r_idx in range(2, len(values) + 1):
         oid = ws.cell(r_idx, col_order_id).value
-        if str(oid).strip() == order_id:
+        if str(oid).strip().lower() == str(order_id).strip().lower():
             old_status = ws.cell(r_idx, col_status).value or ""
             if normalize(old_status) != normalize(new_status):
                 ws.update_cell(r_idx, col_status, new_status)
