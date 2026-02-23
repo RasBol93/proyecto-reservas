@@ -124,7 +124,11 @@ def telegram_send_document(
 
 def telegram_answer_callback(bot_token: str, callback_query_id: str, text: str = "OK") -> None:
     try:
-        res = telegram_api_call(bot_token, "answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
+        res = telegram_api_call(
+            bot_token,
+            "answerCallbackQuery",
+            {"callback_query_id": callback_query_id, "text": text},
+        )
         if not res.get("ok", True):
             log_event("telegram_ack_failed", error=res.get("description") or res)
     except Exception as e:
@@ -195,6 +199,49 @@ def get_payment_qr_url(tenant: Dict[str, Any]) -> str:
     # alternativa: URL pública (Drive uc?export=download&id=... o cualquier URL pública)
     raw = (tenant.get("payment_qr_url") or tenant.get("payment_qr_link") or "").strip()
     return _normalize_public_qr_url(raw)
+
+
+# -------------------------
+# DEBUG QR helpers (para diagnosticar por qué "no tengo QR configurado")
+# -------------------------
+
+def _mask(s: Any, keep: int = 10) -> str:
+    s = str(s or "")
+    if len(s) <= keep:
+        return s
+    return s[:keep] + "..."
+
+
+def debug_qr_snapshot(tenant_id: str, tenant: Dict[str, Any]) -> None:
+    """
+    Loguea un snapshot del tenant para ver qué columnas/valores llegan realmente.
+    No expone tokens completos.
+    """
+    try:
+        keys = sorted(list(tenant.keys()))
+    except Exception:
+        keys = []
+
+    log_event(
+        "debug_qr_tenant_snapshot",
+        tenant_id=tenant_id,
+        tenant_keys=keys,
+        payment_qr_url=_mask(tenant.get("payment_qr_url")),
+        payment_qr_link=_mask(tenant.get("payment_qr_link")),
+        payment_qr_file_id=_mask(tenant.get("payment_qr_file_id")),
+    )
+
+    # print ayuda si log_event no se ve (Render logs)
+    try:
+        print("=== DEBUG QR SNAPSHOT ===")
+        print("tenant_id:", tenant_id)
+        print("tenant_keys:", keys)
+        print("payment_qr_url:", tenant.get("payment_qr_url"))
+        print("payment_qr_link:", tenant.get("payment_qr_link"))
+        print("payment_qr_file_id:", tenant.get("payment_qr_file_id"))
+        print("=========================")
+    except Exception:
+        pass
 
 
 # -------------------------
@@ -465,13 +512,13 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 lines_txt, total, total_qty = fmt_cart_lines(cart, menu_idx)
 
                 has_items = total_qty > 0
-                msg = (
+                msg_txt = (
                     f"🛒 *Tu carrito*\n"
                     f"Cantidad: *{total_qty}*\n"
                     f"Total: *{total:.2f}* BOB\n\n"
                     f"{lines_txt}"
                 )
-                telegram_send_text(bot_token, chat_id, msg, reply_markup=cart_kb(has_items), parse_mode="Markdown")
+                telegram_send_text(bot_token, chat_id, msg_txt, reply_markup=cart_kb(has_items), parse_mode="Markdown")
                 return {"ok": True}
 
             if data == "cart_clear":
@@ -488,7 +535,12 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     return {"ok": True}
 
                 sess["stage"] = "awaiting_name"
-                telegram_send_text(bot_token, chat_id, "Perfecto. ¿Cuál es tu *nombre* para el pedido?", parse_mode="Markdown")
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Perfecto. ¿Cuál es tu *nombre* para el pedido?",
+                    parse_mode="Markdown",
+                )
                 return {"ok": True}
 
             # Cliente presiona "Ya pagué" -> avisar admin (CON proof)
@@ -506,7 +558,12 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                 order = get_order_by_id(orders_sh, order_id)
                 if not order:
-                    telegram_send_text(bot_token, chat_id, "No encontré tu pedido. Vuelve a /start.", reply_markup=client_home_kb())
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "No encontré tu pedido. Vuelve a /start.",
+                        reply_markup=client_home_kb(),
+                    )
                     return {"ok": True}
 
                 proof_file_id = (order.get("payment_proof_file_id") or "").strip()
@@ -611,6 +668,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     ]),
                 )
                 return {"ok": True}
+
+            return {"ok": True}
 
         return {"ok": True}
 
@@ -744,9 +803,20 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     parse_mode="Markdown",
                 )
 
+                # ---- DEBUG QR: ver qué llega realmente desde tenants ----
+                debug_qr_snapshot(tenant_id, tenant)
+
                 # enviar QR (file_id preferido; si no hay, URL)
                 qr_file_id = get_payment_qr_file_id(tenant)
                 qr_url = get_payment_qr_url(tenant)
+
+                log_event(
+                    "debug_qr_values",
+                    tenant_id=tenant_id,
+                    qr_file_id_present=bool(qr_file_id),
+                    qr_url_present=bool(qr_url),
+                    qr_url=(qr_url[:220] if qr_url else ""),
+                )
 
                 if qr_file_id:
                     telegram_send_photo(bot_token, chat_id, qr_file_id, caption="QR de pago")
