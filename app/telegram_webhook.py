@@ -1,6 +1,7 @@
 # app/telegram_webhook.py
 
 import json
+import re
 import urllib.request
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -157,9 +158,43 @@ def get_payment_qr_file_id(tenant: Dict[str, Any]) -> str:
     return (tenant.get("payment_qr_file_id") or "").strip()
 
 
+def _drive_file_id_from_url(url: str) -> Optional[str]:
+    """
+    Extrae file_id de links Drive típicos:
+      - https://drive.google.com/file/d/<ID>/view?...
+      - https://drive.google.com/open?id=<ID>
+      - https://drive.google.com/uc?id=<ID>&export=download
+    """
+    if not url:
+        return None
+    m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _normalize_public_qr_url(url: str) -> str:
+    """
+    Telegram acepta mejor:
+      https://drive.google.com/uc?export=download&id=<ID>
+    Si ya es una URL normal (https://...) la devuelve tal cual.
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    file_id = _drive_file_id_from_url(url)
+    if file_id:
+        return f"https://drive.google.com/uc?export=download&id={file_id}"
+    return url
+
+
 def get_payment_qr_url(tenant: Dict[str, Any]) -> str:
-    # alternativa: URL pública (Drive uc?export=download&id=...)
-    return (tenant.get("payment_qr_url") or "").strip()
+    # alternativa: URL pública (Drive uc?export=download&id=... o cualquier URL pública)
+    raw = (tenant.get("payment_qr_url") or tenant.get("payment_qr_link") or "").strip()
+    return _normalize_public_qr_url(raw)
 
 
 # -------------------------
@@ -246,7 +281,6 @@ def notify_admin_payment_reported(
     menu_idx = load_menu_index(orders_sh)
     cart = parse_items_field(order.get("items"))
 
-    # total y recap
     try:
         total = float(order.get("total_amount") or 0)
     except Exception:
@@ -258,7 +292,6 @@ def notify_admin_payment_reported(
     proof_type = (order.get("payment_proof_type") or "").strip()
     proof_caption = (order.get("payment_proof_caption") or "").strip()
 
-    # Botón confirmar
     confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{order_id}")]])
 
     txt = (
@@ -360,11 +393,10 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             if cb_tenant_id != tenant_id:
                 raise HTTPException(status_code=400, detail="Tenant mismatch in callback")
 
-            # 1) marcar PAID
             update_order_status(orders_sh, order_id, "PAID")
             telegram_send_text(bot_token, chat_id, f"✅ Pedido {order_id} marcado como PAID")
 
-            # 2) avisar al cliente con el BOT CLIENTE
+            # avisar al cliente con el BOT CLIENTE
             order = get_order_by_id(orders_sh, order_id)
             if order:
                 client_token = get_client_bot_token(tenant)
@@ -454,7 +486,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 if cb_tenant_id != tenant_id:
                     raise HTTPException(status_code=400, detail="Tenant mismatch in i_paid callback")
 
-                # validar que exista proof
                 order = get_order_by_id(orders_sh, order_id)
                 if not order:
                     telegram_send_text(bot_token, chat_id, "No encontré tu pedido. Vuelve a /start.", reply_markup=client_home_kb())
@@ -470,10 +501,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     )
                     return {"ok": True}
 
-                # notificar admin (recap + proof + botón confirmar)
                 notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id)
 
-                # confirmar al cliente
                 telegram_send_text(
                     bot_token,
                     chat_id,
@@ -575,13 +604,17 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         chat_id = int(msg["chat"]["id"])
         text = (msg.get("text") or "").strip()
 
+        # ✅ Utilidad: /id (sirve en webhook, sin getUpdates)
+        if normalize(text) in ("/id", "id"):
+            telegram_send_text(bot_token, chat_id, f"chat_id = {chat_id}")
+            return {"ok": True}
+
         # -------------------------
         # CLIENT: manejar upload de proof (foto o PDF)
         # -------------------------
         if mode == "client":
             sess = get_sess(tenant_id, chat_id)
 
-            # Detectar proof upload
             proof_file_id = None
             proof_type = None
             proof_caption = (msg.get("caption") or "").strip()
@@ -597,10 +630,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     proof_caption = (msg["document"].get("file_name") or "").strip()
 
             if proof_file_id and proof_type:
-                # 1) detectar order_id: preferimos el que quedó en sesión
                 order_id = (sess.get("tmp") or {}).get("pending_order_id")
 
-                # 2) fallback: buscar el más reciente PENDING_PAYMENT
                 if not order_id:
                     order_id = find_latest_pending_order_for_contact(
                         orders_sh=orders_sh,
@@ -625,7 +656,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     proof_caption=proof_caption,
                 )
 
-                # Confirmar y mostrar botón "Ya pagué"
                 telegram_send_text(
                     bot_token,
                     chat_id,
@@ -654,9 +684,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 if total_qty <= 0:
                     telegram_send_text(bot_token, chat_id, "Tu carrito está vacío.", reply_markup=client_home_kb())
                     sess["stage"] = "idle"
-                    return {"ok": True
-
-                    }
+                    return {"ok": True}
 
                 order_id = gen_order_id()
                 requested_time = "pendiente"  # etapa 2 después
@@ -681,7 +709,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 sess["tmp"]["pending_order_id"] = order_id
                 sess["tmp"]["customer_name"] = customer_name
 
-                # 1) recap + instrucción
                 recap = build_order_recap_text(
                     tenant_id=tenant_id,
                     order_id=order_id,
@@ -700,7 +727,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     parse_mode="Markdown",
                 )
 
-                # 2) enviar QR (file_id preferido; si no hay, URL)
+                # enviar QR (file_id preferido; si no hay, URL)
                 qr_file_id = get_payment_qr_file_id(tenant)
                 qr_url = get_payment_qr_url(tenant)
 
@@ -714,8 +741,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                         chat_id,
                         "⚠️ No tengo QR configurado para este tenant (payment_qr_file_id / payment_qr_url).",
                     )
+                    log_event("missing_qr_config", tenant_id=tenant_id)
 
-                # 3) pedir comprobante + botón (se habilita luego de recibir proof)
                 telegram_send_text(
                     bot_token,
                     chat_id,
@@ -728,8 +755,12 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             telegram_send_text(bot_token, chat_id, "Usa /start para ver el menú.", reply_markup=client_home_kb())
             return {"ok": True}
 
-        # ADMIN: por ahora simple si escribe (no callback)
-        telegram_send_text(bot_token, chat_id, "OK admin ✅")
+        # ADMIN: útil para probar chat_id y que el bot “exista”
+        if normalize(text) in ("start", "/start", "hola"):
+            telegram_send_text(bot_token, chat_id, "Admin bot listo. Escribe /id para ver tu chat_id ✅")
+            return {"ok": True}
+
+        telegram_send_text(bot_token, chat_id, "OK admin ✅ (escribe /id para ver tu chat_id)")
         return {"ok": True}
 
     return {"ok": True}
