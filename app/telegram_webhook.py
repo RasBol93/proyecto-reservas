@@ -260,6 +260,10 @@ def parse_items_field(items_field: Any) -> List[Dict[str, Any]]:
     return []
 
 
+# -------------------------
+# ADMIN notify (ROBUST)
+# -------------------------
+
 def notify_admin_payment_reported(
     tenant: Dict[str, Any],
     tenant_id: str,
@@ -269,16 +273,25 @@ def notify_admin_payment_reported(
     admin_token = get_admin_bot_token(tenant)
     admin_chat_id = get_admin_chat_id(tenant)
 
-    if not admin_token or not admin_chat_id:
-        log_event("admin_notify_skipped", tenant_id=tenant_id, reason="missing admin_bot_token or admin_chat_id")
+    if not admin_token:
+        log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_admin_bot_token")
+        return
+    if not admin_chat_id:
+        log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_admin_chat_id")
         return
 
     order = get_order_by_id(orders_sh, order_id)
     if not order:
-        telegram_send_text(admin_token, admin_chat_id, f"⚠️ No encontré el pedido {order_id} en Sheets.")
+        telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
         return
 
-    menu_idx = load_menu_index(orders_sh)
+    # menu puede fallar (no rompas la notificación por eso)
+    try:
+        menu_idx = load_menu_index(orders_sh)
+    except Exception as e:
+        log_event("admin_menu_load_error", tenant_id=tenant_id, error=str(e))
+        menu_idx = {}
+
     cart = parse_items_field(order.get("items"))
 
     try:
@@ -294,26 +307,32 @@ def notify_admin_payment_reported(
 
     confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{order_id}")]])
 
+    # OJO: sin Markdown para evitar fallos por caracteres raros
     txt = (
-        f"💳 *Pago reportado por cliente*\n"
-        f"Tenant: `{tenant_id}`\n"
-        f"ID: `{order_id}`\n"
-        f"Cliente: *{order.get('customer_name','')}*\n"
-        f"Contacto (chat_id): `{order.get('customer_contact','')}`\n"
-        f"Hora recogida: *{order.get('requested_time','pendiente')}*\n"
-        f"Cantidad total: *{total_qty}*\n"
-        f"Total: *{total:.2f}* BOB\n\n"
-        f"*Detalle:*\n{lines_txt}\n\n"
-        f"Cuando verifiques el pago, presiona ✅ Confirmar pago."
+        "💳 PAGO REPORTADO\n\n"
+        f"Tenant: {tenant_id}\n"
+        f"ID: {order_id}\n"
+        f"Cliente: {order.get('customer_name','')}\n"
+        f"Contacto(chat_id): {order.get('customer_contact','')}\n"
+        f"Hora recogida: {order.get('requested_time','pendiente')}\n"
+        f"Cantidad total: {total_qty}\n"
+        f"Total: {total:.2f} BOB\n\n"
+        f"Detalle:\n{lines_txt}\n\n"
+        "Presiona ✅ Confirmar pago cuando verifiques."
     )
 
-    telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn, parse_mode="Markdown")
+    telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn)
 
     # Reenviar comprobante
-    if proof_file_id and proof_type == "photo":
-        telegram_send_photo(admin_token, admin_chat_id, proof_file_id, caption=proof_caption or "Comprobante (foto)")
-    elif proof_file_id and proof_type == "document":
-        telegram_send_document(admin_token, admin_chat_id, proof_file_id, caption=proof_caption or "Comprobante (archivo)")
+    if proof_file_id:
+        if proof_type == "photo":
+            telegram_send_photo(admin_token, admin_chat_id, proof_file_id, caption=proof_caption or "Comprobante (foto)")
+        elif proof_type == "document":
+            telegram_send_document(admin_token, admin_chat_id, proof_file_id, caption=proof_caption or "Comprobante (archivo)")
+        else:
+            log_event("admin_unknown_proof_type", tenant_id=tenant_id, order_id=order_id, proof_type=proof_type)
+    else:
+        log_event("admin_missing_proof_file_id", tenant_id=tenant_id, order_id=order_id)
 
 
 # -------------------------
@@ -406,11 +425,10 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                         telegram_send_text(
                             client_token,
                             int(client_chat),
-                            f"✅ Pago validado. Tu pedido *{order_id}* fue confirmado. ¡Gracias!",
-                            parse_mode="Markdown",
+                            f"✅ Pago validado. Tu pedido {order_id} fue confirmado. ¡Gracias!",
                         )
                     except Exception as e:
-                        log_event("notify_client_paid_failed", order_id=order_id, error=str(e))
+                        log_event("notify_client_paid_failed", tenant_id=tenant_id, order_id=order_id, error=str(e))
 
             return {"ok": True}
 
@@ -473,7 +491,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, "Perfecto. ¿Cuál es tu *nombre* para el pedido?", parse_mode="Markdown")
                 return {"ok": True}
 
-            # Cliente presiona "Ya pagué" -> avisar admin (con proof)
+            # Cliente presiona "Ya pagué" -> avisar admin (CON proof)
             if data.startswith("i_paid|"):
                 parts = data.split("|")
                 if len(parts) != 3:
@@ -496,11 +514,11 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        "Aún no recibí tu comprobante.\nPor favor envía una *foto o PDF* del pago primero.",
-                        parse_mode="Markdown",
+                        "Aún no recibí tu comprobante.\nPor favor envía una foto o PDF del pago primero.",
                     )
                     return {"ok": True}
 
+                # ✅ Aquí se dispara la notificación al ADMIN (después de proof + botón)
                 notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id)
 
                 telegram_send_text(
@@ -622,7 +640,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             if msg.get("photo"):
                 proof_file_id = msg["photo"][-1].get("file_id")
                 proof_type = "photo"
-
             elif msg.get("document"):
                 proof_file_id = msg["document"].get("file_id")
                 proof_type = "document"
