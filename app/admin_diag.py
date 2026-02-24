@@ -1,24 +1,31 @@
 # app/admin_diag.py
 
+import os
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.config import ADMIN_TOKEN
 from app.sheets import get_gspread_client
 from app.tenants import get_tenant_or_404
 
 router = APIRouter(prefix="/admin/diag", tags=["admin"])
 
 
+def _get_admin_token() -> str:
+    return (os.getenv("ADMIN_TOKEN") or "").strip()
+
+
 def _require_admin_token(token: str) -> None:
-    # Si no está configurado, no rompemos deploy: devolvemos error claro
-    if not ADMIN_TOKEN:
+    admin_token = _get_admin_token()
+
+    # NO rompemos deploy si falta: respondemos claro
+    if not admin_token:
         raise HTTPException(
             status_code=503,
             detail="ADMIN_TOKEN no está configurado en variables de entorno (Render).",
         )
-    if (token or "").strip() != ADMIN_TOKEN:
+
+    if (token or "").strip() != admin_token:
         raise HTTPException(status_code=401, detail="Invalid admin token")
 
 
@@ -32,7 +39,6 @@ def diag_tenant(
     gc = get_gspread_client()
     tenant = get_tenant_or_404(tenant_id, gc=gc)
 
-    # devolvemos snapshot útil (sin exponer tokens completos)
     def mask(v: Optional[str]) -> str:
         v = (v or "").strip()
         if not v:
@@ -47,8 +53,6 @@ def diag_tenant(
         "tenant_id_raw": tenant.get("tenant_id_raw"),
         "tenant_keys": sorted(list(tenant.keys())),
         "orders_sheet_id": tenant.get("orders_sheet_id"),
-        "orders_enabled": tenant.get("orders_enabled"),
-        "bookings_enabled": tenant.get("bookings_enabled"),
         "admin_chat_id": tenant.get("admin_chat_id"),
         "timezone": tenant.get("timezone"),
         "qr": {
@@ -67,6 +71,6 @@ def diag_tenant(
             "admin_bot_token": mask(tenant.get("admin_bot_token")),
             "client_bot_token": mask(tenant.get("client_bot_token")),
             "webhook_secret_admin": mask(tenant.get("webhook_secret_admin")),
-            "webhook_secret_client": mask(tenant.get("webhook_secret_client")),
+            "webhook_secret_client": mask(tenant.get("webhook_secret_admin")),
         },
     }
