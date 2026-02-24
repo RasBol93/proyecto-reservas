@@ -1,46 +1,133 @@
 # app/menu.py
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
 from app.sheets import get_ws, read_records_manual
-from app.utils import to_bool, normalize
+from app.utils import to_bool, normalize, log_event
+
+
+REQUIRED_MENU_HEADERS = ["sku", "name", "price", "active", "category"]
+
+
+def _ws_has_required_headers(ws, required_headers: List[str], max_scan_rows: int = 10) -> bool:
+    """
+    Verifica si una worksheet contiene TODOS los headers requeridos en alguna de las
+    primeras filas (max_scan_rows). Es robusto ante:
+    - Fila 1 headers técnicos
+    - Fila 2 traducción/etiquetas
+    """
+    try:
+        values = ws.get_all_values()
+    except Exception:
+        return False
+
+    if not values:
+        return False
+
+    req = [normalize(h) for h in required_headers]
+    scan = values[:max_scan_rows]
+
+    for row in scan:
+        row_norm = [normalize(x) for x in row]
+        if all(h in row_norm for h in req):
+            return True
+
+    return False
+
+
+def _find_menu_ws_by_headers(orders_sh) -> Optional[Any]:
+    """
+    Busca en todas las pestañas del spreadsheet una worksheet que tenga los headers del menú.
+    """
+    try:
+        for ws in orders_sh.worksheets():
+            if _ws_has_required_headers(ws, REQUIRED_MENU_HEADERS):
+                return ws
+    except Exception:
+        return None
+    return None
+
+
+def _parse_price(value: Any) -> Optional[float]:
+    """
+    Soporta:
+      - "12"
+      - "12.5"
+      - "12,5"
+      - " 12,50 "
+    """
+    s = str(value or "").strip()
+    if not s:
+        return None
+    s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
 
 
 def load_menu_index(orders_sh) -> Dict[str, Dict[str, Any]]:
     """
-    Lee la hoja 'Menu' del sheet del tenant.
-    Espera headers técnicos:
-      sku, name, price, active, category
+    Lee el menú del sheet del tenant.
+
+    Estrategia robusta:
+    1) intenta abrir la pestaña "Menu"
+    2) si no existe, busca cualquier pestaña que contenga los headers técnicos:
+       sku, name, price, active, category
+
+    Devuelve un índice: sku -> {sku, name, price, category}
+    (solo active=TRUE)
     """
-    ws = get_ws(orders_sh, "Menu")
+    ws = None
+
+    # 1) Camino rápido (nombre estándar)
+    try:
+        ws = get_ws(orders_sh, "Menu")
+    except Exception:
+        ws = None
+
+    # 2) Fallback robusto (por headers)
+    if ws is None:
+        ws = _find_menu_ws_by_headers(orders_sh)
+        if ws is not None:
+            log_event("menu_ws_autodetected", worksheet_title=getattr(ws, "title", "unknown"))
+
+    if ws is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Menu worksheet not found. Expected a tab named 'Menu' or any tab with headers: sku,name,price,active,category",
+        )
+
     rows = read_records_manual(
         ws,
-        required_headers=["sku", "name", "price", "active", "category"],
+        required_headers=REQUIRED_MENU_HEADERS,
     )
 
     idx: Dict[str, Dict[str, Any]] = {}
 
     for r in rows:
-        sku = str(r.get("sku", "")).strip()
+        sku = str(r.get("sku", "") or "").strip()
         if not sku:
             continue
 
         if not to_bool(r.get("active", "")):
             continue
 
-        price_raw = str(r.get("price", "")).strip()
-        try:
-            price = float(price_raw)
-        except Exception:
+        price = _parse_price(r.get("price", ""))
+        if price is None:
+            # ignora filas con precio inválido
             continue
+
+        name = str(r.get("name", "") or "").strip()
+        category = str(r.get("category", "") or "").strip() or "Otros"
 
         idx[sku] = {
             "sku": sku,
-            "name": str(r.get("name", "")).strip(),
-            "price": price,
-            "category": str(r.get("category", "")).strip() or "Otros",
+            "name": name,
+            "price": float(price),
+            "category": category,
         }
 
     return idx
