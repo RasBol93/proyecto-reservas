@@ -64,7 +64,7 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
     Lee Tenants desde el spreadsheet de configuración (RESERVACIONES_CONFIG).
     Soporta compatibilidad:
       - admin_bot_token + webhook_secret_admin (nuevo)
-      - bot_token + webhook_secret (viejo fallback)
+      - bot_token / bot_token_admin + webhook_secret (viejo fallback)
     """
     global _TENANTS_CACHE, _TENANTS_CACHE_AT
 
@@ -113,27 +113,62 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
         if not active:
             continue
 
-        admin_bot_token = _pick_first_nonempty(get(row, "admin_bot_token"), get(row, "bot_token"))
-        client_bot_token = _pick_first_nonempty(get(row, "client_bot_token"))
+        # --- Tokens (compatibilidad total) ---
+        admin_bot_token = _pick_first_nonempty(
+            get(row, "admin_bot_token"),
+            get(row, "bot_token_admin"),
+            get(row, "bot_token"),
+        )
 
-        webhook_secret_admin = _pick_first_nonempty(get(row, "webhook_secret_admin"), get(row, "webhook_secret"))
-        webhook_secret_client = _pick_first_nonempty(get(row, "webhook_secret_client"))
+        client_bot_token = _pick_first_nonempty(
+            get(row, "client_bot_token"),
+            get(row, "bot_token_client"),
+        )
+
+        # --- Secrets (compatibilidad total) ---
+        webhook_secret_admin = _pick_first_nonempty(
+            get(row, "webhook_secret_admin"),
+            get(row, "webhook_secret"),
+        )
+
+        webhook_secret_client = _pick_first_nonempty(
+            get(row, "webhook_secret_client"),
+        )
+
+        # --- QR config (lo que faltaba) ---
+        payment_qr_url = _pick_first_nonempty(
+            get(row, "payment_qr_url"),
+            get(row, "payment_qr_link"),
+        )
+
+        payment_qr_file_id = _pick_first_nonempty(
+            get(row, "payment_qr_file_id"),
+        )
 
         tenants[tid] = {
             "tenant_id": tid,                 # normalizado (clave real)
             "tenant_id_raw": tid_raw,         # original (solo para referencia/debug)
             "name": get(row, "name"),
             "business_type": get(row, "business_type"),
+
             "orders_sheet_id": str(get(row, "orders_sheet_id")).strip(),
             "orders_enabled": to_bool(get(row, "orders_enabled")),
             "bookings_enabled": to_bool(get(row, "bookings_enabled")),
+
             "admin_bot_token": (admin_bot_token or "").strip(),
             "client_bot_token": (client_bot_token or "").strip(),
+
             "webhook_secret_admin": (webhook_secret_admin or "").strip(),
             "webhook_secret_client": (webhook_secret_client or "").strip(),
+
             "admin_chat_id": str(get(row, "admin_chat_id")).strip(),
             "timezone": (get(row, "timezone") or "America/La_Paz").strip(),
             "admin_whatsapp": str(get(row, "admin_whatsapp")).strip(),
+
+            # ✅ NUEVO: QR
+            "payment_qr_url": (payment_qr_url or "").strip(),
+            "payment_qr_link": str(get(row, "payment_qr_link")).strip(),  # opcional, por si lo usas
+            "payment_qr_file_id": (payment_qr_file_id or "").strip(),
         }
 
     _TENANTS_CACHE = tenants
@@ -144,7 +179,6 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
 def get_tenant_or_404(tenant_id: str, gc=None) -> Dict[str, Any]:
     """
     Firma ÚNICA y coherente.
-    (Se acabó el *args porque generaba llamadas ambiguas y bugs difíciles.)
     """
     tid = _norm_tenant_id(tenant_id)
     if not tid:
