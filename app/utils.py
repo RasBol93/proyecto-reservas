@@ -1,6 +1,8 @@
 # app/utils.py
+
 import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,24 +21,37 @@ def to_bool(v: Any) -> bool:
 
 
 def normalize(s: Any) -> str:
+    """
+    Normaliza para matching robusto:
+    - lower
+    - sin tildes/diacríticos (unicode)
+    - quita puntuación rara pero mantiene "_" "-" y espacios
+    """
     if s is None:
         return ""
     s = str(s).strip().lower()
-    replacements = {
-        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u",
-        "ä": "a", "ë": "e", "ï": "i", "ö": "o", "ü": "u",
-        "ñ": "n",
-    }
-    for a, b in replacements.items():
-        s = s.replace(a, b)
-    # mantiene "_" porque \w lo incluye
+
+    # quita tildes/diacríticos
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+
+    # permite: letras/números/_/-/espacios
     s = re.sub(r"[^\w\s-]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
 def log_event(event: str, **fields: Any) -> None:
-    # No loguear secretos (por si alguien pasa algo sensible)
-    blocked = {"creds", "token", "GCP_CREDENTIALS_JSON", "ADMIN_TOKEN"}
-    safe = {k: v for k, v in fields.items() if k not in blocked}
+    # bloquea keys sensibles
+    blocked_keys = {
+        "creds", "token", "authorization", "password",
+        "GCP_CREDENTIALS_JSON", "ADMIN_TOKEN",
+        "admin_bot_token", "client_bot_token",
+        "webhook_secret_admin", "webhook_secret_client",
+    }
+    safe = {}
+    for k, v in fields.items():
+        if k in blocked_keys:
+            continue
+        safe[k] = v
     print(json.dumps({"ts": now_iso_utc(), "event": event, **safe}, ensure_ascii=False))
