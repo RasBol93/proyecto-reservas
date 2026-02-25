@@ -13,23 +13,14 @@ from app.utils import normalize
 router = APIRouter(prefix="/admin/diag", tags=["admin"])
 
 
-# ---------------------------------
-# Admin token
-# ---------------------------------
-
 def _get_admin_token() -> str:
     return (os.getenv("ADMIN_TOKEN") or "").strip()
 
 
 def _require_admin_token(token: str) -> None:
     admin_token = _get_admin_token()
-
     if not admin_token:
-        raise HTTPException(
-            status_code=503,
-            detail="ADMIN_TOKEN no está configurado en variables de entorno (Render).",
-        )
-
+        raise HTTPException(status_code=503, detail="ADMIN_TOKEN no está configurado en variables de entorno (Render).")
     if (token or "").strip() != admin_token:
         raise HTTPException(status_code=401, detail="Invalid admin token")
 
@@ -43,10 +34,6 @@ def _mask(v: Optional[str]) -> str:
     return v[:4] + "..." + v[-4:]
 
 
-# ---------------------------------
-# URL helpers
-# ---------------------------------
-
 def _is_drive_uc_url(url: str) -> bool:
     url = (url or "").strip()
     if not url:
@@ -55,13 +42,6 @@ def _is_drive_uc_url(url: str) -> bool:
 
 
 def _drive_file_id_from_url(url: str) -> Optional[str]:
-    """
-    Extrae file_id de links Drive típicos:
-      - https://drive.google.com/file/d/<ID>/view?...
-      - https://drive.google.com/open?id=<ID>
-      - https://drive.google.com/uc?id=<ID>&export=download
-      - https://drive.google.com/uc?export=download&id=<ID>
-    """
     if not url:
         return None
     m = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
@@ -74,10 +54,6 @@ def _drive_file_id_from_url(url: str) -> Optional[str]:
 
 
 def _normalize_public_qr_url(url: str) -> str:
-    """
-    Telegram suele aceptar mejor:
-      https://drive.google.com/uc?export=download&id=<ID>
-    """
     url = (url or "").strip()
     if not url:
         return ""
@@ -87,12 +63,7 @@ def _normalize_public_qr_url(url: str) -> str:
     return url
 
 
-# ---------------------------------
-# Sheets helpers (ligeros)
-# ---------------------------------
-
 def _col_letter(n: int) -> str:
-    """1 -> A, 2 -> B, 27 -> AA"""
     s = ""
     while n > 0:
         n, r = divmod(n - 1, 26)
@@ -101,15 +72,11 @@ def _col_letter(n: int) -> str:
 
 
 def _ws_sample_values(ws, max_rows: int = 30, max_cols: int = 30) -> List[List[str]]:
-    """
-    Lee solo un bloque chico (mucho más rápido que get_all_values en sheets grandes).
-    """
     end_col = _col_letter(max_cols)
     rng = f"A1:{end_col}{max_rows}"
     try:
-        return ws.get(rng)  # gspread: devuelve lista de filas
+        return ws.get(rng)
     except Exception:
-        # fallback
         try:
             return ws.get_all_values()[:max_rows]
         except Exception:
@@ -117,102 +84,54 @@ def _ws_sample_values(ws, max_rows: int = 30, max_cols: int = 30) -> List[List[s
 
 
 def _ws_has_headers(ws, required_headers: List[str], max_scan_rows: int = 30) -> Tuple[bool, Optional[int], List[str]]:
-    """
-    Retorna: (ok, header_row_1based, headers_raw_encontrados)
-    Busca headers en las primeras max_scan_rows filas.
-    """
     values = _ws_sample_values(ws, max_rows=max_scan_rows, max_cols=60)
     if not values:
         return (False, None, [])
-
     req = [normalize(h) for h in required_headers]
-
     for idx0, row in enumerate(values):
         row_norm = [normalize(x) for x in row]
         if all(h in row_norm for h in req):
             return (True, idx0 + 1, row)
-
     return (False, None, values[0] if values else [])
 
 
 def _find_ws_by_name_or_headers(sh, preferred_title: str, required_headers: List[str]) -> Dict[str, Any]:
-    """
-    - Primero intenta por nombre exacto.
-    - Si falla, busca por headers en otras hojas.
-    """
-    # 1) por nombre
     try:
         ws = sh.worksheet(preferred_title)
         ok, header_row, headers_raw = _ws_has_headers(ws, required_headers=required_headers)
-        return {
-            "found": True,
-            "method": "by_name",
-            "title": ws.title,
-            "headers_ok": ok,
-            "header_row": header_row,
-            "headers_raw": headers_raw,
-        }
+        return {"found": True, "method": "by_name", "title": ws.title, "headers_ok": ok, "header_row": header_row, "headers_raw": headers_raw}
     except Exception:
         pass
 
-    # 2) por headers
     try:
         for ws in sh.worksheets():
             ok, header_row, headers_raw = _ws_has_headers(ws, required_headers=required_headers)
             if ok:
-                return {
-                    "found": True,
-                    "method": "by_headers",
-                    "title": ws.title,
-                    "headers_ok": True,
-                    "header_row": header_row,
-                    "headers_raw": headers_raw,
-                }
+                return {"found": True, "method": "by_headers", "title": ws.title, "headers_ok": True, "header_row": header_row, "headers_raw": headers_raw}
         return {"found": False, "method": "not_found"}
     except Exception as e:
         return {"found": False, "method": "error", "error": str(e)}
 
 
-# ---------------------------------
-# Check framework (OK/WARN/FAIL)
-# ---------------------------------
-
 def _check(check_id: str, status: str, details: str, suggested_fix: str = "") -> Dict[str, Any]:
-    return {
-        "id": check_id,
-        "status": status,  # OK | WARN | FAIL
-        "details": details,
-        "suggested_fix": suggested_fix,
-    }
+    return {"id": check_id, "status": status, "details": details, "suggested_fix": suggested_fix}
 
 
 def _is_token_shape_ok(tok: str) -> bool:
-    """
-    Heurística: tokens de bot Telegram suelen tener ":".
-    No es validación real, solo warning.
-    """
     tok = (tok or "").strip()
     if not tok:
         return False
     return (":" in tok) and (len(tok) >= 20)
 
 
-# ---------------------------------
-# Endpoints
-# ---------------------------------
-
 @router.get("/tenant")
-def diag_tenant(
-    tenant_id: str = Query(..., description="tenant_id (ej: resto_demo)"),
-    token: str = Query(..., description="ADMIN_TOKEN"),
-) -> Dict[str, Any]:
+def diag_tenant(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[str, Any]:
     _require_admin_token(token)
-
     gc = get_gspread_client()
     tenant = get_tenant_or_404(tenant_id, gc=gc)
 
     qr_url_raw = (tenant.get("payment_qr_url") or tenant.get("payment_qr_link") or "").strip()
-    qr_url = _normalize_public_qr_url(qr_url_raw)
+    qr_url_norm = _normalize_public_qr_url(qr_url_raw)
     qr_file_id = (tenant.get("payment_qr_file_id") or "").strip()
 
     return {
@@ -225,10 +144,11 @@ def diag_tenant(
         "timezone": tenant.get("timezone"),
         "qr": {
             "payment_qr_file_id_present": bool(qr_file_id),
-            "payment_qr_url_present": bool(qr_url),
+            "payment_qr_url_present": bool(qr_url_norm),
             "payment_qr_file_id_masked": _mask(qr_file_id),
-            "payment_qr_url_preview": qr_url[:200],
-            "payment_qr_url_is_drive_uc": _is_drive_uc_url(qr_url),
+            "payment_qr_url_preview": qr_url_norm[:200],
+            "payment_qr_url_is_drive_uc": _is_drive_uc_url(qr_url_norm),
+            "payment_qr_url_normalized": qr_url_norm[:200],
         },
         "tokens_present": {
             "admin_bot_token_present": bool((tenant.get("admin_bot_token") or "").strip()),
@@ -240,22 +160,13 @@ def diag_tenant(
             "admin_bot_token": _mask(tenant.get("admin_bot_token")),
             "client_bot_token": _mask(tenant.get("client_bot_token")),
             "webhook_secret_admin": _mask(tenant.get("webhook_secret_admin")),
-            "webhook_secret_client": _mask(tenant.get("webhook_secret_client")),  # ✅ corregido
+            "webhook_secret_client": _mask(tenant.get("webhook_secret_client")),
         },
     }
 
 
 @router.get("/tenant_full")
-def tenant_full(
-    tenant_id: str = Query(..., description="tenant_id (ej: resto_demo)"),
-    token: str = Query(..., description="ADMIN_TOKEN"),
-) -> Dict[str, Any]:
-    """
-    Diagnóstico robusto (para operar 100 restaurantes):
-    - ~20 checks
-    - salida estándar OK/WARN/FAIL
-    - suggested_fix por check
-    """
+def tenant_full(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[str, Any]:
     _require_admin_token(token)
 
     checks: List[Dict[str, Any]] = []
@@ -270,7 +181,6 @@ def tenant_full(
         if st == "FAIL":
             blockers.append(c["id"])
 
-    # ---- (1) tenant load
     gc = get_gspread_client()
     try:
         tenant = get_tenant_or_404(tenant_id, gc=gc)
@@ -279,27 +189,17 @@ def tenant_full(
         add(_check("tenant_found_active", "FAIL", f"Tenant no válido: {e.detail}", "Revisar tenant_id y columna active en TENANTS."))
         return {"ok": False, "tenant_id": tenant_id, "summary": summary, "blockers": blockers, "checks": checks}
 
-    # ---- (2) tenant_id normalization
     raw = (tenant.get("tenant_id_raw") or "").strip()
     norm = (tenant.get("tenant_id") or "").strip()
     if raw and normalize(raw).replace(" ", "") != norm:
-        add(_check(
-            "tenant_id_normalization",
-            "WARN",
-            f"tenant_id_raw='{raw}' normaliza a '{normalize(raw).replace(' ', '')}', pero tenant_id cacheado es '{norm}'.",
-            "Evita espacios/tildes raras en tenant_id para que sea estable."
-        ))
+        add(_check("tenant_id_normalization", "WARN", f"tenant_id_raw='{raw}' normaliza distinto.", "Evita espacios/tildes raras en tenant_id."))
     else:
         add(_check("tenant_id_normalization", "OK", "tenant_id consistente (raw vs normalizado)."))
 
-    # ---- (3) flags
     orders_enabled = bool(tenant.get("orders_enabled", False))
-    if orders_enabled:
-        add(_check("orders_enabled", "OK", "orders_enabled=true"))
-    else:
-        add(_check("orders_enabled", "WARN", "orders_enabled=false", "Si este tenant debe vender, pon orders_enabled=TRUE."))
+    add(_check("orders_enabled", "OK" if orders_enabled else "WARN", f"orders_enabled={'true' if orders_enabled else 'false'}",
+               "Si este tenant debe vender, pon orders_enabled=TRUE." if not orders_enabled else ""))
 
-    # ---- (4) tokens + secrets
     admin_bot_token = (tenant.get("admin_bot_token") or "").strip()
     client_bot_token = (tenant.get("client_bot_token") or "").strip()
     secret_admin = (tenant.get("webhook_secret_admin") or "").strip()
@@ -321,18 +221,14 @@ def tenant_full(
                "webhook_secret_client presente." if secret_client else "webhook_secret_client missing.",
                "Completa webhook_secret_client en TENANTS." if not secret_client else ""))
 
-    # ---- (5) token shape heuristic
-    if admin_bot_token and not _is_token_shape_ok(admin_bot_token):
-        add(_check("admin_bot_token_shape", "WARN", "admin_bot_token tiene forma rara (heurística).", "Verifica que sea el token real del BotFather."))
-    else:
-        add(_check("admin_bot_token_shape", "OK" if admin_bot_token else "WARN", "admin_bot_token parece correcto." if admin_bot_token else "Sin token para validar."))
+    add(_check("admin_bot_token_shape", "OK" if (admin_bot_token and _is_token_shape_ok(admin_bot_token)) else ("WARN" if admin_bot_token else "WARN"),
+               "admin_bot_token parece correcto." if admin_bot_token else "Sin token para validar.",
+               "Verifica token BotFather." if (admin_bot_token and not _is_token_shape_ok(admin_bot_token)) else ""))
 
-    if client_bot_token and not _is_token_shape_ok(client_bot_token):
-        add(_check("client_bot_token_shape", "WARN", "client_bot_token tiene forma rara (heurística).", "Verifica que sea el token real del BotFather."))
-    else:
-        add(_check("client_bot_token_shape", "OK" if client_bot_token else "WARN", "client_bot_token parece correcto." if client_bot_token else "Sin token para validar."))
+    add(_check("client_bot_token_shape", "OK" if (client_bot_token and _is_token_shape_ok(client_bot_token)) else ("WARN" if client_bot_token else "WARN"),
+               "client_bot_token parece correcto." if client_bot_token else "Sin token para validar.",
+               "Verifica token BotFather." if (client_bot_token and not _is_token_shape_ok(client_bot_token)) else ""))
 
-    # ---- (6) admin_chat_id
     admin_chat_id_raw = (tenant.get("admin_chat_id") or "").strip()
     if not admin_chat_id_raw:
         add(_check("admin_chat_id_present", "WARN", "admin_chat_id vacío.", "Usa /id en el bot admin y pega ese número en TENANTS."))
@@ -343,37 +239,29 @@ def tenant_full(
         except Exception:
             add(_check("admin_chat_id_present", "FAIL", f"admin_chat_id no es numérico: '{admin_chat_id_raw}'", "Debe ser un número (chat_id Telegram)."))
 
-    # ---- (7) timezone
     tz = (tenant.get("timezone") or "").strip()
-    if tz:
-        add(_check("timezone_present", "OK", f"timezone='{tz}'"))
-    else:
-        add(_check("timezone_present", "WARN", "timezone vacío.", "Recomendado: America/La_Paz"))
+    add(_check("timezone_present", "OK" if tz else "WARN", f"timezone='{tz}'" if tz else "timezone vacío.", "Recomendado: America/La_Paz" if not tz else ""))
 
-    # ---- (8) orders_sheet_id
     orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
     if not orders_sheet_id:
         add(_check("orders_sheet_id_present", "FAIL", "orders_sheet_id missing.", "Completa orders_sheet_id en TENANTS."))
         return {"ok": False, "tenant_id": tenant_id, "summary": summary, "blockers": blockers, "checks": checks}
     add(_check("orders_sheet_id_present", "OK", "orders_sheet_id presente."))
 
-    # ---- (9) QR config
     qr_file_id = (tenant.get("payment_qr_file_id") or "").strip()
     qr_url_raw = (tenant.get("payment_qr_url") or tenant.get("payment_qr_link") or "").strip()
-    qr_url = _normalize_public_qr_url(qr_url_raw)
+    qr_url_norm = _normalize_public_qr_url(qr_url_raw)
 
     if qr_file_id:
         add(_check("payment_qr_source", "OK", "QR por file_id (preferido)."))
-    elif qr_url:
+    elif qr_url_norm:
         add(_check("payment_qr_source", "OK", "QR por URL pública."))
-        if not _is_drive_uc_url(qr_url):
-            add(_check("payment_qr_url_format", "WARN", "QR URL no es drive uc?export=download&id=...", "Convierte a formato uc?export=download&id=<ID> para máxima compatibilidad."))
-        else:
-            add(_check("payment_qr_url_format", "OK", "QR URL tiene formato drive uc correcto."))
+        add(_check("payment_qr_url_format", "OK" if _is_drive_uc_url(qr_url_norm) else "WARN",
+                   "QR URL formato OK." if _is_drive_uc_url(qr_url_norm) else "QR URL no es drive uc?export=download&id=...",
+                   "Convierte a formato uc?export=download&id=<ID>." if not _is_drive_uc_url(qr_url_norm) else ""))
     else:
         add(_check("payment_qr_source", "WARN", "No hay QR configurado.", "Configura payment_qr_file_id o payment_qr_url/payment_qr_link en TENANTS."))
 
-    # ---- (10) Open spreadsheet
     try:
         sh = open_spreadsheet_by_key(gc, orders_sheet_id)
         add(_check("orders_sheet_open", "OK", "Spreadsheet de tenant abre correctamente."))
@@ -381,33 +269,37 @@ def tenant_full(
         add(_check("orders_sheet_open", "FAIL", f"No se pudo abrir spreadsheet: {e}", "Comparte el sheet con la service account y verifica el ID."))
         return {"ok": False, "tenant_id": tenant_id, "summary": summary, "blockers": blockers, "checks": checks}
 
-    # ---- (11) Worksheets + headers
     orders_required = ["order_id", "created_at", "tenant_id", "customer_name", "customer_contact", "items", "status", "total_amount"]
     menu_required = ["sku", "name", "price", "active", "category"]
 
     orders_diag = _find_ws_by_name_or_headers(sh, "Orders", required_headers=orders_required)
     if not orders_diag.get("found"):
-        add(_check("orders_ws_found", "FAIL", "Orders worksheet no encontrada.", "Crea una pestaña 'Orders' o asegúrate que exista una con esos headers."))
+        add(_check("orders_ws_found", "FAIL", "Orders worksheet no encontrada.", "Crea 'Orders' o una hoja con esos headers."))
     else:
         add(_check("orders_ws_found", "OK", f"Orders encontrada: '{orders_diag.get('title')}' ({orders_diag.get('method')})."))
-        if orders_diag.get("headers_ok"):
-            add(_check("orders_headers_ok", "OK", f"Headers Orders OK (fila {orders_diag.get('header_row')})."))
-        else:
-            add(_check("orders_headers_ok", "FAIL", f"Headers Orders incompletos en '{orders_diag.get('title')}'.", "Revisa la fila de headers técnicos y nombres exactos."))
+        add(_check("orders_headers_ok", "OK" if orders_diag.get("headers_ok") else "FAIL",
+                   f"Headers Orders OK (fila {orders_diag.get('header_row')})." if orders_diag.get("headers_ok") else "Headers Orders incompletos.",
+                   "Revisa headers técnicos exactos." if not orders_diag.get("headers_ok") else ""))
 
     menu_diag = _find_ws_by_name_or_headers(sh, "Menu", required_headers=menu_required)
     if not menu_diag.get("found"):
-        add(_check("menu_ws_found", "FAIL", "Menu worksheet no encontrada.", "Crea una pestaña 'Menu' o asegúrate que exista una con esos headers."))
+        add(_check("menu_ws_found", "FAIL", "Menu worksheet no encontrada.", "Crea 'Menu' o una hoja con esos headers."))
     else:
         add(_check("menu_ws_found", "OK", f"Menu encontrada: '{menu_diag.get('title')}' ({menu_diag.get('method')})."))
-        if menu_diag.get("headers_ok"):
-            add(_check("menu_headers_ok", "OK", f"Headers Menu OK (fila {menu_diag.get('header_row')})."))
-        else:
-            add(_check("menu_headers_ok", "FAIL", f"Headers Menu incompletos en '{menu_diag.get('title')}'.", "Revisa la fila de headers técnicos y nombres exactos."))
+        add(_check("menu_headers_ok", "OK" if menu_diag.get("headers_ok") else "FAIL",
+                   f"Headers Menu OK (fila {menu_diag.get('header_row')})." if menu_diag.get("headers_ok") else "Headers Menu incompletos.",
+                   "Revisa headers técnicos exactos." if not menu_diag.get("headers_ok") else ""))
 
     ok = (summary["FAIL"] == 0)
-    quick_fix = [c["suggested_fix"] for c in checks if c["status"] == "FAIL" and c["suggested_fix"]]
-    quick_fix += [c["suggested_fix"] for c in checks if c["status"] == "WARN" and c["suggested_fix"]]
+
+    # quick_fix sin duplicados
+    seen = set()
+    quick_fix = []
+    for c in checks:
+        sf = (c.get("suggested_fix") or "").strip()
+        if sf and sf not in seen:
+            seen.add(sf)
+            quick_fix.append(sf)
 
     return {
         "ok": ok,
@@ -415,16 +307,18 @@ def tenant_full(
         "tenant_id_raw": tenant.get("tenant_id_raw"),
         "summary": summary,
         "blockers": blockers,
-        "quick_fix": quick_fix[:15],
+        "quick_fix": quick_fix[:20],
         "checks": checks,
         "worksheets": {"orders": orders_diag, "menu": menu_diag},
+        "qr_debug": {
+            "payment_qr_url_raw": qr_url_raw[:200],
+            "payment_qr_url_normalized": qr_url_norm[:200],
+            "payment_qr_url_is_drive_uc": _is_drive_uc_url(qr_url_norm),
+            "payment_qr_file_id_present": bool(qr_file_id),
+        },
     }
 
 
-# Mantengo /healthcheck por compatibilidad (alias simple)
 @router.get("/healthcheck")
-def healthcheck_tenant(
-    tenant_id: str = Query(..., description="tenant_id (ej: resto_demo)"),
-    token: str = Query(..., description="ADMIN_TOKEN"),
-) -> Dict[str, Any]:
+def healthcheck_tenant(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[str, Any]:
     return tenant_full(tenant_id=tenant_id, token=token)
