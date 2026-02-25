@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def create_app() -> FastAPI:
     app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
-    # CORS (si no lo necesitas, puedes restringir dominios luego)
+    # CORS (si luego quieres restringir, se hace por dominios)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -37,6 +37,11 @@ def create_app() -> FastAPI:
     @app.get("/health", tags=["system"])
     def health():
         return {"ok": True, "status": "healthy", "service": APP_NAME}
+
+    # Healthcheck público simple (NO toca secretos)
+    @app.get("/healthcheck", tags=["system"])
+    def healthcheck():
+        return {"ok": True, "status": "running", "service": APP_NAME, "version": APP_VERSION}
 
     @app.on_event("startup")
     async def startup_event():
