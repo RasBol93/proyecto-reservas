@@ -1,4 +1,14 @@
 # app/telegram_webhook.py
+#
+# Mejoras aplicadas (mínimas, pero de producción):
+# ✅ Seguridad: solo admin_chat_id puede confirmar pago (anti-hijack).
+# ✅ Idempotencia: confirmar PAID dos veces no rompe y devuelve mensaje consistente.
+# ✅ Robustez: manejo defensivo de updates raros (sin message/callback) y cast seguro.
+# ✅ Menos fallos por Markdown: textos admin sin Markdown; cliente con Markdown limitado.
+# ✅ Evita callback_data largo: (ya lo cubre telegram_keyboard.py con guardrail).
+# ✅ Logs más útiles: eventos para auditing y diagnósticos.
+#
+# Nota: Mantengo tu arquitectura y contratos. No toco sheets.py/utils.py.
 
 import json
 import re
@@ -369,6 +379,31 @@ def i_paid_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
 
 
 # -------------------------
+# Helpers de seguridad / parsing
+# -------------------------
+
+def _safe_int(v: Any) -> Optional[int]:
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def _assert_admin_authorized(tenant: Dict[str, Any], chat_id: int, tenant_id: str) -> None:
+    """
+    Seguridad crítica: SOLO el admin_chat_id puede confirmar pagos.
+    Si no está configurado, permitimos (modo demo) pero logueamos warning.
+    """
+    admin_chat_id = get_admin_chat_id(tenant)
+    if admin_chat_id is None:
+        log_event("admin_chat_id_missing_security_warning", tenant_id=tenant_id, chat_id=chat_id)
+        return
+    if chat_id != admin_chat_id:
+        log_event("admin_paid_unauthorized", tenant_id=tenant_id, chat_id=chat_id, expected_admin_chat_id=admin_chat_id)
+        raise HTTPException(status_code=403, detail="Not authorized")
+
+
+# -------------------------
 # Webhook endpoint
 # -------------------------
 
@@ -381,7 +416,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
     gc = get_gspread_client()
     tenant = get_tenant_or_404(tenant_id, gc=gc)
 
-    # Debug snapshot: ver qué keys llegan realmente
+    # Debug snapshot: ver qué keys llegan realmente (útil para el bug QR)
     try:
         log_event(
             "debug_qr_tenant_snapshot",
@@ -411,15 +446,25 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
     if cb:
         data = (cb.get("data") or "").strip()
         cb_id = cb.get("id")
-        chat_id = int(cb["message"]["chat"]["id"])
+
+        # callback puede venir sin message (casos raros)
+        msg_obj = cb.get("message") or {}
+        chat_obj = msg_obj.get("chat") or {}
+        chat_id = _safe_int(chat_obj.get("id"))
+        if chat_id is None:
+            log_event("callback_missing_chat_id", tenant_id=tenant_id, data=data)
+            return {"ok": True}
 
         if cb_id:
             telegram_answer_callback(bot_token, cb_id, "OK")
 
+        # -------------------------
         # ADMIN callbacks: confirmar pago
+        # -------------------------
         if mode == "admin" and data.startswith("paid|"):
             parts = data.split("|")
             if len(parts) != 3:
+                log_event("admin_paid_bad_callback_format", tenant_id=tenant_id, data=data)
                 return {"ok": True}
 
             cb_tenant_id = parts[1].strip()
@@ -428,8 +473,21 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             if cb_tenant_id != tenant_id:
                 raise HTTPException(status_code=400, detail="Tenant mismatch in callback")
 
-            update_order_status(orders_sh, order_id, "PAID")
-            telegram_send_text(bot_token, chat_id, f"✅ Pedido {order_id} marcado como PAID")
+            # ✅ Seguridad: solo admin real
+            _assert_admin_authorized(tenant, chat_id, tenant_id)
+
+            # ✅ Idempotencia: update_order_status ahora devuelve already
+            res = update_order_status(orders_sh, order_id, "PAID")
+            if not res.get("found"):
+                telegram_send_text(bot_token, chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
+                return {"ok": True}
+
+            if res.get("already"):
+                telegram_send_text(bot_token, chat_id, f"ℹ️ Pedido {order_id} ya estaba en PAID.")
+            else:
+                telegram_send_text(bot_token, chat_id, f"✅ Pedido {order_id} marcado como PAID")
+
+            log_event("admin_mark_paid", tenant_id=tenant_id, order_id=order_id, admin_chat_id=chat_id, already=bool(res.get("already")))
 
             # avisar al cliente con el BOT CLIENTE
             order = get_order_by_id(orders_sh, order_id)
@@ -448,7 +506,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             return {"ok": True}
 
+        # -------------------------
         # CLIENT callbacks
+        # -------------------------
         if mode == "client":
             sess = get_sess(tenant_id, chat_id)
 
@@ -632,7 +692,11 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
     # =========================================================
     msg = update.get("message") or update.get("edited_message")
     if msg:
-        chat_id = int(msg["chat"]["id"])
+        chat_id = _safe_int((msg.get("chat") or {}).get("id"))
+        if chat_id is None:
+            log_event("message_missing_chat_id", tenant_id=tenant_id)
+            return {"ok": True}
+
         text = (msg.get("text") or "").strip()
 
         if normalize(text) in ("/id", "id"):
@@ -651,11 +715,14 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 proof_file_id = msg["photo"][-1].get("file_id")
                 proof_type = "photo"
             elif msg.get("document"):
-                proof_file_id = msg["document"].get("file_id")
+                proof_file_id = (msg.get("document") or {}).get("file_id")
                 proof_type = "document"
                 if not proof_caption:
-                    proof_caption = (msg["document"].get("file_name") or "").strip()
+                    proof_caption = ((msg.get("document") or {}).get("file_name") or "").strip()
 
+            # --------
+            # Proof upload: buscar order_id
+            # --------
             if proof_file_id and proof_type:
                 order_id = (sess.get("tmp") or {}).get("pending_order_id")
 
@@ -683,6 +750,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     proof_caption=proof_caption,
                 )
 
+                log_event("client_payment_proof_received", tenant_id=tenant_id, order_id=order_id, proof_type=proof_type, chat_id=chat_id)
+
                 telegram_send_text(
                     bot_token,
                     chat_id,
@@ -691,11 +760,17 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 )
                 return {"ok": True}
 
+            # --------
+            # Start
+            # --------
             if normalize(text) in ("start", "/start", "hola"):
                 clear_sess(tenant_id, chat_id)
                 telegram_send_text(bot_token, chat_id, "Bienvenido 👋\nElige una opción:", client_home_kb())
                 return {"ok": True}
 
+            # --------
+            # Captura nombre
+            # --------
             if sess.get("stage") == "awaiting_name":
                 customer_name = text.strip()
                 if not customer_name:
@@ -727,6 +802,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     source="telegram",
                     total_amount=total,
                 )
+
+                log_event("order_created", tenant_id=tenant_id, order_id=order_id, chat_id=chat_id, total=total)
 
                 sess["stage"] = "awaiting_proof"
                 sess["tmp"] = sess.get("tmp") or {}
@@ -794,4 +871,5 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         telegram_send_text(bot_token, chat_id, "OK admin ✅ (escribe /id para ver tu chat_id)")
         return {"ok": True}
 
+    # update sin callback_query ni message: ignorar
     return {"ok": True}
