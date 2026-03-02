@@ -1,4 +1,20 @@
 # app/orders.py
+"""
+Orders persistence layer (Google Sheets)
+
+Objetivos de estas mejoras:
+- Idempotencia clara en updates (status y proof) para tolerar retries de Telegram/Render.
+- Menos escrituras en Sheets (batch update cuando se puede).
+- Robusto ante headers desplazados (fila 1 técnica, fila 2 etiquetas) y pestañas con nombres distintos.
+- Diagnóstico más útil en logs cuando autodetecta pestañas o faltan headers.
+
+Requisitos implícitos del sistema:
+- Orders sheet debe tener (mínimo): order_id, tenant_id, status
+- Ideal: Orders tab se llame "Orders", pero si no, se autodetecta por headers.
+
+Nota:
+- Mantengo tu estilo y funciones, pero refuerzo casos borde.
+"""
 
 import json
 from typing import Any, Dict, List, Tuple, Optional
@@ -22,6 +38,10 @@ REQUIRED_ORDERS_HEADERS_MIN = ["order_id", "tenant_id", "status"]
 
 
 def _ws_has_required_headers(ws, required_headers: List[str], max_scan_rows: int = 30) -> bool:
+    """
+    True si encuentra una fila (dentro de las primeras max_scan_rows) que contenga
+    TODOS los required_headers (comparación normalizada).
+    """
     try:
         values = ws.get_all_values()
     except Exception:
@@ -42,6 +62,9 @@ def _ws_has_required_headers(ws, required_headers: List[str], max_scan_rows: int
 
 
 def _find_orders_ws_by_headers(orders_sh) -> Optional[Any]:
+    """
+    Busca una worksheet que tenga headers mínimos de Orders.
+    """
     try:
         for ws in orders_sh.worksheets():
             if _ws_has_required_headers(ws, REQUIRED_ORDERS_HEADERS_MIN):
@@ -52,6 +75,11 @@ def _find_orders_ws_by_headers(orders_sh) -> Optional[Any]:
 
 
 def _ensure_orders_ws(orders_sh):
+    """
+    Estrategia:
+    1) intenta pestaña "Orders"
+    2) si no existe, autodetecta por headers
+    """
     # 1) camino rápido
     try:
         return get_ws(orders_sh, "Orders")
@@ -69,7 +97,10 @@ def _ensure_orders_ws(orders_sh):
 
     raise HTTPException(
         status_code=500,
-        detail="Orders worksheet not found. Expected a tab named 'Orders' or any tab with headers including: order_id, tenant_id, status",
+        detail=(
+            "Orders worksheet not found. Expected a tab named 'Orders' "
+            "or any tab with headers including: order_id, tenant_id, status"
+        ),
     )
 
 
@@ -142,6 +173,26 @@ def _row_as_dict(headers_norm: List[str], row: List[Any]) -> Dict[str, Any]:
     return out
 
 
+def _find_row_by_order_id(values: List[List[Any]], header_row_1based: int, col_order_id: int, order_id: str) -> Optional[int]:
+    """
+    Devuelve row_1based de la fila del pedido, o None.
+    """
+    oid_target = normalize(order_id)
+
+    # data empieza debajo del header_row
+    start_idx_0 = header_row_1based  # 1-based -> idx 0-based
+    for i in range(start_idx_0, len(values)):
+        row = values[i]
+        oid = row[col_order_id] if col_order_id < len(row) else ""
+        if normalize(oid) == oid_target:
+            return i + 1
+    return None
+
+
+def _safe_str(v: Any) -> str:
+    return str(v if v is not None else "")
+
+
 # ---------------------------------
 # Public API
 # ---------------------------------
@@ -159,6 +210,10 @@ def append_order_row(
     source: str,
     total_amount: float,
 ) -> None:
+    """
+    Inserta una fila siguiendo EXACTAMENTE el orden de headers detectados.
+    Esto evita romper cuando el sheet agrega columnas.
+    """
     ws = _ensure_orders_ws(orders_sh)
 
     required = [
@@ -201,7 +256,10 @@ def append_order_row(
 
 def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, Any]:
     """
-    Mejora: idempotencia explícita + retorno de bandera already.
+    Mejora:
+    - idempotencia explícita con bandera "already"
+    - evita escribir si ya está en ese estado
+    - más robusto si hay retries
     """
     ws = _ensure_orders_ws(orders_sh)
 
@@ -211,33 +269,34 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
     col_order_id = headers_norm.index("order_id")
     col_status = headers_norm.index("status")
 
-    oid_target = normalize(order_id)
-    old_status = ""
-    found_row_1based = None
-
-    # datos empiezan debajo del header_row
-    start_idx_0 = header_row  # header_row es 1-based => start idx 0-based = header_row
-    for i in range(start_idx_0, len(values)):
-        row = values[i]
-        oid = row[col_order_id] if col_order_id < len(row) else ""
-        if normalize(oid) == oid_target:
-            found_row_1based = i + 1
-            old_status = row[col_status] if col_status < len(row) else ""
-            break
-
+    found_row_1based = _find_row_by_order_id(values, header_row, col_order_id, order_id)
     if not found_row_1based:
         return {"found": False}
 
-    # idempotencia
+    # leer status actual desde values
+    row_idx_0 = found_row_1based - 1
+    row = values[row_idx_0] if row_idx_0 < len(values) else []
+    old_status = row[col_status] if col_status < len(row) else ""
+
     if normalize(old_status) == normalize(new_status):
-        return {"found": True, "old_status": old_status, "row_1based": found_row_1based, "already": True}
+        return {
+            "found": True,
+            "old_status": old_status,
+            "row_1based": found_row_1based,
+            "already": True,
+        }
 
     try:
         ws.update_cell(found_row_1based, col_status + 1, new_status)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed updating status: {e}")
 
-    return {"found": True, "old_status": old_status, "row_1based": found_row_1based, "already": False}
+    return {
+        "found": True,
+        "old_status": old_status,
+        "row_1based": found_row_1based,
+        "already": False,
+    }
 
 
 def get_order_by_id(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
@@ -247,19 +306,16 @@ def get_order_by_id(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
     header_row, headers_raw, headers_norm, values = _get_orders_header(ws, required=required)
 
     col_order_id = headers_norm.index("order_id")
-    oid_target = normalize(order_id)
+    found_row_1based = _find_row_by_order_id(values, header_row, col_order_id, order_id)
+    if not found_row_1based:
+        return None
 
-    start_idx_0 = header_row
-    for i in range(start_idx_0, len(values)):
-        row = values[i]
-        oid = row[col_order_id] if col_order_id < len(row) else ""
-        if normalize(oid) == oid_target:
-            data = _row_as_dict(headers_norm, row)
-            data["_row_1based"] = i + 1
-            data["_header_row"] = header_row
-            return data
-
-    return None
+    row_idx_0 = found_row_1based - 1
+    row = values[row_idx_0] if row_idx_0 < len(values) else []
+    data = _row_as_dict(headers_norm, row)
+    data["_row_1based"] = found_row_1based
+    data["_header_row"] = header_row
+    return data
 
 
 def find_latest_pending_order_for_contact(
@@ -267,6 +323,11 @@ def find_latest_pending_order_for_contact(
     customer_contact: str,
     status: str = "PENDING_PAYMENT",
 ) -> Optional[str]:
+    """
+    Devuelve el order_id más reciente (último en la hoja) que coincida con:
+    - customer_contact
+    - status
+    """
     ws = _ensure_orders_ws(orders_sh)
 
     required = ["order_id", "customer_contact", "status"]
@@ -284,7 +345,7 @@ def find_latest_pending_order_for_contact(
         row = values[i]
         c = row[col_contact] if col_contact < len(row) else ""
         s = row[col_status] if col_status < len(row) else ""
-        if normalize(str(c)) == contact_target and normalize(str(s)) == status_target:
+        if normalize(_safe_str(c)) == contact_target and normalize(_safe_str(s)) == status_target:
             oid = row[col_oid] if col_oid < len(row) else ""
             return oid.strip() if oid else None
 
@@ -299,7 +360,10 @@ def update_order_payment_proof(
     proof_caption: str = "",
 ) -> Dict[str, Any]:
     """
-    Mejora: actualiza solo si cambió (evita writes duplicados por retries).
+    Mejora grande:
+    - idempotente: solo escribe si cambió
+    - si existen 2 o 3 columnas, hace BATCH update (1 request en vez de 3)
+    - devuelve "changed": True/False para debugging
     """
     ws = _ensure_orders_ws(orders_sh)
 
@@ -311,40 +375,48 @@ def update_order_payment_proof(
     col_type = _col_index(headers_norm, "payment_proof_type")
     col_cap = _col_index(headers_norm, "payment_proof_caption")
 
-    oid_target = normalize(order_id)
-    found_row_1based = None
-    found_row = None
-
-    start_idx_0 = header_row
-    for i in range(start_idx_0, len(values)):
-        row = values[i]
-        oid = row[col_oid] if col_oid < len(row) else ""
-        if normalize(oid) == oid_target:
-            found_row_1based = i + 1
-            found_row = row
-            break
-
-    if not found_row_1based or found_row is None:
+    found_row_1based = _find_row_by_order_id(values, header_row, col_oid, order_id)
+    if not found_row_1based:
         return {"found": False}
 
-    def _cell_value(col_idx: Optional[int]) -> str:
+    row_idx_0 = found_row_1based - 1
+    row = values[row_idx_0] if row_idx_0 < len(values) else []
+
+    def cur(col_idx: Optional[int]) -> str:
         if col_idx is None:
             return ""
-        return str(found_row[col_idx] if col_idx < len(found_row) else "")
+        return _safe_str(row[col_idx] if col_idx < len(row) else "")
 
-    cur_file = _cell_value(col_file)
-    cur_type = _cell_value(col_type)
-    cur_cap = _cell_value(col_cap)
+    cur_file = cur(col_file)
+    cur_type = cur(col_type)
+    cur_cap = cur(col_cap)
 
-    # Actualizar solo columnas que existan y que cambien
+    # preparar cambios
+    updates: List[Tuple[int, str]] = []  # (col_1based, value)
+    if col_file is not None and _safe_str(cur_file) != _safe_str(proof_file_id):
+        updates.append((col_file + 1, proof_file_id))
+    if col_type is not None and _safe_str(cur_type) != _safe_str(proof_type):
+        updates.append((col_type + 1, proof_type))
+    if col_cap is not None and _safe_str(cur_cap) != _safe_str(proof_caption):
+        updates.append((col_cap + 1, proof_caption))
+
+    if not updates:
+        return {"found": True, "row_1based": found_row_1based, "changed": False}
+
+    # Preferir batch_update (menos requests)
     try:
-        if col_file is not None and str(cur_file) != str(proof_file_id):
-            ws.update_cell(found_row_1based, col_file + 1, proof_file_id)
-        if col_type is not None and str(cur_type) != str(proof_type):
-            ws.update_cell(found_row_1based, col_type + 1, proof_type)
-        if col_cap is not None and str(cur_cap) != str(proof_caption):
-            ws.update_cell(found_row_1based, col_cap + 1, proof_caption)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed updating payment proof: {e}")
+        # gspread worksheet.batch_update espera rangos A1 y values en lista de listas
+        data = []
+        for col_1based, value in updates:
+            a1 = ws.cell(found_row_1based, col_1based).address  # e.g., "K12"
+            data.append({"range": a1, "values": [[value]]})
+        ws.batch_update(data)
+    except Exception:
+        # fallback seguro a update_cell individual
+        try:
+            for col_1based, value in updates:
+                ws.update_cell(found_row_1based, col_1based, value)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed updating payment proof: {e}")
 
-    return {"found": True, "row_1based": found_row_1based}
+    return {"found": True, "row_1based": found_row_1based, "changed": True}
