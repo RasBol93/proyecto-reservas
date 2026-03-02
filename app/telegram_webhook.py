@@ -1,12 +1,12 @@
 # app/telegram_webhook.py
 #
-# Mejoras (mínimas, pero "prod-safe"):
-# ✅ Seguridad: solo admin_chat_id puede confirmar pago (anti-hijack) + i_paid solo si el pedido pertenece a ese chat.
-# ✅ Idempotencia: confirmar PAID 2 veces no rompe (depende de orders.py already) + dedupe simple para crear pedido.
-# ✅ Robustez: manejo defensivo de updates raros (sin message/callback) y cast seguro.
-# ✅ Menos fallos por Markdown: admin sin Markdown; cliente con Markdown limitado.
-# ✅ Logs más útiles: eventos para auditing y diagnósticos.
-# ✅ UX: captura requested_time opcional (stage) antes de crear order (sin romper tu flujo: si no responde, queda "pendiente").
+# Cambio solicitado:
+# ✅ Cuando el cliente SUBE el comprobante (foto/PDF),
+#    se notifica al ADMIN inmediatamente y se reenvía el comprobante,
+#    ANTES de que el cliente presione "Ya pagué".
+#
+# Nota: mantengo "✅ Ya pagué" como opcional (recordatorio) por si el admin no responde,
+#       pero ya no es requisito para notificar.
 
 import json
 import re
@@ -32,10 +32,6 @@ from app.utils import normalize, log_event
 
 router = APIRouter()
 
-# =========================================================
-# Estado en memoria (DEMO)
-# - Si Render reinicia, se pierde.
-# =========================================================
 # key: (tenant_id, chat_id) -> {"cart":[{"sku":..., "qty":...}], "stage": "...", "tmp": {...}}
 SESSIONS: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
@@ -282,7 +278,6 @@ def notify_admin_payment_reported(
         telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
         return
 
-    # menu puede fallar
     try:
         menu_idx = load_menu_index(orders_sh)
     except Exception as e:
@@ -305,7 +300,7 @@ def notify_admin_payment_reported(
     confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{order_id}")]])
 
     txt = (
-        "💳 PAGO REPORTADO\n\n"
+        "💳 COMPROBANTE RECIBIDO\n\n"
         f"Tenant: {tenant_id}\n"
         f"ID: {order_id}\n"
         f"Cliente: {order.get('customer_name','')}\n"
@@ -314,11 +309,12 @@ def notify_admin_payment_reported(
         f"Cantidad total: {total_qty}\n"
         f"Total: {total:.2f} BOB\n\n"
         f"Detalle:\n{lines_txt}\n\n"
-        "Presiona ✅ Confirmar pago cuando verifiques."
+        "Verifica el comprobante y presiona ✅ Confirmar pago."
     )
 
     telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn)
 
+    # Reenvía el comprobante (si existe)
     if proof_file_id:
         if proof_type == "photo":
             telegram_send_photo(admin_token, admin_chat_id, proof_file_id, caption=proof_caption or "Comprobante (foto)")
@@ -352,16 +348,10 @@ def cart_kb(has_items: bool) -> Dict[str, Any]:
 
 
 def i_paid_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
+    # queda como "recordatorio" opcional
     return kb([
-        [("✅ Ya pagué", f"i_paid|{tenant_id}|{order_id}")],
+        [("🔔 Avisar / Recordar al admin", f"i_paid|{tenant_id}|{order_id}")],
         [("🏠 Inicio", "home")],
-    ])
-
-
-def requested_time_skip_kb() -> Dict[str, Any]:
-    return kb([
-        [("⏭️ Omitir (pendiente)", "time_skip")],
-        [("⬅️ Volver al carrito", "cart")],
     ])
 
 
@@ -387,9 +377,6 @@ def _assert_admin_authorized(tenant: Dict[str, Any], chat_id: int, tenant_id: st
 
 
 def _assert_order_belongs_to_chat(order: Dict[str, Any], chat_id: int, tenant_id: str, order_id: str) -> None:
-    """
-    Seguridad: el cliente solo puede operar sobre SU pedido (customer_contact == chat_id).
-    """
     owner = str(order.get("customer_contact") or "").strip()
     if not owner:
         log_event("order_missing_owner_contact", tenant_id=tenant_id, order_id=order_id)
@@ -485,7 +472,46 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             return {"ok": True}
 
-        # CLIENT callbacks
+        # CLIENT: recordatorio opcional al admin (ya no es requisito)
+        if mode == "client" and data.startswith("i_paid|"):
+            parts = data.split("|")
+            if len(parts) != 3:
+                return {"ok": True}
+
+            _, cb_tenant_id, order_id = parts
+            cb_tenant_id = cb_tenant_id.strip()
+            order_id = order_id.strip()
+
+            if cb_tenant_id != tenant_id:
+                raise HTTPException(status_code=400, detail="Tenant mismatch in i_paid callback")
+
+            order = get_order_by_id(orders_sh, order_id)
+            if not order:
+                telegram_send_text(bot_token, chat_id, "No encontré tu pedido. Vuelve a /start.", reply_markup=client_home_kb())
+                return {"ok": True}
+
+            _assert_order_belongs_to_chat(order, chat_id, tenant_id, order_id)
+
+            proof_file_id = (order.get("payment_proof_file_id") or "").strip()
+            if not proof_file_id:
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Aún no recibí tu comprobante.\nPor favor envía una foto o PDF del pago primero.",
+                )
+                return {"ok": True}
+
+            notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id)
+
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "🔔 Listo. Le reenvié el comprobante al administrador para que lo verifique.",
+                reply_markup=client_home_kb(),
+            )
+            return {"ok": True}
+
+        # resto callbacks client (menú/carrito/etc.)
         if mode == "client":
             sess = get_sess(tenant_id, chat_id)
 
@@ -539,53 +565,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                 sess["stage"] = "awaiting_name"
                 telegram_send_text(bot_token, chat_id, "Perfecto. ¿Cuál es tu *nombre* para el pedido?", parse_mode="Markdown")
-                return {"ok": True}
-
-            if data == "time_skip":
-                # el cliente decidió no poner hora
-                sess["tmp"] = sess.get("tmp") or {}
-                sess["tmp"]["requested_time"] = "pendiente"
-                sess["stage"] = "awaiting_name"
-                telegram_send_text(bot_token, chat_id, "Listo. ¿Cuál es tu *nombre* para el pedido?", parse_mode="Markdown")
-                return {"ok": True}
-
-            # Cliente presiona "Ya pagué" -> avisar admin (solo si el pedido es suyo)
-            if data.startswith("i_paid|"):
-                parts = data.split("|")
-                if len(parts) != 3:
-                    return {"ok": True}
-
-                _, cb_tenant_id, order_id = parts
-                cb_tenant_id = cb_tenant_id.strip()
-                order_id = order_id.strip()
-
-                if cb_tenant_id != tenant_id:
-                    raise HTTPException(status_code=400, detail="Tenant mismatch in i_paid callback")
-
-                order = get_order_by_id(orders_sh, order_id)
-                if not order:
-                    telegram_send_text(bot_token, chat_id, "No encontré tu pedido. Vuelve a /start.", reply_markup=client_home_kb())
-                    return {"ok": True}
-
-                _assert_order_belongs_to_chat(order, chat_id, tenant_id, order_id)
-
-                proof_file_id = (order.get("payment_proof_file_id") or "").strip()
-                if not proof_file_id:
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        "Aún no recibí tu comprobante.\nPor favor envía una foto o PDF del pago primero.",
-                    )
-                    return {"ok": True}
-
-                notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id)
-
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    "✅ Recibido. Espera unos minutos mientras verificamos tu pago.",
-                    reply_markup=client_home_kb(),
-                )
                 return {"ok": True}
 
             if data.startswith("cat|"):
@@ -693,7 +672,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         if mode == "client":
             sess = get_sess(tenant_id, chat_id)
 
-            # Proof upload
             proof_file_id = None
             proof_type = None
             proof_caption = (msg.get("caption") or "").strip()
@@ -707,9 +685,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 if not proof_caption:
                     proof_caption = ((msg.get("document") or {}).get("file_name") or "").strip()
 
+            # ✅ CAMBIO CLAVE: al subir proof, notificar admin inmediatamente
             if proof_file_id and proof_type:
                 order_id = (sess.get("tmp") or {}).get("pending_order_id")
-
                 if not order_id:
                     order_id = find_latest_pending_order_for_contact(
                         orders_sh=orders_sh,
@@ -736,37 +714,42 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                 log_event("client_payment_proof_received", tenant_id=tenant_id, order_id=order_id, proof_type=proof_type, chat_id=chat_id)
 
+                # Validar ownership y dedupe notificación
+                tmp = sess.get("tmp") or {}
+                sess["tmp"] = tmp
+
+                order = get_order_by_id(orders_sh, order_id)
+                if order:
+                    _assert_order_belongs_to_chat(order, chat_id, tenant_id, order_id)
+
+                already_notified = str(tmp.get("admin_notified_for_order") or "").strip() == str(order_id)
+                if not already_notified:
+                    notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id)
+                    tmp["admin_notified_for_order"] = str(order_id)
+                    log_event("admin_notified_on_proof_upload", tenant_id=tenant_id, order_id=order_id)
+                else:
+                    log_event("admin_notify_skipped_duplicate", tenant_id=tenant_id, order_id=order_id)
+
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "✅ Comprobante recibido.\nAhora presiona “✅ Ya pagué” para avisar al administrador.",
+                    "✅ Comprobante recibido.\n📨 Ya se lo envié al administrador para verificación.\n"
+                    "Si en unos minutos no responde, puedes tocar “🔔 Avisar / Recordar al admin”.",
                     reply_markup=i_paid_kb(tenant_id, order_id),
                 )
                 return {"ok": True}
 
-            # Start
             if normalize(text) in ("start", "/start", "hola"):
                 clear_sess(tenant_id, chat_id)
                 telegram_send_text(bot_token, chat_id, "Bienvenido 👋\nElige una opción:", client_home_kb())
                 return {"ok": True}
 
-            # Captura requested_time (opcional)
-            if sess.get("stage") == "awaiting_time":
-                requested_time = text.strip() or "pendiente"
-                sess["tmp"] = sess.get("tmp") or {}
-                sess["tmp"]["requested_time"] = requested_time
-                sess["stage"] = "awaiting_name"
-                telegram_send_text(bot_token, chat_id, "Perfecto. ¿Cuál es tu *nombre* para el pedido?", parse_mode="Markdown")
-                return {"ok": True}
-
-            # Captura nombre (con dedupe para evitar doble append por retries)
             if sess.get("stage") == "awaiting_name":
                 customer_name = text.strip()
                 if not customer_name:
                     telegram_send_text(bot_token, chat_id, "Dime tu nombre, por favor.")
                     return {"ok": True}
 
-                # ✅ Dedupe: si ya creamos un order_id en esta fase, no volver a crear
                 tmp = sess.get("tmp") or {}
                 existing_oid = (tmp.get("pending_order_id") or "").strip()
                 if existing_oid:
@@ -781,7 +764,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                 menu_idx = load_menu_index(orders_sh)
                 cart = sess.get("cart") or []
-                lines_txt, total, total_qty = fmt_cart_lines(cart, menu_idx)
+                _, total, total_qty = fmt_cart_lines(cart, menu_idx)
 
                 if total_qty <= 0:
                     telegram_send_text(bot_token, chat_id, "Tu carrito está vacío.", reply_markup=client_home_kb())
@@ -789,7 +772,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     return {"ok": True}
 
                 order_id = gen_order_id()
-                requested_time = (tmp.get("requested_time") or "pendiente").strip() or "pendiente"
+                requested_time = "pendiente"
 
                 append_order_row(
                     orders_sh=orders_sh,
@@ -833,14 +816,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 qr_file_id = get_payment_qr_file_id(tenant)
                 qr_url = get_payment_qr_url(tenant)
 
-                log_event(
-                    "debug_qr_values",
-                    tenant_id=tenant_id,
-                    qr_file_id_present=bool(qr_file_id),
-                    qr_url_present=bool(qr_url),
-                    qr_url=qr_url[:200] if qr_url else "",
-                )
-
                 if qr_file_id:
                     telegram_send_photo(bot_token, chat_id, qr_file_id, caption="QR de pago")
                 elif qr_url:
@@ -856,13 +831,11 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "📎 Cuando pagues, envía aquí tu *comprobante* (foto o PDF).\n"
-                    "Después de enviarlo, podrás presionar “✅ Ya pagué”.",
+                    "📎 Cuando pagues, envía aquí tu *comprobante* (foto o PDF).",
                     parse_mode="Markdown",
                 )
                 return {"ok": True}
 
-            # Si el usuario escribe algo suelto
             telegram_send_text(bot_token, chat_id, "Usa /start para ver el menú.", reply_markup=client_home_kb())
             return {"ok": True}
 
