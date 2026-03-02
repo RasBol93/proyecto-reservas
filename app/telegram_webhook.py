@@ -62,7 +62,7 @@ def telegram_api_call(bot_token: str, method: str, payload: Dict[str, Any]) -> D
         method="POST",
     )
 
-    with urllib.request.urlopen(req, timeout=12) as resp:
+    with urllib.request.urlopen(req, timeout=20) as resp:
         raw = resp.read().decode("utf-8")
         return json.loads(raw)
 
@@ -131,25 +131,22 @@ def telegram_answer_callback(bot_token: str, callback_query_id: str, text: str =
         log_event("telegram_ack_exception", error=str(e))
 
 
-def telegram_get_file_download_url(bot_token: str, file_id: str) -> Optional[str]:
+def telegram_get_file_path(bot_token: str, file_id: str) -> str:
     """
-    Convierte un file_id en una URL descargable usando getFile (con el bot que lo recibió).
-    Luego esa URL se puede mandar desde OTRO bot como photo/document.
+    Usa getFile para obtener file_path.
+    OJO: el file_id es válido en el contexto del bot que lo recibió.
     """
-    if not bot_token or not file_id:
-        return None
-    try:
-        res = telegram_api_call(bot_token, "getFile", {"file_id": file_id})
-        if not res.get("ok"):
-            return None
-        file_path = ((res.get("result") or {}).get("file_path") or "").strip()
-        if not file_path:
-            return None
-        # TELEGRAM_API_BASE suele ser https://api.telegram.org
-        return f"{TELEGRAM_API_BASE}/file/bot{bot_token}/{file_path}"
-    except Exception as e:
-        log_event("telegram_getfile_failed", error=str(e))
-        return None
+    res = telegram_api_call(bot_token, "getFile", {"file_id": file_id})
+    if not res.get("ok"):
+        raise RuntimeError(f"getFile failed: {res.get('description') or res}")
+    return res["result"]["file_path"]
+
+
+def telegram_build_file_url(bot_token: str, file_path: str) -> str:
+    """
+    URL directa para descargar desde Telegram.
+    """
+    return f"{TELEGRAM_API_BASE}/file/bot{bot_token}/{file_path}"
 
 
 # -------------------------
@@ -270,6 +267,116 @@ def parse_items_field(items_field: Any) -> List[Dict[str, Any]]:
 
 
 # -------------------------
+# ADMIN notify (con comprobante)
+# -------------------------
+
+def notify_admin_payment_reported(
+    tenant: Dict[str, Any],
+    tenant_id: str,
+    orders_sh,
+    order_id: str,
+    is_reminder: bool = False,
+) -> None:
+    admin_token = get_admin_bot_token(tenant)
+    admin_chat_id = get_admin_chat_id(tenant)
+    client_token = get_client_bot_token(tenant)
+
+    if not admin_token:
+        log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_admin_bot_token")
+        return
+    if not admin_chat_id:
+        log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_admin_chat_id")
+        return
+    if not client_token:
+        log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_client_bot_token_for_forward")
+        # igual mandamos texto (pero no media)
+        client_token = ""
+
+    order = get_order_by_id(orders_sh, order_id)
+    if not order:
+        telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
+        return
+
+    # menú puede fallar (no rompas la notificación por eso)
+    try:
+        menu_idx = load_menu_index(orders_sh)
+    except Exception as e:
+        log_event("admin_menu_load_error", tenant_id=tenant_id, error=str(e))
+        menu_idx = {}
+
+    cart = parse_items_field(order.get("items"))
+
+    try:
+        total = float(order.get("total_amount") or 0)
+    except Exception:
+        total = 0.0
+
+    lines_txt, _, total_qty = fmt_cart_lines(cart, menu_idx)
+
+    proof_file_id = (order.get("payment_proof_file_id") or "").strip()
+    proof_type = (order.get("payment_proof_type") or "").strip()
+    proof_caption = (order.get("payment_proof_caption") or "").strip()
+
+    confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{order_id}")]])
+
+    # título recordatorio
+    title = "💳 PAGO REPORTADO"
+    if is_reminder:
+        title = "🔔 *RECORDATORIO* — 💳 PAGO REPORTADO"
+
+    # Nota: aquí sí usamos Markdown SOLO para el título del recordatorio.
+    # El resto sin markdown para evitar caracteres raros.
+    txt = (
+        f"{title}\n\n"
+        f"Tenant: {tenant_id}\n"
+        f"ID: {order_id}\n"
+        f"Cliente: {order.get('customer_name','')}\n"
+        f"Contacto(chat_id): {order.get('customer_contact','')}\n"
+        f"Hora recogida: {order.get('requested_time','pendiente')}\n"
+        f"Cantidad total: {total_qty}\n"
+        f"Total: {total:.2f} BOB\n\n"
+        f"Detalle:\n{lines_txt}\n\n"
+        "Presiona ✅ Confirmar pago cuando verifiques."
+    )
+
+    # si es recordatorio, habilitamos markdown por el título; si no, no hace falta
+    parse_mode = "Markdown" if is_reminder else None
+    telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn, parse_mode=parse_mode)
+
+    # ------- enviar comprobante al admin (clave) -------
+    if not proof_file_id or not proof_type:
+        log_event("admin_missing_proof", tenant_id=tenant_id, order_id=order_id, proof_file_id=bool(proof_file_id), proof_type=proof_type)
+        return
+
+    if not client_token:
+        telegram_send_text(admin_token, admin_chat_id, "⚠️ No puedo reenviar el comprobante: falta client_bot_token.")
+        return
+
+    try:
+        # 1) sacar file_path usando el BOT CLIENTE
+        file_path = telegram_get_file_path(client_token, proof_file_id)
+        # 2) construir URL directa de descarga (con token del cliente)
+        download_url = telegram_build_file_url(client_token, file_path)
+
+        # 3) enviar al admin con el BOT ADMIN usando URL
+        cap = proof_caption or ("Comprobante (foto)" if proof_type == "photo" else "Comprobante (archivo)")
+        if proof_type == "photo":
+            telegram_send_photo(admin_token, admin_chat_id, download_url, caption=cap)
+        else:
+            telegram_send_document(admin_token, admin_chat_id, download_url, caption=cap)
+
+        log_event("admin_proof_forwarded", tenant_id=tenant_id, order_id=order_id, proof_type=proof_type)
+
+    except Exception as e:
+        log_event("admin_proof_forward_failed", tenant_id=tenant_id, order_id=order_id, error=str(e))
+        telegram_send_text(
+            admin_token,
+            admin_chat_id,
+            f"⚠️ No pude reenviar el comprobante automáticamente (error técnico). Pedido: {order_id}",
+        )
+
+
+# -------------------------
 # Client keyboards
 # -------------------------
 
@@ -319,92 +426,6 @@ def _assert_admin_authorized(tenant: Dict[str, Any], chat_id: int, tenant_id: st
 
 
 # -------------------------
-# ADMIN notify (con comprobante)
-# -------------------------
-
-def notify_admin_payment_reported(
-    tenant: Dict[str, Any],
-    tenant_id: str,
-    orders_sh,
-    order_id: str,
-    is_reminder: bool,
-) -> None:
-    admin_token = get_admin_bot_token(tenant)
-    admin_chat_id = get_admin_chat_id(tenant)
-    client_token = get_client_bot_token(tenant)
-
-    if not admin_token or not admin_chat_id:
-        log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_admin_token_or_chat_id")
-        return
-
-    order = get_order_by_id(orders_sh, order_id)
-    if not order:
-        telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
-        return
-
-    # menu puede fallar (no rompas la notificación por eso)
-    try:
-        menu_idx = load_menu_index(orders_sh)
-    except Exception as e:
-        log_event("admin_menu_load_error", tenant_id=tenant_id, error=str(e))
-        menu_idx = {}
-
-    cart = parse_items_field(order.get("items"))
-
-    try:
-        total = float(order.get("total_amount") or 0)
-    except Exception:
-        total = 0.0
-
-    lines_txt, _, total_qty = fmt_cart_lines(cart, menu_idx)
-
-    proof_file_id = (order.get("payment_proof_file_id") or "").strip()
-    proof_type = (order.get("payment_proof_type") or "").strip()
-    proof_caption = (order.get("payment_proof_caption") or "").strip()
-
-    confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{order_id}")]])
-
-    header = "💳 <b>PAGO REPORTADO</b>\n\n"
-    if is_reminder:
-        header = "🔔 <b>RECORDATORIO — PAGO REPORTADO</b>\n\n"
-
-    txt = (
-        header +
-        f"Tenant: {tenant_id}\n"
-        f"ID: {order_id}\n"
-        f"Cliente: {order.get('customer_name','')}\n"
-        f"Contacto(chat_id): {order.get('customer_contact','')}\n"
-        f"Hora recogida: {order.get('requested_time','pendiente')}\n"
-        f"Cantidad total: {total_qty}\n"
-        f"Total: {total:.2f} BOB\n\n"
-        f"Detalle:\n{lines_txt}\n\n"
-        "Presiona ✅ Confirmar pago cuando verifiques."
-    )
-
-    telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn, parse_mode="HTML")
-
-    # Enviar comprobante (clave): construir URL descargable con el CLIENT bot
-    if proof_file_id and client_token:
-        dl_url = telegram_get_file_download_url(client_token, proof_file_id)
-        if dl_url:
-            if proof_type == "photo":
-                telegram_send_photo(admin_token, admin_chat_id, dl_url, caption=proof_caption or "Comprobante (foto)")
-            elif proof_type == "document":
-                telegram_send_document(admin_token, admin_chat_id, dl_url, caption=proof_caption or "Comprobante (archivo)")
-            else:
-                log_event("admin_unknown_proof_type", tenant_id=tenant_id, order_id=order_id, proof_type=proof_type)
-        else:
-            log_event("admin_proof_no_download_url", tenant_id=tenant_id, order_id=order_id)
-            telegram_send_text(admin_token, admin_chat_id, "⚠️ No pude generar URL del comprobante para reenviar.")
-    else:
-        # si no hay proof, igual queda el texto + botón
-        if not proof_file_id:
-            log_event("admin_missing_proof_file_id", tenant_id=tenant_id, order_id=order_id)
-        if not client_token:
-            log_event("admin_missing_client_bot_token_for_proof", tenant_id=tenant_id, order_id=order_id)
-
-
-# -------------------------
 # Webhook endpoint
 # -------------------------
 
@@ -445,7 +466,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         if cb_id:
             telegram_answer_callback(bot_token, cb_id, "OK")
 
+        # -------------------------
         # ADMIN: confirmar pago
+        # -------------------------
         if mode == "admin" and data.startswith("paid|"):
             parts = data.split("|")
             if len(parts) != 3:
@@ -472,20 +495,26 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             log_event("admin_mark_paid", tenant_id=tenant_id, order_id=order_id, admin_chat_id=chat_id, already=bool(res.get("already")))
 
-            # avisar al cliente
+            # avisar al cliente con el BOT CLIENTE
             order = get_order_by_id(orders_sh, order_id)
             if order:
                 client_token = get_client_bot_token(tenant)
                 client_chat = (order.get("customer_contact") or "").strip()
                 if client_token and client_chat:
                     try:
-                        telegram_send_text(client_token, int(client_chat), f"✅ Pago validado. Tu pedido {order_id} fue confirmado. ¡Gracias!")
+                        telegram_send_text(
+                            client_token,
+                            int(client_chat),
+                            f"✅ Pago validado. Tu pedido {order_id} fue confirmado. ¡Gracias!",
+                        )
                     except Exception as e:
                         log_event("notify_client_paid_failed", tenant_id=tenant_id, order_id=order_id, error=str(e))
 
             return {"ok": True}
 
+        # -------------------------
         # CLIENT callbacks
+        # -------------------------
         if mode == "client":
             sess = get_sess(tenant_id, chat_id)
 
@@ -496,6 +525,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             if data == "menu":
                 menu_idx = load_menu_index(orders_sh)
                 cats = group_menu_by_category(menu_idx)
+
                 if not cats:
                     telegram_send_text(bot_token, chat_id, "No hay menú activo.", client_home_kb())
                     return {"ok": True}
@@ -505,6 +535,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     rows.append([(c, f"cat|{normalize(c)}")])
                 rows.append([("🛒 Carrito", "cart")])
                 rows.append([("🏠 Inicio", "home")])
+
                 telegram_send_text(bot_token, chat_id, "📋 Elige una categoría:", kb(rows))
                 return {"ok": True}
 
@@ -512,6 +543,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 menu_idx = load_menu_index(orders_sh)
                 cart = sess.get("cart") or []
                 lines_txt, total, total_qty = fmt_cart_lines(cart, menu_idx)
+
                 has_items = total_qty > 0
                 msg = (
                     f"🛒 *Tu carrito*\n"
@@ -534,11 +566,12 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 if not cart:
                     telegram_send_text(bot_token, chat_id, "Tu carrito está vacío.", reply_markup=client_home_kb())
                     return {"ok": True}
+
                 sess["stage"] = "awaiting_name"
                 telegram_send_text(bot_token, chat_id, "Perfecto. ¿Cuál es tu *nombre* para el pedido?", parse_mode="Markdown")
                 return {"ok": True}
 
-            # ✅ Ya pagué (primer envío = notificación normal, segundo = recordatorio)
+            # ✅ Botón "Ya pagué": aquí recién se notifica al admin (con comprobante)
             if data.startswith("i_paid|"):
                 parts = data.split("|")
                 if len(parts) != 3:
@@ -558,26 +591,35 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                 proof_file_id = (order.get("payment_proof_file_id") or "").strip()
                 if not proof_file_id:
-                    telegram_send_text(bot_token, chat_id, "Aún no recibí tu comprobante.\nPor favor envía una foto o PDF del pago primero.")
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "Aún no recibí tu comprobante.\nPor favor envía una foto o PDF del pago primero.",
+                    )
                     return {"ok": True}
 
-                # detectar si es recordatorio
+                # ¿Es recordatorio? (si ya notificamos este order_id antes en la sesión)
                 tmp = sess.get("tmp") or {}
-                key = f"i_paid_sent::{order_id}"
-                is_reminder = bool(tmp.get(key))
-                tmp[key] = True
-                sess["tmp"] = tmp
+                already_notified = (tmp.get("admin_notified_order_id") == order_id)
+                is_reminder = bool(already_notified)
 
                 notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id, is_reminder=is_reminder)
 
-                if is_reminder:
-                    telegram_send_text(bot_token, chat_id, "🔔 Recordatorio enviado al administrador. Gracias.", reply_markup=client_home_kb())
-                else:
-                    telegram_send_text(bot_token, chat_id, "✅ Recibido. Espera unos minutos mientras verificamos tu pago.", reply_markup=client_home_kb())
+                # marcar como notificado en sesión
+                tmp["admin_notified_order_id"] = order_id
+                sess["tmp"] = tmp
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "✅ Recibido. Espera unos minutos mientras verificamos tu pago.",
+                    reply_markup=client_home_kb(),
+                )
                 return {"ok": True}
 
             if data.startswith("cat|"):
                 cat_norm = data.split("|", 1)[1].strip()
+
                 menu_idx = load_menu_index(orders_sh)
                 cats = group_menu_by_category(menu_idx)
 
@@ -607,6 +649,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             if data.startswith("prd|"):
                 sku = data.split("|", 1)[1].strip()
+
                 rows = [
                     [("1", f"qty|{sku}|1"), ("2", f"qty|{sku}|2"), ("3", f"qty|{sku}|3"), ("4", f"qty|{sku}|4")],
                     [("🛒 Carrito", "cart")],
@@ -675,7 +718,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             telegram_send_text(bot_token, chat_id, f"chat_id = {chat_id}")
             return {"ok": True}
 
-        # CLIENT: upload proof (NO notifica admin; solo guarda + muestra botón)
+        # CLIENT: manejar upload de proof (foto o PDF)
         if mode == "client":
             sess = get_sess(tenant_id, chat_id)
 
@@ -692,8 +735,12 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 if not proof_caption:
                     proof_caption = ((msg.get("document") or {}).get("file_name") or "").strip()
 
+            # ✅ IMPORTANTE:
+            # Aquí SOLO guardamos el comprobante en Sheets y NO avisamos al admin.
+            # El aviso al admin ocurre cuando el cliente presiona "✅ Ya pagué".
             if proof_file_id and proof_type:
                 order_id = (sess.get("tmp") or {}).get("pending_order_id")
+
                 if not order_id:
                     order_id = find_latest_pending_order_for_contact(
                         orders_sh=orders_sh,
@@ -702,7 +749,12 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     )
 
                 if not order_id:
-                    telegram_send_text(bot_token, chat_id, "No encontré un pedido pendiente. Crea un pedido nuevo con /start.", reply_markup=client_home_kb())
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "No encontré un pedido pendiente. Crea un pedido nuevo con /start.",
+                        reply_markup=client_home_kb(),
+                    )
                     return {"ok": True}
 
                 update_order_payment_proof(
@@ -713,7 +765,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     proof_caption=proof_caption,
                 )
 
-                log_event("client_payment_proof_received", tenant_id=tenant_id, order_id=order_id, proof_type=proof_type, chat_id=chat_id)
+                log_event("client_payment_proof_saved", tenant_id=tenant_id, order_id=order_id, proof_type=proof_type, chat_id=chat_id)
 
                 telegram_send_text(
                     bot_token,
@@ -766,6 +818,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 sess["tmp"] = sess.get("tmp") or {}
                 sess["tmp"]["pending_order_id"] = order_id
                 sess["tmp"]["customer_name"] = customer_name
+                # reset de recordatorio (nuevo pedido)
+                sess["tmp"].pop("admin_notified_order_id", None)
 
                 recap = build_order_recap_text(
                     order_id=order_id,
@@ -787,12 +841,24 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 qr_file_id = get_payment_qr_file_id(tenant)
                 qr_url = get_payment_qr_url(tenant)
 
+                log_event(
+                    "debug_qr_values",
+                    tenant_id=tenant_id,
+                    qr_file_id_present=bool(qr_file_id),
+                    qr_url_present=bool(qr_url),
+                    qr_url=qr_url[:200] if qr_url else "",
+                )
+
                 if qr_file_id:
                     telegram_send_photo(bot_token, chat_id, qr_file_id, caption="QR de pago")
                 elif qr_url:
                     telegram_send_photo(bot_token, chat_id, qr_url, caption="QR de pago")
                 else:
-                    telegram_send_text(bot_token, chat_id, "⚠️ No tengo QR configurado para este tenant (payment_qr_file_id / payment_qr_url).")
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No tengo QR configurado para este tenant (payment_qr_file_id / payment_qr_url).",
+                    )
                     log_event("missing_qr_config", tenant_id=tenant_id)
 
                 telegram_send_text(
