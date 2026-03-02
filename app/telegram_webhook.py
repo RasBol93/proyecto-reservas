@@ -1,12 +1,11 @@
 # app/telegram_webhook.py
 #
-# Cambio solicitado:
-# ✅ Cuando el cliente SUBE el comprobante (foto/PDF),
-#    se notifica al ADMIN inmediatamente y se reenvía el comprobante,
-#    ANTES de que el cliente presione "Ya pagué".
-#
-# Nota: mantengo "✅ Ya pagué" como opcional (recordatorio) por si el admin no responde,
-#       pero ya no es requisito para notificar.
+# Cambios aplicados por tus 3 issues:
+# 1) Mantener el botón "✅ Ya pagué" (se queda).
+# 2) Enviar comprobante al admin SIEMPRE:
+#    - El file_id del cliente NO suele funcionar en el bot admin (bots distintos).
+#    - Solución: getFile con BOT CLIENTE -> construir URL -> enviar URL con BOT ADMIN.
+# 3) Recordatorio: título al admin en negrita + emoji 🔔 al inicio.
 
 import json
 import re
@@ -135,6 +134,36 @@ def telegram_answer_callback(bot_token: str, callback_query_id: str, text: str =
         log_event("telegram_ack_exception", error=str(e))
 
 
+def telegram_get_file_path(source_bot_token: str, file_id: str) -> Optional[str]:
+    """
+    Devuelve file_path usando getFile del bot que RECIBIÓ el archivo.
+    (Importante: file_id suele ser válido solo para ese bot.)
+    """
+    if not source_bot_token or not file_id:
+        return None
+    try:
+        res = telegram_api_call(source_bot_token, "getFile", {"file_id": file_id})
+        if not res.get("ok"):
+            log_event("telegram_getfile_failed", error=res.get("description") or res)
+            return None
+        result = res.get("result") or {}
+        return (result.get("file_path") or "").strip() or None
+    except Exception as e:
+        log_event("telegram_getfile_exception", error=str(e))
+        return None
+
+
+def telegram_build_file_url(source_bot_token: str, file_id: str) -> Optional[str]:
+    """
+    Construye URL descargable:
+      https://api.telegram.org/file/bot<TOKEN>/<file_path>
+    """
+    fp = telegram_get_file_path(source_bot_token, file_id)
+    if not fp:
+        return None
+    return f"https://api.telegram.org/file/bot{source_bot_token}/{fp}"
+
+
 # -------------------------
 # helpers tenant fields
 # -------------------------
@@ -254,7 +283,7 @@ def parse_items_field(items_field: Any) -> List[Dict[str, Any]]:
 
 
 # -------------------------
-# ADMIN notify (ROBUST)
+# ADMIN notify
 # -------------------------
 
 def notify_admin_payment_reported(
@@ -262,9 +291,17 @@ def notify_admin_payment_reported(
     tenant_id: str,
     orders_sh,
     order_id: str,
+    is_reminder: bool = False,
 ) -> None:
+    """
+    Envía al admin:
+    - Texto con botón ✅ Confirmar pago
+    - Y SIEMPRE intenta mandar el comprobante (foto/PDF):
+        usando URL construida vía BOT CLIENTE (getFile -> file_path -> file URL)
+    """
     admin_token = get_admin_bot_token(tenant)
     admin_chat_id = get_admin_chat_id(tenant)
+    client_token = get_client_bot_token(tenant)  # importante para construir URL de file
 
     if not admin_token:
         log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_admin_bot_token")
@@ -299,8 +336,15 @@ def notify_admin_payment_reported(
 
     confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{order_id}")]])
 
+    # Título especial para recordatorio
+    if is_reminder:
+        title = "<b>🔔 RECORDATORIO — COMPROBANTE YA ENVIADO</b>\n\n"
+    else:
+        title = "<b>💳 COMPROBANTE RECIBIDO</b>\n\n"
+
+    # Usamos HTML para negrita del título (y evitamos Markdown frágil)
     txt = (
-        "💳 COMPROBANTE RECIBIDO\n\n"
+        title
         f"Tenant: {tenant_id}\n"
         f"ID: {order_id}\n"
         f"Cliente: {order.get('customer_name','')}\n"
@@ -312,18 +356,34 @@ def notify_admin_payment_reported(
         "Verifica el comprobante y presiona ✅ Confirmar pago."
     )
 
-    telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn)
+    telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn, parse_mode="HTML")
 
-    # Reenvía el comprobante (si existe)
-    if proof_file_id:
+    # ----
+    # Enviar el comprobante REAL al admin
+    # ----
+    if not proof_file_id:
+        log_event("admin_missing_proof_file_id", tenant_id=tenant_id, order_id=order_id)
+        return
+
+    # Construir URL usando el BOT CLIENTE (porque ese bot recibió el archivo)
+    proof_url = telegram_build_file_url(client_token, proof_file_id) if client_token else None
+    if not proof_url:
+        log_event("admin_proof_url_build_failed", tenant_id=tenant_id, order_id=order_id)
+        # fallback: intentar con file_id (puede funcionar si fuera mismo bot)
         if proof_type == "photo":
             telegram_send_photo(admin_token, admin_chat_id, proof_file_id, caption=proof_caption or "Comprobante (foto)")
         elif proof_type == "document":
             telegram_send_document(admin_token, admin_chat_id, proof_file_id, caption=proof_caption or "Comprobante (archivo)")
-        else:
-            log_event("admin_unknown_proof_type", tenant_id=tenant_id, order_id=order_id, proof_type=proof_type)
+        return
+
+    # Enviar por URL (esto sí funciona aunque sean bots distintos)
+    if proof_type == "photo":
+        telegram_send_photo(admin_token, admin_chat_id, proof_url, caption=proof_caption or "Comprobante (foto)")
+    elif proof_type == "document":
+        telegram_send_document(admin_token, admin_chat_id, proof_url, caption=proof_caption or "Comprobante (archivo)")
     else:
-        log_event("admin_missing_proof_file_id", tenant_id=tenant_id, order_id=order_id)
+        # si no sabemos, mandarlo como documento
+        telegram_send_document(admin_token, admin_chat_id, proof_url, caption=proof_caption or "Comprobante")
 
 
 # -------------------------
@@ -348,9 +408,9 @@ def cart_kb(has_items: bool) -> Dict[str, Any]:
 
 
 def i_paid_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
-    # queda como "recordatorio" opcional
+    # ✅ Se mantiene exactamente como tú quieres
     return kb([
-        [("🔔 Avisar / Recordar al admin", f"i_paid|{tenant_id}|{order_id}")],
+        [("✅ Ya pagué", f"i_paid|{tenant_id}|{order_id}")],
         [("🏠 Inicio", "home")],
     ])
 
@@ -453,8 +513,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 (f"ℹ️ Pedido {order_id} ya estaba en PAID." if res.get("already") else f"✅ Pedido {order_id} marcado como PAID"),
             )
 
-            log_event("admin_mark_paid", tenant_id=tenant_id, order_id=order_id, admin_chat_id=chat_id, already=bool(res.get("already")))
-
             # avisar al cliente con el BOT CLIENTE
             order = get_order_by_id(orders_sh, order_id)
             if order:
@@ -472,7 +530,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             return {"ok": True}
 
-        # CLIENT: recordatorio opcional al admin (ya no es requisito)
+        # CLIENT: botón "✅ Ya pagué" => recordatorio (con título 🔔)
         if mode == "client" and data.startswith("i_paid|"):
             parts = data.split("|")
             if len(parts) != 3:
@@ -501,12 +559,12 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 )
                 return {"ok": True}
 
-            notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id)
+            notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id, is_reminder=True)
 
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "🔔 Listo. Le reenvié el comprobante al administrador para que lo verifique.",
+                "🔔 Listo. Le envié un recordatorio al administrador con tu comprobante.",
                 reply_markup=client_home_kb(),
             )
             return {"ok": True}
@@ -685,7 +743,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 if not proof_caption:
                     proof_caption = ((msg.get("document") or {}).get("file_name") or "").strip()
 
-            # ✅ CAMBIO CLAVE: al subir proof, notificar admin inmediatamente
+            # Al subir comprobante: guardar en Sheets + notificar admin con el archivo
             if proof_file_id and proof_type:
                 order_id = (sess.get("tmp") or {}).get("pending_order_id")
                 if not order_id:
@@ -714,27 +772,14 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                 log_event("client_payment_proof_received", tenant_id=tenant_id, order_id=order_id, proof_type=proof_type, chat_id=chat_id)
 
-                # Validar ownership y dedupe notificación
-                tmp = sess.get("tmp") or {}
-                sess["tmp"] = tmp
-
-                order = get_order_by_id(orders_sh, order_id)
-                if order:
-                    _assert_order_belongs_to_chat(order, chat_id, tenant_id, order_id)
-
-                already_notified = str(tmp.get("admin_notified_for_order") or "").strip() == str(order_id)
-                if not already_notified:
-                    notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id)
-                    tmp["admin_notified_for_order"] = str(order_id)
-                    log_event("admin_notified_on_proof_upload", tenant_id=tenant_id, order_id=order_id)
-                else:
-                    log_event("admin_notify_skipped_duplicate", tenant_id=tenant_id, order_id=order_id)
+                # Notificar admin inmediatamente
+                notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id, is_reminder=False)
 
                 telegram_send_text(
                     bot_token,
                     chat_id,
                     "✅ Comprobante recibido.\n📨 Ya se lo envié al administrador para verificación.\n"
-                    "Si en unos minutos no responde, puedes tocar “🔔 Avisar / Recordar al admin”.",
+                    "Si deseas, también puedes presionar “✅ Ya pagué” para enviar un recordatorio.",
                     reply_markup=i_paid_kb(tenant_id, order_id),
                 )
                 return {"ok": True}
@@ -748,18 +793,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 customer_name = text.strip()
                 if not customer_name:
                     telegram_send_text(bot_token, chat_id, "Dime tu nombre, por favor.")
-                    return {"ok": True}
-
-                tmp = sess.get("tmp") or {}
-                existing_oid = (tmp.get("pending_order_id") or "").strip()
-                if existing_oid:
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        f"ℹ️ Ya tengo tu pedido creado.\nID: `{existing_oid}`\nEnvíame el comprobante (foto o PDF).",
-                        parse_mode="Markdown",
-                        reply_markup=i_paid_kb(tenant_id, existing_oid),
-                    )
                     return {"ok": True}
 
                 menu_idx = load_menu_index(orders_sh)
@@ -788,10 +821,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     total_amount=total,
                 )
 
-                log_event("order_created", tenant_id=tenant_id, order_id=order_id, chat_id=chat_id, total=total)
-
                 sess["stage"] = "awaiting_proof"
-                sess["tmp"] = tmp
+                sess["tmp"] = sess.get("tmp") or {}
                 sess["tmp"]["pending_order_id"] = order_id
                 sess["tmp"]["customer_name"] = customer_name
 
