@@ -45,7 +45,29 @@ def clear_sess(tenant_id: str, chat_id: int) -> None:
 
 
 # -------------------------
-# Telegram API helpers
+# Utils (safe)
+# -------------------------
+
+def _safe_int(v: Any) -> Optional[int]:
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def _html_escape(s: Any) -> str:
+    s = str(s or "")
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+# -------------------------
+# Telegram API helpers (JSON)
 # -------------------------
 
 def telegram_api_call(bot_token: str, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -72,7 +94,7 @@ def telegram_send_text(
     chat_id: int,
     text: str,
     reply_markup: Optional[Dict[str, Any]] = None,
-    parse_mode: Optional[str] = None,
+    parse_mode: Optional[str] = None,  # "Markdown" or "HTML"
 ) -> None:
     payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
     if reply_markup:
@@ -131,22 +153,125 @@ def telegram_answer_callback(bot_token: str, callback_query_id: str, text: str =
         log_event("telegram_ack_exception", error=str(e))
 
 
+# -------------------------
+# Telegram file download helpers
+# -------------------------
+
 def telegram_get_file_path(bot_token: str, file_id: str) -> str:
-    """
-    Usa getFile para obtener file_path.
-    OJO: el file_id es válido en el contexto del bot que lo recibió.
-    """
     res = telegram_api_call(bot_token, "getFile", {"file_id": file_id})
     if not res.get("ok"):
-        raise RuntimeError(f"getFile failed: {res.get('description') or res}")
+        raise RuntimeError(f"getFile failed: {res}")
     return res["result"]["file_path"]
 
 
 def telegram_build_file_url(bot_token: str, file_path: str) -> str:
-    """
-    URL directa para descargar desde Telegram.
-    """
+    # Telegram estándar
     return f"{TELEGRAM_API_BASE}/file/bot{bot_token}/{file_path}"
+
+
+def telegram_download_file_bytes(bot_token: str, file_id: str) -> Tuple[bytes, str]:
+    """
+    Descarga binario usando el MISMO bot que recibió el file_id (crítico).
+    Retorna (bytes, file_path).
+    """
+    file_path = telegram_get_file_path(bot_token, file_id)
+    url = telegram_build_file_url(bot_token, file_path)
+
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        content = resp.read()
+    return content, file_path
+
+
+# -------------------------
+# Multipart upload helpers (para reenviar archivos)
+# -------------------------
+
+def _multipart_post(url: str, fields: Dict[str, str], files: Dict[str, Dict[str, Any]], timeout: int = 45) -> Dict[str, Any]:
+    """
+    POST multipart/form-data.
+    files: {"photo": {"filename": "...", "content": b"...", "content_type": "image/jpeg"}, ...}
+    """
+    boundary = "----ChatGPTBoundary7MA4YWxkTrZu0gW"
+    parts: List[bytes] = []
+
+    def add_field(name: str, value: str):
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode())
+        parts.append((value or "").encode("utf-8"))
+        parts.append(b"\r\n")
+
+    def add_file(fieldname: str, filename: str, content: bytes, content_type: str):
+        parts.append(f"--{boundary}\r\n".encode())
+        parts.append(f'Content-Disposition: form-data; name="{fieldname}"; filename="{filename}"\r\n'.encode())
+        parts.append(f"Content-Type: {content_type}\r\n\r\n".encode())
+        parts.append(content)
+        parts.append(b"\r\n")
+
+    for k, v in (fields or {}).items():
+        add_field(k, str(v))
+
+    for fieldname, meta in (files or {}).items():
+        add_file(
+            fieldname=fieldname,
+            filename=meta.get("filename") or "file.bin",
+            content=meta.get("content") or b"",
+            content_type=meta.get("content_type") or "application/octet-stream",
+        )
+
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = b"".join(parts)
+
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw)
+
+
+def telegram_send_photo_bytes(bot_token: str, chat_id: int, content: bytes, filename: str, caption: str = "") -> Dict[str, Any]:
+    url = f"{TELEGRAM_API_BASE}/bot{bot_token}/sendPhoto"
+    fields = {"chat_id": str(chat_id)}
+    if caption:
+        fields["caption"] = caption
+
+    return _multipart_post(
+        url=url,
+        fields=fields,
+        files={
+            "photo": {
+                "filename": filename or "proof.jpg",
+                "content": content,
+                "content_type": "image/jpeg",
+            }
+        },
+        timeout=45,
+    )
+
+
+def telegram_send_document_bytes(bot_token: str, chat_id: int, content: bytes, filename: str, caption: str = "") -> Dict[str, Any]:
+    url = f"{TELEGRAM_API_BASE}/bot{bot_token}/sendDocument"
+    fields = {"chat_id": str(chat_id)}
+    if caption:
+        fields["caption"] = caption
+
+    return _multipart_post(
+        url=url,
+        fields=fields,
+        files={
+            "document": {
+                "filename": filename or "proof.pdf",
+                "content": content,
+                "content_type": "application/octet-stream",
+            }
+        },
+        timeout=60,
+    )
 
 
 # -------------------------
@@ -233,6 +358,7 @@ def fmt_cart_lines(cart: List[Dict[str, Any]], menu_idx: Dict[str, Any]) -> Tupl
 
 
 def build_order_recap_text(
+    tenant_id: str,
     order_id: str,
     customer_name: str,
     customer_contact: str,
@@ -267,7 +393,7 @@ def parse_items_field(items_field: Any) -> List[Dict[str, Any]]:
 
 
 # -------------------------
-# ADMIN notify (con comprobante)
+# ADMIN notify (robusto + reenvío comprobante)
 # -------------------------
 
 def notify_admin_payment_reported(
@@ -279,7 +405,6 @@ def notify_admin_payment_reported(
 ) -> None:
     admin_token = get_admin_bot_token(tenant)
     admin_chat_id = get_admin_chat_id(tenant)
-    client_token = get_client_bot_token(tenant)
 
     if not admin_token:
         log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_admin_bot_token")
@@ -287,17 +412,13 @@ def notify_admin_payment_reported(
     if not admin_chat_id:
         log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_admin_chat_id")
         return
-    if not client_token:
-        log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_client_bot_token_for_forward")
-        # igual mandamos texto (pero no media)
-        client_token = ""
 
     order = get_order_by_id(orders_sh, order_id)
     if not order:
         telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
         return
 
-    # menú puede fallar (no rompas la notificación por eso)
+    # menu puede fallar; no rompas notificación
     try:
         menu_idx = load_menu_index(orders_sh)
     except Exception as e:
@@ -319,61 +440,71 @@ def notify_admin_payment_reported(
 
     confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{order_id}")]])
 
-    # título recordatorio
-    title = "💳 PAGO REPORTADO"
+    # ---- TITULO con recordatorio ----
     if is_reminder:
-        title = "🔔 *RECORDATORIO* — 💳 PAGO REPORTADO"
+        title = "<b>🔔 RECORDATORIO — PAGO REPORTADO</b>"
+    else:
+        title = "<b>💳 PAGO REPORTADO</b>"
 
-    # Nota: aquí sí usamos Markdown SOLO para el título del recordatorio.
-    # El resto sin markdown para evitar caracteres raros.
+    # Mensaje en HTML (solo bold del título; todo escapado)
     txt = (
         f"{title}\n\n"
-        f"Tenant: {tenant_id}\n"
-        f"ID: {order_id}\n"
-        f"Cliente: {order.get('customer_name','')}\n"
-        f"Contacto(chat_id): {order.get('customer_contact','')}\n"
-        f"Hora recogida: {order.get('requested_time','pendiente')}\n"
-        f"Cantidad total: {total_qty}\n"
-        f"Total: {total:.2f} BOB\n\n"
-        f"Detalle:\n{lines_txt}\n\n"
-        "Presiona ✅ Confirmar pago cuando verifiques."
+        f"Tenant: {_html_escape(tenant_id)}\n"
+        f"ID: {_html_escape(order_id)}\n"
+        f"Cliente: {_html_escape(order.get('customer_name',''))}\n"
+        f"Contacto(chat_id): {_html_escape(order.get('customer_contact',''))}\n"
+        f"Hora recogida: {_html_escape(order.get('requested_time','pendiente'))}\n"
+        f"Cantidad total: {_html_escape(total_qty)}\n"
+        f"Total: {_html_escape(f'{total:.2f}')} BOB\n\n"
+        f"Detalle:\n{_html_escape(lines_txt)}\n\n"
+        f"{_html_escape('Presiona ✅ Confirmar pago cuando verifiques.')}"
     )
 
-    # si es recordatorio, habilitamos markdown por el título; si no, no hace falta
-    parse_mode = "Markdown" if is_reminder else None
-    telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn, parse_mode=parse_mode)
+    telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn, parse_mode="HTML")
 
-    # ------- enviar comprobante al admin (clave) -------
+    # ---- reenviar comprobante (CRÍTICO) ----
     if not proof_file_id or not proof_type:
         log_event("admin_missing_proof", tenant_id=tenant_id, order_id=order_id, proof_file_id=bool(proof_file_id), proof_type=proof_type)
         return
 
+    client_token = get_client_bot_token(tenant)
     if not client_token:
         telegram_send_text(admin_token, admin_chat_id, "⚠️ No puedo reenviar el comprobante: falta client_bot_token.")
+        log_event("admin_forward_proof_failed", tenant_id=tenant_id, order_id=order_id, reason="missing_client_bot_token")
         return
 
     try:
-        # 1) sacar file_path usando el BOT CLIENTE
-        file_path = telegram_get_file_path(client_token, proof_file_id)
-        # 2) construir URL directa de descarga (con token del cliente)
-        download_url = telegram_build_file_url(client_token, file_path)
+        content, file_path = telegram_download_file_bytes(client_token, proof_file_id)
 
-        # 3) enviar al admin con el BOT ADMIN usando URL
-        cap = proof_caption or ("Comprobante (foto)" if proof_type == "photo" else "Comprobante (archivo)")
+        filename_guess = ""
+        if proof_caption:
+            filename_guess = proof_caption.strip()
+        if not filename_guess:
+            filename_guess = file_path.split("/")[-1] if file_path else ("proof.jpg" if proof_type == "photo" else "proof.pdf")
+
         if proof_type == "photo":
-            telegram_send_photo(admin_token, admin_chat_id, download_url, caption=cap)
+            res = telegram_send_photo_bytes(
+                admin_token,
+                admin_chat_id,
+                content,
+                filename=filename_guess or "proof.jpg",
+                caption=proof_caption or "Comprobante (foto)",
+            )
         else:
-            telegram_send_document(admin_token, admin_chat_id, download_url, caption=cap)
+            res = telegram_send_document_bytes(
+                admin_token,
+                admin_chat_id,
+                content,
+                filename=filename_guess or "proof.pdf",
+                caption=proof_caption or "Comprobante (archivo)",
+            )
 
-        log_event("admin_proof_forwarded", tenant_id=tenant_id, order_id=order_id, proof_type=proof_type)
+        if not res.get("ok", True):
+            log_event("admin_proof_forward_failed_api", tenant_id=tenant_id, order_id=order_id, api=res)
 
     except Exception as e:
-        log_event("admin_proof_forward_failed", tenant_id=tenant_id, order_id=order_id, error=str(e))
-        telegram_send_text(
-            admin_token,
-            admin_chat_id,
-            f"⚠️ No pude reenviar el comprobante automáticamente (error técnico). Pedido: {order_id}",
-        )
+        log_event("admin_proof_forward_exception", tenant_id=tenant_id, order_id=order_id, error=str(e))
+        telegram_send_text(admin_token, admin_chat_id, f"⚠️ No pude reenviar el comprobante automáticamente. Error: {e}")
 
 
 # -------------------------
@@ -405,15 +536,8 @@ def i_paid_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
 
 
 # -------------------------
-# Helpers de seguridad / parsing
+# Seguridad: solo admin_chat_id puede confirmar pago
 # -------------------------
-
-def _safe_int(v: Any) -> Optional[int]:
-    try:
-        return int(v)
-    except Exception:
-        return None
-
 
 def _assert_admin_authorized(tenant: Dict[str, Any], chat_id: int, tenant_id: str) -> None:
     admin_chat_id = get_admin_chat_id(tenant)
@@ -495,7 +619,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             log_event("admin_mark_paid", tenant_id=tenant_id, order_id=order_id, admin_chat_id=chat_id, already=bool(res.get("already")))
 
-            # avisar al cliente con el BOT CLIENTE
+            # avisar al cliente con BOT CLIENTE
             order = get_order_by_id(orders_sh, order_id)
             if order:
                 client_token = get_client_bot_token(tenant)
@@ -571,7 +695,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, "Perfecto. ¿Cuál es tu *nombre* para el pedido?", parse_mode="Markdown")
                 return {"ok": True}
 
-            # ✅ Botón "Ya pagué": aquí recién se notifica al admin (con comprobante)
+            # Cliente presiona "Ya pagué" -> avisa admin (con recordatorio si reintenta)
             if data.startswith("i_paid|"):
                 parts = data.split("|")
                 if len(parts) != 3:
@@ -598,16 +722,15 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     )
                     return {"ok": True}
 
-                # ¿Es recordatorio? (si ya notificamos este order_id antes en la sesión)
+                # Recordatorio: si ya avisó antes en esta sesión
                 tmp = sess.get("tmp") or {}
-                already_notified = (tmp.get("admin_notified_order_id") == order_id)
-                is_reminder = bool(already_notified)
-
-                notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id, is_reminder=is_reminder)
-
-                # marcar como notificado en sesión
-                tmp["admin_notified_order_id"] = order_id
+                notified_map = tmp.get("admin_notified") or {}
+                already = bool(notified_map.get(order_id))
+                notified_map[order_id] = True
+                tmp["admin_notified"] = notified_map
                 sess["tmp"] = tmp
+
+                notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id, is_reminder=already)
 
                 telegram_send_text(
                     bot_token,
@@ -718,7 +841,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             telegram_send_text(bot_token, chat_id, f"chat_id = {chat_id}")
             return {"ok": True}
 
-        # CLIENT: manejar upload de proof (foto o PDF)
+        # CLIENT: upload de proof (foto o PDF) -> SOLO guardar en sheet, NO notificar admin todavía
         if mode == "client":
             sess = get_sess(tenant_id, chat_id)
 
@@ -735,9 +858,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 if not proof_caption:
                     proof_caption = ((msg.get("document") or {}).get("file_name") or "").strip()
 
-            # ✅ IMPORTANTE:
-            # Aquí SOLO guardamos el comprobante en Sheets y NO avisamos al admin.
-            # El aviso al admin ocurre cuando el cliente presiona "✅ Ya pagué".
             if proof_file_id and proof_type:
                 order_id = (sess.get("tmp") or {}).get("pending_order_id")
 
@@ -818,10 +938,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 sess["tmp"] = sess.get("tmp") or {}
                 sess["tmp"]["pending_order_id"] = order_id
                 sess["tmp"]["customer_name"] = customer_name
-                # reset de recordatorio (nuevo pedido)
-                sess["tmp"].pop("admin_notified_order_id", None)
 
                 recap = build_order_recap_text(
+                    tenant_id=tenant_id,
                     order_id=order_id,
                     customer_name=customer_name,
                     customer_contact=str(chat_id),
