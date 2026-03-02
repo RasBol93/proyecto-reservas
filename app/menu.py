@@ -1,6 +1,8 @@
 # app/menu.py
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import re
+import time
 
 from fastapi import HTTPException
 
@@ -10,13 +12,15 @@ from app.utils import to_bool, normalize, log_event
 
 REQUIRED_MENU_HEADERS = ["sku", "name", "price", "active", "category"]
 
+# Cache simple por spreadsheet (para reducir hits a Sheets en alta interacción)
+_MENU_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
+MENU_CACHE_TTL_SECONDS = 90  # 1.5 minutos
+
 
 def _ws_has_required_headers(ws, required_headers: List[str], max_scan_rows: int = 10) -> bool:
     """
     Verifica si una worksheet contiene TODOS los headers requeridos en alguna de las
-    primeras filas (max_scan_rows). Es robusto ante:
-    - Fila 1 headers técnicos
-    - Fila 2 traducción/etiquetas
+    primeras filas (max_scan_rows). Robusto ante fila 2 traducción.
     """
     try:
         values = ws.get_all_values()
@@ -57,15 +61,36 @@ def _parse_price(value: Any) -> Optional[float]:
       - "12.5"
       - "12,5"
       - " 12,50 "
+      - "12 Bs"
+      - "Bs 12"
+      - "12 BOB"
     """
     s = str(value or "").strip()
     if not s:
         return None
+
+    # normalizar separador decimal
     s = s.replace(",", ".")
+
+    # extraer primer número tipo float de la string
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return None
+
     try:
-        return float(s)
+        return float(m.group(1))
     except Exception:
         return None
+
+
+def _cache_key_for_orders_sh(orders_sh) -> str:
+    """
+    Intenta usar la key del spreadsheet si está disponible.
+    """
+    try:
+        return getattr(orders_sh, "id", None) or getattr(orders_sh, "sheet1", None) or str(id(orders_sh))
+    except Exception:
+        return str(id(orders_sh))
 
 
 def load_menu_index(orders_sh) -> Dict[str, Dict[str, Any]]:
@@ -80,6 +105,14 @@ def load_menu_index(orders_sh) -> Dict[str, Dict[str, Any]]:
     Devuelve un índice: sku -> {sku, name, price, category}
     (solo active=TRUE)
     """
+    # cache
+    ck = _cache_key_for_orders_sh(orders_sh)
+    now = time.time()
+    if ck in _MENU_CACHE:
+        ts, cached = _MENU_CACHE[ck]
+        if (now - ts) <= MENU_CACHE_TTL_SECONDS:
+            return cached
+
     ws = None
 
     # 1) Camino rápido (nombre estándar)
@@ -123,6 +156,10 @@ def load_menu_index(orders_sh) -> Dict[str, Dict[str, Any]]:
         name = str(r.get("name", "") or "").strip()
         category = str(r.get("category", "") or "").strip() or "Otros"
 
+        if sku in idx:
+            # no rompe, pero deja evidencia
+            log_event("menu_duplicate_sku", sku=sku, prev=idx[sku], new={"name": name, "price": price, "category": category})
+
         idx[sku] = {
             "sku": sku,
             "name": name,
@@ -130,6 +167,7 @@ def load_menu_index(orders_sh) -> Dict[str, Dict[str, Any]]:
             "category": category,
         }
 
+    _MENU_CACHE[ck] = (now, idx)
     return idx
 
 
