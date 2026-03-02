@@ -200,6 +200,9 @@ def append_order_row(
 
 
 def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, Any]:
+    """
+    Mejora: idempotencia explícita + retorno de bandera already.
+    """
     ws = _ensure_orders_ws(orders_sh)
 
     required = ["order_id", "status"]
@@ -213,7 +216,7 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
     found_row_1based = None
 
     # datos empiezan debajo del header_row
-    start_idx_0 = header_row  # header_row es 1-based, por eso start idx 0-based = header_row
+    start_idx_0 = header_row  # header_row es 1-based => start idx 0-based = header_row
     for i in range(start_idx_0, len(values)):
         row = values[i]
         oid = row[col_order_id] if col_order_id < len(row) else ""
@@ -225,13 +228,16 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
     if not found_row_1based:
         return {"found": False}
 
-    if normalize(old_status) != normalize(new_status):
-        try:
-            ws.update_cell(found_row_1based, col_status + 1, new_status)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed updating status: {e}")
+    # idempotencia
+    if normalize(old_status) == normalize(new_status):
+        return {"found": True, "old_status": old_status, "row_1based": found_row_1based, "already": True}
 
-    return {"found": True, "old_status": old_status, "row_1based": found_row_1based}
+    try:
+        ws.update_cell(found_row_1based, col_status + 1, new_status)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed updating status: {e}")
+
+    return {"found": True, "old_status": old_status, "row_1based": found_row_1based, "already": False}
 
 
 def get_order_by_id(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
@@ -292,6 +298,9 @@ def update_order_payment_proof(
     proof_type: str,
     proof_caption: str = "",
 ) -> Dict[str, Any]:
+    """
+    Mejora: actualiza solo si cambió (evita writes duplicados por retries).
+    """
     ws = _ensure_orders_ws(orders_sh)
 
     required = ["order_id"]
@@ -304,6 +313,7 @@ def update_order_payment_proof(
 
     oid_target = normalize(order_id)
     found_row_1based = None
+    found_row = None
 
     start_idx_0 = header_row
     for i in range(start_idx_0, len(values)):
@@ -311,18 +321,28 @@ def update_order_payment_proof(
         oid = row[col_oid] if col_oid < len(row) else ""
         if normalize(oid) == oid_target:
             found_row_1based = i + 1
+            found_row = row
             break
 
-    if not found_row_1based:
+    if not found_row_1based or found_row is None:
         return {"found": False}
 
-    # Actualizar solo columnas que existan
+    def _cell_value(col_idx: Optional[int]) -> str:
+        if col_idx is None:
+            return ""
+        return str(found_row[col_idx] if col_idx < len(found_row) else "")
+
+    cur_file = _cell_value(col_file)
+    cur_type = _cell_value(col_type)
+    cur_cap = _cell_value(col_cap)
+
+    # Actualizar solo columnas que existan y que cambien
     try:
-        if col_file is not None:
+        if col_file is not None and str(cur_file) != str(proof_file_id):
             ws.update_cell(found_row_1based, col_file + 1, proof_file_id)
-        if col_type is not None:
+        if col_type is not None and str(cur_type) != str(proof_type):
             ws.update_cell(found_row_1based, col_type + 1, proof_type)
-        if col_cap is not None:
+        if col_cap is not None and str(cur_cap) != str(proof_caption):
             ws.update_cell(found_row_1based, col_cap + 1, proof_caption)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed updating payment proof: {e}")
