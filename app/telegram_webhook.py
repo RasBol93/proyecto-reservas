@@ -24,7 +24,7 @@ from app.orders import (
 from app.telegram_keyboard import kb
 from app.utils import normalize, log_event
 
-# ✅ NUEVO: stats
+# ✅ stats
 from app.stats import build_periods, resolve_period, build_stats_report_text, log_event_to_sheet
 
 router = APIRouter()
@@ -135,6 +135,22 @@ def telegram_answer_callback(bot_token: str, callback_query_id: str, text: str =
             log_event("telegram_ack_failed", error=res.get("description") or res)
     except Exception as e:
         log_event("telegram_ack_exception", error=str(e))
+
+
+# ✅ NUEVO: Reply Keyboard (teclado fijo, NO inline)
+def reply_kb(button_rows: List[List[str]], resize: bool = True, one_time: bool = False) -> Dict[str, Any]:
+    """
+    ReplyKeyboardMarkup:
+    - aparece como botones "fijos" abajo del chat
+    - al presionar, Telegram envía texto
+    """
+    keyboard = [[{"text": txt} for txt in row] for row in button_rows]
+    return {
+        "keyboard": keyboard,
+        "resize_keyboard": bool(resize),
+        "one_time_keyboard": bool(one_time),
+        "selective": False,
+    }
 
 
 # -------------------------
@@ -448,7 +464,7 @@ def notify_admin_payment_reported(
 
 
 # -------------------------
-# Client keyboards
+# Client keyboards (INLINE)
 # -------------------------
 
 def client_home_kb() -> Dict[str, Any]:
@@ -489,18 +505,18 @@ def contact_admin_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
     ])
 
 
-# ✅ NUEVO: Admin keyboards (mínimos)
-def admin_home_kb() -> Dict[str, Any]:
-    return kb([
-        [("📊 Estadísticas", "admin_stats")],
-    ])
+# ✅ ADMIN: teclado FIJO (reply keyboard)
+def admin_fixed_kb() -> Dict[str, Any]:
+    return reply_kb([
+        ["📊 Estadísticas"],
+    ], resize=True, one_time=False)
 
 
-def admin_periods_kb(tenant_id: str, periods: List[Tuple[str, str]]) -> Dict[str, Any]:
+# ✅ ADMIN: selector de períodos (INLINE)
+def admin_periods_inline_kb(tenant_id: str, periods: List[Tuple[str, str]]) -> Dict[str, Any]:
     rows = []
     for label, key in periods:
         rows.append([(f"📊 {label}", f"admin_stats_period|{tenant_id}|{key}")])
-    rows.append([("⬅️ Volver", "admin_home")])
     return kb(rows)
 
 
@@ -595,10 +611,10 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             res = update_order_status(orders_sh, order_id, "PAID")
             if not res.get("found"):
-                telegram_send_text(bot_token, chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
+                telegram_send_text(bot_token, chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.", reply_markup=admin_fixed_kb())
                 return {"ok": True}
 
-            telegram_send_text(bot_token, chat_id, f"✅ Pedido {order_id} marcado como PAID")
+            telegram_send_text(bot_token, chat_id, f"✅ Pedido {order_id} marcado como PAID", reply_markup=admin_fixed_kb())
 
             order = get_order_by_id(orders_sh, order_id)
             if order:
@@ -612,44 +628,25 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             return {"ok": True}
 
-        # ✅ NUEVO: ADMIN stats callbacks
-        if mode == "admin":
-            if data == "admin_home":
-                telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_home_kb())
+        # ✅ ADMIN: períodos stats (INLINE)
+        if mode == "admin" and data.startswith("admin_stats_period|"):
+            parts = data.split("|")
+            if len(parts) != 3:
                 return {"ok": True}
+            _, cb_tenant_id, period_key = parts
+            cb_tenant_id = cb_tenant_id.strip()
+            period_key = period_key.strip()
 
-            if data == "admin_stats":
-                # mostrar períodos
-                periods = build_periods(tenant_tz)
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    "📊 Elige el período:",
-                    reply_markup=admin_periods_kb(tenant_id, periods),
-                )
-                return {"ok": True}
+            if cb_tenant_id != tenant_id:
+                raise HTTPException(status_code=400, detail="Tenant mismatch in stats callback")
 
-            if data.startswith("admin_stats_period|"):
-                parts = data.split("|")
-                if len(parts) != 3:
-                    return {"ok": True}
-                _, cb_tenant_id, period_key = parts
-                cb_tenant_id = cb_tenant_id.strip()
-                period_key = period_key.strip()
+            _assert_admin_authorized(tenant, chat_id, tenant_id)
 
-                if cb_tenant_id != tenant_id:
-                    raise HTTPException(status_code=400, detail="Tenant mismatch in stats callback")
+            period = resolve_period(tenant_tz, period_key)
+            txt = build_stats_report_text(orders_sh, tenant_id=tenant_id, tenant_tz=tenant_tz, period=period)
 
-                # (opcional) seguridad: solo admin_chat_id puede ver stats
-                _assert_admin_authorized(tenant, chat_id, tenant_id)
-
-                period = resolve_period(tenant_tz, period_key)
-                txt = build_stats_report_text(orders_sh, tenant_id=tenant_id, tenant_tz=tenant_tz, period=period)
-
-                telegram_send_text(bot_token, chat_id, txt)
-                # dejar botón para volver a períodos (sin spamear muchos botones)
-                telegram_send_text(bot_token, chat_id, "⬅️ Volver:", reply_markup=admin_periods_kb(tenant_id, build_periods(tenant_tz)))
-                return {"ok": True}
+            telegram_send_text(bot_token, chat_id, txt, reply_markup=admin_fixed_kb())
+            return {"ok": True}
 
         # -------------------------
         # CLIENT callbacks (MENÚ COMPLETO + PAGO)
@@ -659,12 +656,10 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             tmp = sess.get("tmp") or {}
             sess["tmp"] = tmp
 
-            # ---- Home
             if data == "home":
                 telegram_send_text(bot_token, chat_id, "Elige una opción:", client_home_kb())
                 return {"ok": True}
 
-            # ---- Menu (categorías)
             if data == "menu":
                 menu_idx = load_menu_index(orders_sh)
                 cats = group_menu_by_category(menu_idx)
@@ -682,7 +677,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, "📋 Elige una categoría:", kb(rows))
                 return {"ok": True}
 
-            # ---- Categoría -> productos
             if data.startswith("cat|"):
                 cat_norm = data.split("|", 1)[1].strip()
 
@@ -714,10 +708,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, f"🍽 {real_cat} — elige un producto:", kb(rows))
                 return {"ok": True}
 
-            # ---- Producto -> elegir cantidad
             if data.startswith("prd|"):
                 sku = data.split("|", 1)[1].strip()
-
                 rows = [
                     [("1", f"qty|{sku}|1"), ("2", f"qty|{sku}|2"), ("3", f"qty|{sku}|3"), ("4", f"qty|{sku}|4")],
                     [("🛒 Carrito", "cart")],
@@ -727,7 +719,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, "Selecciona cantidad:", kb(rows))
                 return {"ok": True}
 
-            # ---- Qty -> agregar al carrito
             if data.startswith("qty|"):
                 parts = data.split("|")
                 if len(parts) != 3:
@@ -771,7 +762,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 )
                 return {"ok": True}
 
-            # ---- Cart
             if data == "cart":
                 menu_idx = load_menu_index(orders_sh)
                 cart = sess.get("cart") or []
@@ -804,7 +794,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, "Perfecto. ¿Cuál es tu *nombre* para el pedido?", parse_mode="Markdown")
                 return {"ok": True}
 
-            # ---- Cliente presiona "Ya pagué" (NOTIFICA ADMIN + PRUEBA)
             if data.startswith("i_paid|"):
                 parts = data.split("|")
                 if len(parts) != 3:
@@ -842,7 +831,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 )
                 return {"ok": True}
 
-            # ---- Recordatorio con cooldown 5 min
             if data.startswith("remind|"):
                 parts = data.split("|")
                 if len(parts) != 3:
@@ -896,7 +884,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     )
                 return {"ok": True}
 
-            # ---- Contactar admin (solo después de 10 min desde “Ya pagué”)
             if data.startswith("contact|"):
                 parts = data.split("|")
                 if len(parts) != 3:
@@ -937,7 +924,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, link)
                 return {"ok": True}
 
-            # fallback
             return {"ok": True}
 
         return {"ok": True}
@@ -1006,7 +992,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             if normalize(text) in ("start", "/start", "hola"):
                 clear_sess(tenant_id, chat_id)
 
-                # ✅ NUEVO: registrar conversación iniciada (no rompe si falla)
+                # métricas: conversación iniciada
                 log_event_to_sheet(
                     orders_sh=orders_sh,
                     tenant_id=tenant_id,
@@ -1096,19 +1082,29 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             telegram_send_text(bot_token, chat_id, "Usa /start para ver el menú.", reply_markup=client_home_kb())
             return {"ok": True}
 
-        # ADMIN
+        # ADMIN: aquí vive el botón fijo
         if mode == "admin":
-            # comando alternativo
-            if normalize(text) in ("/stats", "stats"):
-                telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_home_kb())
-                telegram_send_text(bot_token, chat_id, "📊 Elige el período:", reply_markup=admin_periods_kb(tenant_id, build_periods(tenant_tz)))
+            # siempre poner teclado fijo
+            # 1) si toca el botón "📊 Estadísticas"
+            if normalize(text) in ("📊 estadisticas", "estadisticas", "/stats", "stats"):
+                _assert_admin_authorized(tenant, chat_id, tenant_id)
+                periods = build_periods(tenant_tz)
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "📊 Elige el período:",
+                    reply_markup=admin_periods_inline_kb(tenant_id, periods),
+                )
+                # teclado fijo visible
+                telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
                 return {"ok": True}
 
             if normalize(text) in ("start", "/start", "hola"):
-                telegram_send_text(bot_token, chat_id, "Admin bot listo ✅", reply_markup=admin_home_kb())
+                telegram_send_text(bot_token, chat_id, "Admin bot listo ✅", reply_markup=admin_fixed_kb())
                 return {"ok": True}
 
-            telegram_send_text(bot_token, chat_id, "OK admin ✅", reply_markup=admin_home_kb())
+            # cualquier cosa que escriba, mantenemos el teclado fijo vivo
+            telegram_send_text(bot_token, chat_id, "OK admin ✅", reply_markup=admin_fixed_kb())
             return {"ok": True}
 
         return {"ok": True}
