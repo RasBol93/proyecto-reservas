@@ -6,7 +6,6 @@ import time
 import urllib.request
 import urllib.parse
 from typing import Any, Dict, Optional, List, Tuple
-from datetime import datetime, timedelta
 
 from fastapi import APIRouter, HTTPException
 
@@ -25,10 +24,8 @@ from app.orders import (
 from app.telegram_keyboard import kb
 from app.utils import normalize, log_event
 
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
+# ✅ NUEVO: stats
+from app.stats import build_periods, resolve_period, build_stats_report_text, log_event_to_sheet
 
 router = APIRouter()
 
@@ -40,10 +37,6 @@ SESSIONS: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
 REMINDER_COOLDOWN_SECONDS = 5 * 60
 CONTACT_AFTER_SECONDS = 10 * 60  # 5 min cooldown + 5 min extra
-
-# Pickup
-PICKUP_PREP_MINUTES = 30
-PICKUP_MAX_OPTIONS = 10
 
 
 def get_sess(tenant_id: str, chat_id: int) -> Dict[str, Any]:
@@ -327,149 +320,6 @@ def parse_items_field(items_field: Any) -> List[Dict[str, Any]]:
 
 
 # -------------------------
-# Pickup time helpers (NUEVO)
-# -------------------------
-
-def _now_local(tenant: Dict[str, Any]) -> datetime:
-    tzname = (tenant.get("timezone") or "America/La_Paz").strip()
-    if ZoneInfo:
-        try:
-            return datetime.now(tz=ZoneInfo(tzname))
-        except Exception:
-            return datetime.now(tz=ZoneInfo("America/La_Paz"))
-    return datetime.now()  # fallback (menos exacto)
-
-
-def _parse_hhmm(s: str) -> Optional[Tuple[int, int]]:
-    s = (s or "").strip()
-    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
-    if not m:
-        return None
-    hh = int(m.group(1))
-    mm = int(m.group(2))
-    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
-        return None
-    return hh, mm
-
-
-def _ceil_to_half_hour(dt: datetime) -> datetime:
-    dt = dt.replace(second=0, microsecond=0)
-    m = dt.minute
-    if m == 0 or m == 30:
-        return dt
-    if m < 30:
-        return dt.replace(minute=30)
-    return (dt.replace(minute=0) + timedelta(hours=1))
-
-
-def _read_open_close_from_bookingrules(orders_sh, tenant_id: str) -> Tuple[str, str]:
-    """
-    Lee de worksheet "BookingRules" en el MISMO spreadsheet de orders_sh:
-      columns: tenant_id | open_time | close_time
-    Fallback: 09:00 - 22:00
-    """
-    open_s, close_s = "09:00", "22:00"
-    try:
-        ws = orders_sh.worksheet("BookingRules")
-        values = ws.get_all_values()
-        if not values or len(values) < 2:
-            return open_s, close_s
-
-        header = [normalize(x) for x in values[0]]
-        def idx(col: str) -> Optional[int]:
-            c = normalize(col)
-            return header.index(c) if c in header else None
-
-        i_t = idx("tenant_id")
-        i_o = idx("open_time")
-        i_c = idx("close_time")
-        if i_t is None or i_o is None or i_c is None:
-            return open_s, close_s
-
-        tid_norm = normalize(tenant_id)
-        for row in values[1:]:
-            tval = (row[i_t] if i_t < len(row) else "").strip()
-            if normalize(tval) != tid_norm:
-                continue
-            o = (row[i_o] if i_o < len(row) else "").strip()
-            c = (row[i_c] if i_c < len(row) else "").strip()
-            if _parse_hhmm(o):
-                open_s = o
-            if _parse_hhmm(c):
-                close_s = c
-            return open_s, close_s
-
-        return open_s, close_s
-    except Exception as e:
-        log_event("bookingrules_read_failed", tenant_id=tenant_id, error=str(e))
-        return open_s, close_s
-
-
-def _build_pickup_options(tenant: Dict[str, Any], orders_sh, tenant_id: str) -> List[str]:
-    """
-    Devuelve lista de strings "HH:MM".
-    Regla: first = now + 30 min (o open_time+30 si aún no abre)
-           luego slots cada 30 min (00/30) dentro de open-close
-    """
-    open_s, close_s = _read_open_close_from_bookingrules(orders_sh, tenant_id)
-    ohm = _parse_hhmm(open_s) or (9, 0)
-    chm = _parse_hhmm(close_s) or (22, 0)
-
-    now = _now_local(tenant)
-
-    open_dt = now.replace(hour=ohm[0], minute=ohm[1], second=0, microsecond=0)
-    close_dt = now.replace(hour=chm[0], minute=chm[1], second=0, microsecond=0)
-
-    # base = now + prep
-    base = now + timedelta(minutes=PICKUP_PREP_MINUTES)
-    base = base.replace(second=0, microsecond=0)
-
-    # si aún no abre, base = open + prep
-    if now < open_dt:
-        base = open_dt + timedelta(minutes=PICKUP_PREP_MINUTES)
-
-    # si ya pasó cierre
-    if base > close_dt:
-        return []
-
-    opts: List[datetime] = []
-
-    # 1) lo antes posible = base exacto
-    opts.append(base)
-
-    # 2) siguientes: ceiling a 00/30 y cada 30
-    cur = _ceil_to_half_hour(base)
-    if cur <= base:
-        cur = cur + timedelta(minutes=30)
-
-    while len(opts) < PICKUP_MAX_OPTIONS and cur <= close_dt:
-        opts.append(cur)
-        cur += timedelta(minutes=30)
-
-    out = [d.strftime("%H:%M") for d in opts]
-    # quitar duplicados si por alguna razón se repite
-    seen = set()
-    uniq = []
-    for x in out:
-        if x in seen:
-            continue
-        seen.add(x)
-        uniq.append(x)
-    return uniq
-
-
-def pickup_kb(times: List[str]) -> Dict[str, Any]:
-    rows = []
-    for i, t in enumerate(times):
-        if i == 0:
-            rows.append([(f"⚡ Lo antes posible ({t})", f"ptime|{t}")])
-        else:
-            rows.append([(t, f"ptime|{t}")])
-    rows.append([("🏠 Inicio", "home")])
-    return kb(rows)
-
-
-# -------------------------
 # Forward proof to admin (clave)
 # -------------------------
 
@@ -639,6 +489,21 @@ def contact_admin_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
     ])
 
 
+# ✅ NUEVO: Admin keyboards (mínimos)
+def admin_home_kb() -> Dict[str, Any]:
+    return kb([
+        [("📊 Estadísticas", "admin_stats")],
+    ])
+
+
+def admin_periods_kb(tenant_id: str, periods: List[Tuple[str, str]]) -> Dict[str, Any]:
+    rows = []
+    for label, key in periods:
+        rows.append([(f"📊 {label}", f"admin_stats_period|{tenant_id}|{key}")])
+    rows.append([("⬅️ Volver", "admin_home")])
+    return kb(rows)
+
+
 # -------------------------
 # Helpers seguridad/parsing
 # -------------------------
@@ -692,6 +557,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         raise HTTPException(status_code=500, detail=f"orders_sheet_id missing for tenant: {tenant_id}")
 
     orders_sh = open_spreadsheet_by_key(gc, orders_sheet_id)
+    tenant_tz = (tenant.get("timezone") or "America/La_Paz").strip()
 
     # =========================================================
     # 1) CALLBACK QUERY
@@ -746,8 +612,47 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             return {"ok": True}
 
+        # ✅ NUEVO: ADMIN stats callbacks
+        if mode == "admin":
+            if data == "admin_home":
+                telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_home_kb())
+                return {"ok": True}
+
+            if data == "admin_stats":
+                # mostrar períodos
+                periods = build_periods(tenant_tz)
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "📊 Elige el período:",
+                    reply_markup=admin_periods_kb(tenant_id, periods),
+                )
+                return {"ok": True}
+
+            if data.startswith("admin_stats_period|"):
+                parts = data.split("|")
+                if len(parts) != 3:
+                    return {"ok": True}
+                _, cb_tenant_id, period_key = parts
+                cb_tenant_id = cb_tenant_id.strip()
+                period_key = period_key.strip()
+
+                if cb_tenant_id != tenant_id:
+                    raise HTTPException(status_code=400, detail="Tenant mismatch in stats callback")
+
+                # (opcional) seguridad: solo admin_chat_id puede ver stats
+                _assert_admin_authorized(tenant, chat_id, tenant_id)
+
+                period = resolve_period(tenant_tz, period_key)
+                txt = build_stats_report_text(orders_sh, tenant_id=tenant_id, tenant_tz=tenant_tz, period=period)
+
+                telegram_send_text(bot_token, chat_id, txt)
+                # dejar botón para volver a períodos (sin spamear muchos botones)
+                telegram_send_text(bot_token, chat_id, "⬅️ Volver:", reply_markup=admin_periods_kb(tenant_id, build_periods(tenant_tz)))
+                return {"ok": True}
+
         # -------------------------
-        # CLIENT callbacks (MENÚ COMPLETO + PAGO + PICKUP NUEVO)
+        # CLIENT callbacks (MENÚ COMPLETO + PAGO)
         # -------------------------
         if mode == "client":
             sess = get_sess(tenant_id, chat_id)
@@ -897,93 +802,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                 sess["stage"] = "awaiting_name"
                 telegram_send_text(bot_token, chat_id, "Perfecto. ¿Cuál es tu *nombre* para el pedido?", parse_mode="Markdown")
-                return {"ok": True}
-
-            # ---- NUEVO: elegir hora pickup (botones)
-            if data.startswith("ptime|"):
-                hhmm = data.split("|", 1)[1].strip()
-                if not _parse_hhmm(hhmm):
-                    telegram_send_text(bot_token, chat_id, "Hora inválida. Vuelve a /start.", reply_markup=client_home_kb())
-                    sess["stage"] = "idle"
-                    return {"ok": True}
-
-                # Recuperar snapshot guardado al pedir nombre
-                customer_name = (tmp.get("pending_customer_name") or "").strip()
-                cart = tmp.get("pending_cart") or []
-                try:
-                    total = float(tmp.get("pending_total") or 0)
-                except Exception:
-                    total = 0.0
-
-                if not customer_name or not cart:
-                    telegram_send_text(bot_token, chat_id, "No pude recuperar tu pedido. Vuelve a /start.", reply_markup=client_home_kb())
-                    sess["stage"] = "idle"
-                    sess["tmp"] = {}
-                    return {"ok": True}
-
-                # Crear pedido (igual que antes, solo requested_time cambia)
-                order_id = gen_order_id()
-                requested_time = hhmm
-
-                append_order_row(
-                    orders_sh=orders_sh,
-                    tenant_id=tenant_id,
-                    order_id=order_id,
-                    customer_name=customer_name,
-                    customer_contact=str(chat_id),
-                    items=cart,
-                    delivery_type="pickup",
-                    requested_time=requested_time,
-                    status="PENDING_PAYMENT",
-                    source="telegram",
-                    total_amount=total,
-                )
-
-                sess["stage"] = "awaiting_proof"
-                sess["tmp"] = sess.get("tmp") or {}
-                sess["tmp"]["pending_order_id"] = order_id
-                sess["tmp"]["customer_name"] = customer_name
-                # limpiar pendientes
-                sess["tmp"].pop("pending_customer_name", None)
-                sess["tmp"].pop("pending_cart", None)
-                sess["tmp"].pop("pending_total", None)
-
-                menu_idx = load_menu_index(orders_sh)
-                recap = build_order_recap_text(
-                    order_id=order_id,
-                    customer_name=customer_name,
-                    customer_contact=str(chat_id),
-                    requested_time=requested_time,
-                    cart=cart,
-                    menu_idx=menu_idx,
-                    total=total,
-                )
-
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    recap + "\n💳 *Ahora realiza el pago.*\nTe enviamos el QR a continuación.",
-                    parse_mode="Markdown",
-                )
-
-                qr_file_id = get_payment_qr_file_id(tenant)
-                qr_url = get_payment_qr_url(tenant)
-
-                if qr_file_id:
-                    telegram_send_photo(bot_token, chat_id, qr_file_id, caption="QR de pago")
-                elif qr_url:
-                    telegram_send_photo(bot_token, chat_id, qr_url, caption="QR de pago")
-                else:
-                    telegram_send_text(bot_token, chat_id, "⚠️ No tengo QR configurado para este tenant (payment_qr_file_id / payment_qr_url).")
-                    log_event("missing_qr_config", tenant_id=tenant_id)
-
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    "📎 Cuando pagues, envía aquí tu *comprobante* (foto o PDF).\n"
-                    "Después de enviarlo, podrás presionar “✅ Ya pagué”.",
-                    parse_mode="Markdown",
-                )
                 return {"ok": True}
 
             # ---- Cliente presiona "Ya pagué" (NOTIFICA ADMIN + PRUEBA)
@@ -1187,6 +1005,16 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             if normalize(text) in ("start", "/start", "hola"):
                 clear_sess(tenant_id, chat_id)
+
+                # ✅ NUEVO: registrar conversación iniciada (no rompe si falla)
+                log_event_to_sheet(
+                    orders_sh=orders_sh,
+                    tenant_id=tenant_id,
+                    chat_id=str(chat_id),
+                    event_type="client_start",
+                    meta={"source": "telegram", "text": text[:50]},
+                )
+
                 telegram_send_text(bot_token, chat_id, "Bienvenido 👋\nElige una opción:", client_home_kb())
                 return {"ok": True}
 
@@ -1206,50 +1034,83 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     sess["stage"] = "idle"
                     return {"ok": True}
 
-                # ===========================
-                # NUEVO: pedir hora pickup
-                # ===========================
-                times = _build_pickup_options(tenant, orders_sh, tenant_id)
-                if not times:
-                    # mostrar horario leído (si existe)
-                    o, c = _read_open_close_from_bookingrules(orders_sh, tenant_id)
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        f"😕 Ya no tenemos horarios disponibles hoy.\nHorario: {o}–{c}.\nVuelve más temprano o mañana.",
-                        reply_markup=client_home_kb(),
-                    )
-                    sess["stage"] = "idle"
-                    return {"ok": True}
+                order_id = gen_order_id()
+                requested_time = "pendiente"
 
-                sess["stage"] = "awaiting_pickup_time"
+                append_order_row(
+                    orders_sh=orders_sh,
+                    tenant_id=tenant_id,
+                    order_id=order_id,
+                    customer_name=customer_name,
+                    customer_contact=str(chat_id),
+                    items=cart,
+                    delivery_type="pickup",
+                    requested_time=requested_time,
+                    status="PENDING_PAYMENT",
+                    source="telegram",
+                    total_amount=total,
+                )
+
+                sess["stage"] = "awaiting_proof"
                 sess["tmp"] = sess.get("tmp") or {}
-                sess["tmp"]["pending_customer_name"] = customer_name
-                sess["tmp"]["pending_cart"] = cart
-                sess["tmp"]["pending_total"] = float(total)
+                sess["tmp"]["pending_order_id"] = order_id
+                sess["tmp"]["customer_name"] = customer_name
+
+                recap = build_order_recap_text(
+                    order_id=order_id,
+                    customer_name=customer_name,
+                    customer_contact=str(chat_id),
+                    requested_time=requested_time,
+                    cart=cart,
+                    menu_idx=menu_idx,
+                    total=total,
+                )
 
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "¿A qué hora será el recojo?\nElige una opción:",
-                    reply_markup=pickup_kb(times),
+                    recap + "\n💳 *Ahora realiza el pago.*\nTe enviamos el QR a continuación.",
+                    parse_mode="Markdown",
                 )
-                return {"ok": True}
 
-            # si está esperando pickup, insistir botones
-            if sess.get("stage") == "awaiting_pickup_time":
-                telegram_send_text(bot_token, chat_id, "Por favor elige la hora usando los botones 👇")
+                qr_file_id = get_payment_qr_file_id(tenant)
+                qr_url = get_payment_qr_url(tenant)
+
+                if qr_file_id:
+                    telegram_send_photo(bot_token, chat_id, qr_file_id, caption="QR de pago")
+                elif qr_url:
+                    telegram_send_photo(bot_token, chat_id, qr_url, caption="QR de pago")
+                else:
+                    telegram_send_text(bot_token, chat_id, "⚠️ No tengo QR configurado para este tenant (payment_qr_file_id / payment_qr_url).")
+                    log_event("missing_qr_config", tenant_id=tenant_id)
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "📎 Cuando pagues, envía aquí tu *comprobante* (foto o PDF).\n"
+                    "Después de enviarlo, podrás presionar “✅ Ya pagué”.",
+                    parse_mode="Markdown",
+                )
                 return {"ok": True}
 
             telegram_send_text(bot_token, chat_id, "Usa /start para ver el menú.", reply_markup=client_home_kb())
             return {"ok": True}
 
         # ADMIN
-        if normalize(text) in ("start", "/start", "hola"):
-            telegram_send_text(bot_token, chat_id, "Admin bot listo. Escribe /id para ver tu chat_id ✅")
+        if mode == "admin":
+            # comando alternativo
+            if normalize(text) in ("/stats", "stats"):
+                telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_home_kb())
+                telegram_send_text(bot_token, chat_id, "📊 Elige el período:", reply_markup=admin_periods_kb(tenant_id, build_periods(tenant_tz)))
+                return {"ok": True}
+
+            if normalize(text) in ("start", "/start", "hola"):
+                telegram_send_text(bot_token, chat_id, "Admin bot listo ✅", reply_markup=admin_home_kb())
+                return {"ok": True}
+
+            telegram_send_text(bot_token, chat_id, "OK admin ✅", reply_markup=admin_home_kb())
             return {"ok": True}
 
-        telegram_send_text(bot_token, chat_id, "OK admin ✅ (escribe /id para ver tu chat_id)")
         return {"ok": True}
 
     return {"ok": True}
