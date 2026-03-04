@@ -16,7 +16,25 @@ from app.rate_limit import rate_limiter
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
 from app.tenants import get_tenant_or_404, load_tenants, tenants_cache_info
 from app.menu import load_menu_index, group_menu_by_category, calc_total_amount
-from app.orders import append_order_row, update_order_status, gen_order_id
+
+# =========================
+# Orders imports (BLINDADO)
+# =========================
+# Render a veces queda corriendo una versión vieja de app/orders.py.
+# Esto evita que el deploy muera solo por un rename de función.
+try:
+    from app.orders import append_order_row  # versión nueva
+except Exception:
+    try:
+        from app.orders import append_order as append_order_row  # versión vieja (si existía)
+    except Exception as e:
+        raise ImportError(
+            "No se pudo importar append_order_row ni append_order desde app.orders. "
+            "Revisa que el archivo app/orders.py en el deploy sea el correcto."
+        ) from e
+
+from app.orders import update_order_status, gen_order_id
+
 from app.validators import (
     validate_tenant_id,
     validate_order_id,
