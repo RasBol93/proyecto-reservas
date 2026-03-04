@@ -139,11 +139,6 @@ def telegram_answer_callback(bot_token: str, callback_query_id: str, text: str =
 
 # ✅ NUEVO: Reply Keyboard (teclado fijo, NO inline)
 def reply_kb(button_rows: List[List[str]], resize: bool = True, one_time: bool = False) -> Dict[str, Any]:
-    """
-    ReplyKeyboardMarkup:
-    - aparece como botones "fijos" abajo del chat
-    - al presionar, Telegram envía texto
-    """
     keyboard = [[{"text": txt} for txt in row] for row in button_rows]
     return {
         "keyboard": keyboard,
@@ -275,7 +270,23 @@ def _telegram_send_file_bytes_admin(admin_token: str, method: str, chat_id: int,
 # Formatting helpers
 # -------------------------
 
+def parse_items_field(items_field: Any) -> List[Dict[str, Any]]:
+    if isinstance(items_field, list):
+        return items_field
+    if isinstance(items_field, str) and items_field.strip():
+        try:
+            v = json.loads(items_field)
+            return v if isinstance(v, list) else []
+        except Exception:
+            return []
+    return []
+
+
 def fmt_cart_lines(cart: List[Dict[str, Any]], menu_idx: Dict[str, Any]) -> Tuple[str, float, int]:
+    """
+    Estimado (depende del menú actual). Se usa solo para UI rápida.
+    Los totales reales quedan en items_snapshot + total_amount en Sheets.
+    """
     total_qty = 0
     lines = []
     items_for_total = []
@@ -301,16 +312,50 @@ def fmt_cart_lines(cart: List[Dict[str, Any]], menu_idx: Dict[str, Any]) -> Tupl
     return ("\n".join(lines) if lines else "(vacío)"), total, total_qty
 
 
+def fmt_snapshot_lines(items_snapshot: List[Dict[str, Any]]) -> Tuple[str, float, int]:
+    """
+    REAL (congelado en la orden): usa unit_price + line_total del snapshot.
+    """
+    total_qty = 0
+    total = 0.0
+    lines = []
+
+    for it in items_snapshot or []:
+        name = str(it.get("name") or it.get("sku") or "").strip()
+        try:
+            qty = int(it.get("qty") or 1)
+        except Exception:
+            qty = 1
+        qty = max(1, qty)
+
+        try:
+            unit_price = float(it.get("unit_price") or 0)
+        except Exception:
+            unit_price = 0.0
+
+        try:
+            line_total = float(it.get("line_total") or (unit_price * qty))
+        except Exception:
+            line_total = unit_price * qty
+
+        total_qty += qty
+        total += line_total
+
+        # Ej: "- 2 x Hamburguesa (30) = 60"
+        lines.append(f"- {qty} x {name} ({unit_price:.0f}) = {line_total:.0f}")
+
+    return ("\n".join(lines) if lines else "(vacío)"), float(total), int(total_qty)
+
+
 def build_order_recap_text(
     order_id: str,
     customer_name: str,
     customer_contact: str,
     requested_time: str,
-    cart: List[Dict[str, Any]],
-    menu_idx: Dict[str, Any],
+    detail_lines: str,
+    total_qty: int,
     total: float,
 ) -> str:
-    lines_txt, _, total_qty = fmt_cart_lines(cart, menu_idx)
     return (
         f"🧾 *Resumen de tu pedido*\n"
         f"ID: `{order_id}`\n"
@@ -319,20 +364,8 @@ def build_order_recap_text(
         f"Hora recogida: *{requested_time}*\n"
         f"Cantidad total: *{total_qty}*\n"
         f"Total: *{total:.2f}* BOB\n\n"
-        f"*Detalle:*\n{lines_txt}\n"
+        f"*Detalle:*\n{detail_lines}\n"
     )
-
-
-def parse_items_field(items_field: Any) -> List[Dict[str, Any]]:
-    if isinstance(items_field, list):
-        return items_field
-    if isinstance(items_field, str) and items_field.strip():
-        try:
-            v = json.loads(items_field)
-            return v if isinstance(v, list) else []
-        except Exception:
-            return []
-    return []
 
 
 # -------------------------
@@ -417,20 +450,26 @@ def notify_admin_payment_reported(
         telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
         return False
 
-    try:
-        menu_idx = load_menu_index(orders_sh)
-    except Exception as e:
-        log_event("admin_menu_load_error", tenant_id=tenant_id, error=str(e))
-        menu_idx = {}
+    # ✅ preferir snapshot real
+    items_snapshot = parse_items_field(order.get("items_snapshot"))
+    if items_snapshot:
+        lines_txt, snapshot_total, total_qty = fmt_snapshot_lines(items_snapshot)
+        total = snapshot_total
+    else:
+        # fallback: items + menú actual (estimado)
+        try:
+            menu_idx = load_menu_index(orders_sh)
+        except Exception as e:
+            log_event("admin_menu_load_error", tenant_id=tenant_id, error=str(e))
+            menu_idx = {}
+        cart = parse_items_field(order.get("items"))
+        lines_txt, _, total_qty = fmt_cart_lines(cart, menu_idx)
+        try:
+            total = float(order.get("total_amount") or 0)
+        except Exception:
+            total = 0.0
 
-    cart = parse_items_field(order.get("items"))
-    try:
-        total = float(order.get("total_amount") or 0)
-    except Exception:
-        total = 0.0
-
-    lines_txt, _, total_qty = fmt_cart_lines(cart, menu_idx)
-
+    # proof
     proof_file_id = (order.get("payment_proof_file_id") or "").strip()
     proof_type = (order.get("payment_proof_type") or "").strip()
     proof_caption = (order.get("payment_proof_caption") or "").strip()
@@ -1013,9 +1052,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                 menu_idx = load_menu_index(orders_sh)
                 cart = sess.get("cart") or []
-                lines_txt, total, total_qty = fmt_cart_lines(cart, menu_idx)
+                lines_est, total_est, total_qty_est = fmt_cart_lines(cart, menu_idx)
 
-                if total_qty <= 0:
+                if total_qty_est <= 0:
                     telegram_send_text(bot_token, chat_id, "Tu carrito está vacío.", reply_markup=client_home_kb())
                     sess["stage"] = "idle"
                     return {"ok": True}
@@ -1023,6 +1062,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 order_id = gen_order_id()
                 requested_time = "pendiente"
 
+                # ✅ guarda orden (Orders.py calculará snapshot + total real)
                 append_order_row(
                     orders_sh=orders_sh,
                     tenant_id=tenant_id,
@@ -1034,8 +1074,17 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     requested_time=requested_time,
                     status="PENDING_PAYMENT",
                     source="telegram",
-                    total_amount=total,
+                    total_amount=total_est,
                 )
+
+                # ✅ leer de vuelta para mostrar lo REAL (snapshot + total)
+                order = get_order_by_id(orders_sh, order_id)
+                items_snapshot = parse_items_field((order or {}).get("items_snapshot"))
+                if items_snapshot:
+                    lines_real, total_real, total_qty_real = fmt_snapshot_lines(items_snapshot)
+                else:
+                    # fallback (raro): mostrar estimado
+                    lines_real, total_real, total_qty_real = lines_est, total_est, total_qty_est
 
                 sess["stage"] = "awaiting_proof"
                 sess["tmp"] = sess.get("tmp") or {}
@@ -1047,9 +1096,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     customer_name=customer_name,
                     customer_contact=str(chat_id),
                     requested_time=requested_time,
-                    cart=cart,
-                    menu_idx=menu_idx,
-                    total=total,
+                    detail_lines=lines_real,
+                    total_qty=total_qty_real,
+                    total=total_real,
                 )
 
                 telegram_send_text(
@@ -1084,8 +1133,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
         # ADMIN: aquí vive el botón fijo
         if mode == "admin":
-            # siempre poner teclado fijo
-            # 1) si toca el botón "📊 Estadísticas"
             if normalize(text) in ("📊 estadisticas", "estadisticas", "/stats", "stats"):
                 _assert_admin_authorized(tenant, chat_id, tenant_id)
                 periods = build_periods(tenant_tz)
@@ -1095,7 +1142,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     "📊 Elige el período:",
                     reply_markup=admin_periods_inline_kb(tenant_id, periods),
                 )
-                # teclado fijo visible
                 telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
                 return {"ok": True}
 
@@ -1103,7 +1149,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, "Admin bot listo ✅", reply_markup=admin_fixed_kb())
                 return {"ok": True}
 
-            # cualquier cosa que escriba, mantenemos el teclado fijo vivo
             telegram_send_text(bot_token, chat_id, "OK admin ✅", reply_markup=admin_fixed_kb())
             return {"ok": True}
 
