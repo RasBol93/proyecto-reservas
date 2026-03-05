@@ -20,6 +20,7 @@ from app.orders import (
     find_latest_pending_order_for_contact,
     get_order_by_id,
     gen_order_id,
+    build_items_snapshot,  # ✅ NUEVO
 )
 from app.telegram_keyboard import kb
 from app.utils import normalize, log_event
@@ -340,8 +341,6 @@ def fmt_snapshot_lines(items_snapshot: List[Dict[str, Any]]) -> Tuple[str, float
 
         total_qty += qty
         total += line_total
-
-        # Ej: "- 2 x Hamburguesa (30) = 60"
         lines.append(f"- {qty} x {name} ({unit_price:.0f}) = {line_total:.0f}")
 
     return ("\n".join(lines) if lines else "(vacío)"), float(total), int(total_qty)
@@ -1052,39 +1051,50 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                 menu_idx = load_menu_index(orders_sh)
                 cart = sess.get("cart") or []
-                lines_est, total_est, total_qty_est = fmt_cart_lines(cart, menu_idx)
 
-                if total_qty_est <= 0:
+                # Normaliza cart a [{"sku":..., "qty": int}]
+                items_list: List[Dict[str, Any]] = []
+                for it in cart:
+                    sku = str(it.get("sku") or "").strip()
+                    if not sku:
+                        continue
+                    try:
+                        qty = int(it.get("qty") or 1)
+                    except Exception:
+                        qty = 1
+                    qty = max(1, qty)
+                    if sku in menu_idx:
+                        items_list.append({"sku": sku, "qty": qty})
+
+                if not items_list:
                     telegram_send_text(bot_token, chat_id, "Tu carrito está vacío.", reply_markup=client_home_kb())
                     sess["stage"] = "idle"
                     return {"ok": True}
 
+                # ✅ Snapshot REAL (congelado)
+                items_snapshot = build_items_snapshot(items_list, menu_idx)
+                lines_real, total_real, total_qty_real = fmt_snapshot_lines(items_snapshot)
+
                 order_id = gen_order_id()
                 requested_time = "pendiente"
 
-                # ✅ guarda orden (Orders.py calculará snapshot + total real)
+                # ✅ guarda orden con snapshot + total real
                 append_order_row(
                     orders_sh=orders_sh,
                     tenant_id=tenant_id,
                     order_id=order_id,
                     customer_name=customer_name,
                     customer_contact=str(chat_id),
-                    items=cart,
+                    items=items_list,
+                    items_snapshot=items_snapshot,
+                    currency="BOB",
+                    pricing_version="v1",
                     delivery_type="pickup",
                     requested_time=requested_time,
                     status="PENDING_PAYMENT",
                     source="telegram",
-                    total_amount=total_est,
+                    total_amount=total_real,
                 )
-
-                # ✅ leer de vuelta para mostrar lo REAL (snapshot + total)
-                order = get_order_by_id(orders_sh, order_id)
-                items_snapshot = parse_items_field((order or {}).get("items_snapshot"))
-                if items_snapshot:
-                    lines_real, total_real, total_qty_real = fmt_snapshot_lines(items_snapshot)
-                else:
-                    # fallback (raro): mostrar estimado
-                    lines_real, total_real, total_qty_real = lines_est, total_est, total_qty_est
 
                 sess["stage"] = "awaiting_proof"
                 sess["tmp"] = sess.get("tmp") or {}
