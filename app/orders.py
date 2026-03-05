@@ -1,378 +1,195 @@
-# app/orders.py
-"""
-Orders persistence layer (Google Sheets)
+# app/api_routes.py
 
-Objetivos de estas mejoras:
-- Idempotencia clara en updates (status y proof) para tolerar retries de Telegram/Render.
-- Menos escrituras en Sheets (batch update cuando se puede).
-- Robusto ante headers desplazados (fila 1 técnica, fila 2 etiquetas) y pestañas con nombres distintos.
-- Diagnóstico más útil en logs cuando autodetecta pestañas o faltan headers.
+from typing import List, Optional
 
-Requisitos implícitos del sistema:
-- Orders sheet debe tener (mínimo): order_id, tenant_id, status
-- Ideal: Orders tab se llame "Orders", pero si no, se autodetecta por headers.
-"""
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
-import json
-from typing import Any, Dict, List, Tuple, Optional
+from app.config import (
+    MAX_ITEMS_PER_ORDER,
+    MAX_NAME_LEN,
+    RL_MENU_PER_MIN,
+    RL_CREATE_PER_MIN,
+    RL_MARKPAID_PER_MIN,
+)
+from app.rate_limit import rate_limiter
+from app.sheets import get_gspread_client, open_spreadsheet_by_key
+from app.tenants import get_tenant_or_404, load_tenants, tenants_cache_info
+from app.menu import load_menu_index, group_menu_by_category, calc_total_amount
+from app.orders import append_order_row, update_order_status, gen_order_id, build_items_snapshot
+from app.validators import (
+    validate_tenant_id,
+    validate_order_id,
+    validate_contact,
+    validate_delivery_type,
+    validate_requested_time,
+    validate_source,
+)
+from app.admin_auth import require_admin_token
 
-from fastapi import HTTPException
-
-from app.sheets import get_ws
-from app.utils import normalize, now_iso_utc, log_event
-
-
-def gen_order_id() -> str:
-    import secrets
-    return secrets.token_hex(4)  # 8 chars hex
-
-
-# ---------------------------------
-# Worksheet resolution (robusto)
-# ---------------------------------
-
-REQUIRED_ORDERS_HEADERS_MIN = ["order_id", "tenant_id", "status"]
+router = APIRouter()
 
 
-def _ws_has_required_headers(ws, required_headers: List[str], max_scan_rows: int = 30) -> bool:
-    try:
-        values = ws.get_all_values()
-    except Exception:
-        return False
+# =========================
+# Models
+# =========================
 
-    if not values:
-        return False
-
-    req = [normalize(h) for h in required_headers]
-    scan = values[:max_scan_rows]
-
-    for row in scan:
-        row_norm = [normalize(x) for x in row]
-        if all(h in row_norm for h in req):
-            return True
-
-    return False
+class AdminTokenIn(BaseModel):
+    token: str = Field(..., min_length=1)
 
 
-def _find_orders_ws_by_headers(orders_sh) -> Optional[Any]:
-    try:
-        for ws in orders_sh.worksheets():
-            if _ws_has_required_headers(ws, REQUIRED_ORDERS_HEADERS_MIN):
-                return ws
-    except Exception:
-        return None
-    return None
+class OrderItem(BaseModel):
+    sku: str = Field(..., min_length=1)
+    qty: int = Field(..., ge=1)
 
 
-def _ensure_orders_ws(orders_sh):
-    # 1) camino rápido
-    try:
-        return get_ws(orders_sh, "Orders")
-    except Exception:
-        pass
+class OrderCreateIn(BaseModel):
+    tenant_id: str
+    customer_name: str
+    customer_contact: str
+    items: List[OrderItem]
+    delivery_type: Optional[str] = "pickup"
+    requested_time: Optional[str] = "ahora"
+    source: Optional[str] = "api"
 
-    # 2) fallback por headers
-    ws = _find_orders_ws_by_headers(orders_sh)
-    if ws is not None:
-        try:
-            log_event("orders_ws_autodetected", worksheet_title=getattr(ws, "title", "unknown"))
-        except Exception:
-            pass
-        return ws
 
-    raise HTTPException(
-        status_code=500,
-        detail=(
-            "Orders worksheet not found. Expected a tab named 'Orders' "
-            "or any tab with headers including: order_id, tenant_id, status"
-        ),
+class OrderCreateOut(BaseModel):
+    ok: bool
+    order_id: str
+    total_amount: float
+    currency: str = "BOB"
+
+
+class MarkPaidIn(BaseModel):
+    tenant_id: str
+    order_id: str
+    admin_chat_id: str
+
+
+class MarkPaidOut(BaseModel):
+    ok: bool
+    order_id: str
+    status: str
+    old_status: Optional[str] = None
+    already_paid: Optional[bool] = None
+
+
+# =========================
+# Routes
+# =========================
+
+@router.post("/admin/reload_tenants")
+def admin_reload_tenants(payload: AdminTokenIn):
+    require_admin_token(payload.token)
+
+    gc = get_gspread_client()
+    load_tenants(gc=gc, force=True)
+    return {"ok": True, **tenants_cache_info()}
+
+
+@router.get("/menu")
+def get_menu(tenant_id: str = Query(..., description="tenant_id, ej: resto_demo")):
+    validate_tenant_id(tenant_id)
+    rate_limiter.hit(f"menu:{tenant_id}", RL_MENU_PER_MIN)
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(tenant_id, gc=gc)
+
+    if not tenant.get("orders_enabled", False):
+        raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {tenant_id}")
+
+    orders_sh = open_spreadsheet_by_key(gc, tenant["orders_sheet_id"])
+    menu_idx = load_menu_index(orders_sh)
+    categories = group_menu_by_category(menu_idx)
+
+    return {"ok": True, "tenant_id": tenant_id, "categories": categories}
+
+
+@router.post("/orders/create", response_model=OrderCreateOut)
+def create_order(payload: OrderCreateIn):
+    validate_tenant_id(payload.tenant_id)
+    rate_limiter.hit(f"create:{payload.tenant_id}", RL_CREATE_PER_MIN)
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(payload.tenant_id, gc=gc)
+
+    if not tenant.get("orders_enabled", False):
+        raise HTTPException(status_code=400, detail=f"Orders not enabled for tenant: {payload.tenant_id}")
+
+    name = (payload.customer_name or "").strip()
+    if not name or len(name) > MAX_NAME_LEN:
+        raise HTTPException(status_code=422, detail="customer_name missing or too long")
+
+    contact = (payload.customer_contact or "").strip()
+    validate_contact(contact)
+
+    if not payload.items or len(payload.items) > MAX_ITEMS_PER_ORDER:
+        raise HTTPException(status_code=422, detail=f"items must be 1..{MAX_ITEMS_PER_ORDER}")
+
+    delivery_type = validate_delivery_type(payload.delivery_type or "pickup")
+    requested_time = validate_requested_time(payload.requested_time or "ahora")
+    source = validate_source(payload.source or "api")
+
+    orders_sh = open_spreadsheet_by_key(gc, tenant["orders_sheet_id"])
+    menu_idx = load_menu_index(orders_sh)
+
+    items_list = [{"sku": it.sku.strip(), "qty": int(it.qty)} for it in payload.items]
+    total_amount = calc_total_amount(items_list, menu_idx)
+
+    # ✅ Snapshot real del pedido (precios/categorías del momento)
+    items_snapshot = build_items_snapshot(items_list, menu_idx)
+
+    order_id = gen_order_id()
+
+    append_order_row(
+        orders_sh=orders_sh,
+        tenant_id=payload.tenant_id,
+        order_id=order_id,
+        customer_name=name,
+        customer_contact=contact,
+        items=items_list,
+        items_snapshot=items_snapshot,
+        currency="BOB",
+        pricing_version="v1",
+        delivery_type=delivery_type,
+        requested_time=requested_time,
+        status="PENDING_PAYMENT",
+        source=source,
+        total_amount=total_amount,
     )
 
+    return OrderCreateOut(ok=True, order_id=order_id, total_amount=total_amount, currency="BOB")
 
-# ---------------------------------
-# Header parsing (robusto)
-# ---------------------------------
 
-def _detect_header_row_0based(values: List[List[str]], required_headers: List[str], max_scan: int = 30) -> int:
-    req = [normalize(h) for h in required_headers]
-    scan = values[:max_scan]
+@router.post("/orders/mark_paid", response_model=MarkPaidOut)
+def mark_paid(payload: MarkPaidIn):
+    validate_tenant_id(payload.tenant_id)
+    validate_order_id(payload.order_id)
+    rate_limiter.hit(f"mark_paid:{payload.tenant_id}", RL_MARKPAID_PER_MIN)
 
-    for idx, row in enumerate(scan):
-        row_norm = [normalize(x) for x in row]
-        if all(h in row_norm for h in req):
-            return idx
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(payload.tenant_id, gc=gc)
 
-    return 0
+    expected_admin_chat_id = str(tenant.get("admin_chat_id", "")).strip()
+    if not expected_admin_chat_id:
+        raise HTTPException(status_code=500, detail="admin_chat_id is not set for this tenant")
 
+    if str(payload.admin_chat_id).strip() != expected_admin_chat_id:
+        raise HTTPException(status_code=403, detail="Invalid admin_chat_id for this tenant")
 
-def _get_orders_header(ws, required: List[str]) -> Tuple[int, List[str], List[str], List[List[str]]]:
-    try:
-        values = ws.get_all_values()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Cannot read Orders sheet: {e}")
+    orders_sh = open_spreadsheet_by_key(gc, tenant["orders_sheet_id"])
 
-    if not values:
-        raise HTTPException(status_code=500, detail="Orders sheet is empty")
+    result = update_order_status(orders_sh, payload.order_id, "PAID")
+    if not result.get("found"):
+        raise HTTPException(status_code=404, detail=f"Order not found: {payload.order_id}")
 
-    header_idx_0 = _detect_header_row_0based(values, required_headers=required, max_scan=30)
-    header_row_1based = header_idx_0 + 1
+    old_status = str(result.get("old_status", "") or "")
+    already_paid = (old_status.strip().upper() == "PAID")
 
-    headers_raw = values[header_idx_0]
-    if not headers_raw:
-        raise HTTPException(status_code=500, detail=f"Orders sheet missing headers in row {header_row_1based}")
-
-    headers_norm = [normalize(h) for h in headers_raw]
-    required_norm = [normalize(h) for h in required]
-
-    missing = [h for h in required_norm if h not in headers_norm]
-    if missing:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Orders sheet missing required headers in row {header_row_1based}: {missing}. "
-                f"Headers actuales: {headers_raw}"
-            ),
-        )
-
-    return header_row_1based, headers_raw, headers_norm, values
-
-
-def _col_index(headers_norm: List[str], col_name: str) -> Optional[int]:
-    key = normalize(col_name)
-    return headers_norm.index(key) if key in headers_norm else None
-
-
-def _row_as_dict(headers_norm: List[str], row: List[Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for j, h in enumerate(headers_norm):
-        out[h] = row[j] if j < len(row) else ""
-    return out
-
-
-def _find_row_by_order_id(values: List[List[Any]], header_row_1based: int, col_order_id: int, order_id: str) -> Optional[int]:
-    oid_target = normalize(order_id)
-
-    start_idx_0 = header_row_1based  # 1-based -> idx 0-based
-    for i in range(start_idx_0, len(values)):
-        row = values[i]
-        oid = row[col_order_id] if col_order_id < len(row) else ""
-        if normalize(oid) == oid_target:
-            return i + 1
-    return None
-
-
-def _safe_str(v: Any) -> str:
-    return str(v if v is not None else "")
-
-
-# ---------------------------------
-# Public API
-# ---------------------------------
-
-def append_order_row(
-    orders_sh,
-    tenant_id: str,
-    order_id: str,
-    customer_name: str,
-    customer_contact: str,
-    items: List[Dict[str, Any]],
-    delivery_type: str,
-    requested_time: str,
-    status: str,
-    source: str,
-    total_amount: float,
-) -> None:
-    ws = _ensure_orders_ws(orders_sh)
-
-    required = [
-        "order_id", "created_at", "tenant_id", "customer_name", "customer_contact",
-        "items", "notes", "delivery_type", "requested_time", "status", "source", "total_amount",
-    ]
-    header_row, headers_raw, headers_norm, _values = _get_orders_header(ws, required=required)
-
-    payload_map: Dict[str, Any] = {
-        "order_id": order_id,
-        "created_at": now_iso_utc(),
-        "tenant_id": tenant_id,
-        "customer_name": customer_name,
-        "customer_contact": customer_contact,
-        "items": json.dumps(items, ensure_ascii=False),
-        "notes": "",
-        "delivery_type": delivery_type,
-        "requested_time": requested_time,
-        "status": status,
-        "source": source,
-        "total_amount": total_amount,
-
-        # opcionales (si existen como headers)
-        "payment_proof_file_id": "",
-        "payment_proof_type": "",
-        "payment_proof_caption": "",
-        "payment_confirmed_at": "",
-        "items_snapshot": "",
-        "currency": "",
-        "pricing_version": "",
-    }
-
-    row: List[Any] = []
-    for h_raw in headers_raw:
-        key = normalize(h_raw)
-        row.append(payload_map.get(key, ""))
-
-    try:
-        ws.append_row(row, value_input_option="USER_ENTERED")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed appending order row: {e}")
-
-
-def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, Any]:
-    ws = _ensure_orders_ws(orders_sh)
-
-    required = ["order_id", "status"]
-    header_row, headers_raw, headers_norm, values = _get_orders_header(ws, required=required)
-
-    col_order_id = headers_norm.index("order_id")
-    col_status = headers_norm.index("status")
-
-    found_row_1based = _find_row_by_order_id(values, header_row, col_order_id, order_id)
-    if not found_row_1based:
-        return {"found": False}
-
-    row_idx_0 = found_row_1based - 1
-    row = values[row_idx_0] if row_idx_0 < len(values) else []
-    old_status = row[col_status] if col_status < len(row) else ""
-
-    if normalize(old_status) == normalize(new_status):
-        return {
-            "found": True,
-            "old_status": old_status,
-            "row_1based": found_row_1based,
-            "already": True,
-        }
-
-    try:
-        ws.update_cell(found_row_1based, col_status + 1, new_status)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed updating status: {e}")
-
-    return {
-        "found": True,
-        "old_status": old_status,
-        "row_1based": found_row_1based,
-        "already": False,
-    }
-
-
-def get_order_by_id(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
-    ws = _ensure_orders_ws(orders_sh)
-
-    required = ["order_id", "tenant_id", "customer_name", "customer_contact", "items", "status", "total_amount"]
-    header_row, headers_raw, headers_norm, values = _get_orders_header(ws, required=required)
-
-    col_order_id = headers_norm.index("order_id")
-    found_row_1based = _find_row_by_order_id(values, header_row, col_order_id, order_id)
-    if not found_row_1based:
-        return None
-
-    row_idx_0 = found_row_1based - 1
-    row = values[row_idx_0] if row_idx_0 < len(values) else []
-    data = _row_as_dict(headers_norm, row)
-    data["_row_1based"] = found_row_1based
-    data["_header_row"] = header_row
-    return data
-
-
-def find_latest_pending_order_for_contact(
-    orders_sh,
-    customer_contact: str,
-    status: str = "PENDING_PAYMENT",
-) -> Optional[str]:
-    ws = _ensure_orders_ws(orders_sh)
-
-    required = ["order_id", "customer_contact", "status"]
-    header_row, headers_raw, headers_norm, values = _get_orders_header(ws, required=required)
-
-    col_oid = headers_norm.index("order_id")
-    col_contact = headers_norm.index("customer_contact")
-    col_status = headers_norm.index("status")
-
-    contact_target = normalize(str(customer_contact))
-    status_target = normalize(status)
-
-    for i in range(len(values) - 1, header_row - 1, -1):
-        row = values[i]
-        c = row[col_contact] if col_contact < len(row) else ""
-        s = row[col_status] if col_status < len(row) else ""
-        if normalize(_safe_str(c)) == contact_target and normalize(_safe_str(s)) == status_target:
-            oid = row[col_oid] if col_oid < len(row) else ""
-            return oid.strip() if oid else None
-
-    return None
-
-
-def update_order_payment_proof(
-    orders_sh,
-    order_id: str,
-    proof_file_id: str,
-    proof_type: str,
-    proof_caption: str = "",
-) -> Dict[str, Any]:
-    ws = _ensure_orders_ws(orders_sh)
-
-    required = ["order_id"]
-    header_row, headers_raw, headers_norm, values = _get_orders_header(ws, required=required)
-
-    col_oid = headers_norm.index("order_id")
-    col_file = _col_index(headers_norm, "payment_proof_file_id")
-    col_type = _col_index(headers_norm, "payment_proof_type")
-    col_cap = _col_index(headers_norm, "payment_proof_caption")
-
-    found_row_1based = _find_row_by_order_id(values, header_row, col_oid, order_id)
-    if not found_row_1based:
-        return {"found": False}
-
-    row_idx_0 = found_row_1based - 1
-    row = values[row_idx_0] if row_idx_0 < len(values) else []
-
-    def cur(col_idx: Optional[int]) -> str:
-        if col_idx is None:
-            return ""
-        return _safe_str(row[col_idx] if col_idx < len(row) else "")
-
-    cur_file = cur(col_file)
-    cur_type = cur(col_type)
-    cur_cap = cur(col_cap)
-
-    updates: List[Tuple[int, str]] = []
-    if col_file is not None and _safe_str(cur_file) != _safe_str(proof_file_id):
-        updates.append((col_file + 1, proof_file_id))
-    if col_type is not None and _safe_str(cur_type) != _safe_str(proof_type):
-        updates.append((col_type + 1, proof_type))
-    if col_cap is not None and _safe_str(cur_cap) != _safe_str(proof_caption):
-        updates.append((col_cap + 1, proof_caption))
-
-    if not updates:
-        return {"found": True, "row_1based": found_row_1based, "changed": False}
-
-    try:
-        data = []
-        for col_1based, value in updates:
-            a1 = ws.cell(found_row_1based, col_1based).address
-            data.append({"range": a1, "values": [[value]]})
-        ws.batch_update(data)
-    except Exception:
-        try:
-            for col_1based, value in updates:
-                ws.update_cell(found_row_1based, col_1based, value)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed updating payment proof: {e}")
-
-    return {"found": True, "row_1based": found_row_1based, "changed": True}
-
-
-# =========================================================
-# ✅ BACKWARD COMPATIBILITY (CLAVE)
-# =========================================================
-# Si algún archivo todavía importa append_order en vez de append_order_row,
-# no se rompe el deploy.
-append_order = append_order_row
+    return MarkPaidOut(
+        ok=True,
+        order_id=payload.order_id,
+        status="PAID",
+        old_status=old_status,
+        already_paid=already_paid,
+    )
