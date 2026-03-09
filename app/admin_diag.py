@@ -9,6 +9,11 @@ from fastapi import APIRouter, HTTPException, Query
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
 from app.tenants import get_tenant_or_404
 from app.utils import normalize
+from app.admin_settings import (
+    ADMIN_SETTINGS_SHEET_NAME,
+    REQUIRED_ADMIN_SETTINGS_HEADERS,
+    resolve_business_status_dict,
+)
 
 router = APIRouter(prefix="/admin/diag", tags=["admin"])
 
@@ -99,7 +104,14 @@ def _find_ws_by_name_or_headers(sh, preferred_title: str, required_headers: List
     try:
         ws = sh.worksheet(preferred_title)
         ok, header_row, headers_raw = _ws_has_headers(ws, required_headers=required_headers)
-        return {"found": True, "method": "by_name", "title": ws.title, "headers_ok": ok, "header_row": header_row, "headers_raw": headers_raw}
+        return {
+            "found": True,
+            "method": "by_name",
+            "title": ws.title,
+            "headers_ok": ok,
+            "header_row": header_row,
+            "headers_raw": headers_raw,
+        }
     except Exception:
         pass
 
@@ -107,7 +119,14 @@ def _find_ws_by_name_or_headers(sh, preferred_title: str, required_headers: List
         for ws in sh.worksheets():
             ok, header_row, headers_raw = _ws_has_headers(ws, required_headers=required_headers)
             if ok:
-                return {"found": True, "method": "by_headers", "title": ws.title, "headers_ok": True, "header_row": header_row, "headers_raw": headers_raw}
+                return {
+                    "found": True,
+                    "method": "by_headers",
+                    "title": ws.title,
+                    "headers_ok": True,
+                    "header_row": header_row,
+                    "headers_raw": headers_raw,
+                }
         return {"found": False, "method": "not_found"}
     except Exception as e:
         return {"found": False, "method": "error", "error": str(e)}
@@ -197,37 +216,59 @@ def tenant_full(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[st
         add(_check("tenant_id_normalization", "OK", "tenant_id consistente (raw vs normalizado)."))
 
     orders_enabled = bool(tenant.get("orders_enabled", False))
-    add(_check("orders_enabled", "OK" if orders_enabled else "WARN", f"orders_enabled={'true' if orders_enabled else 'false'}",
-               "Si este tenant debe vender, pon orders_enabled=TRUE." if not orders_enabled else ""))
+    add(_check(
+        "orders_enabled",
+        "OK" if orders_enabled else "WARN",
+        f"orders_enabled={'true' if orders_enabled else 'false'}",
+        "Si este tenant debe vender, pon orders_enabled=TRUE." if not orders_enabled else "",
+    ))
 
     admin_bot_token = (tenant.get("admin_bot_token") or "").strip()
     client_bot_token = (tenant.get("client_bot_token") or "").strip()
     secret_admin = (tenant.get("webhook_secret_admin") or "").strip()
     secret_client = (tenant.get("webhook_secret_client") or "").strip()
 
-    add(_check("admin_bot_token_present", "OK" if admin_bot_token else "FAIL",
-               "admin_bot_token presente." if admin_bot_token else "admin_bot_token missing.",
-               "Completa admin_bot_token en TENANTS." if not admin_bot_token else ""))
+    add(_check(
+        "admin_bot_token_present",
+        "OK" if admin_bot_token else "FAIL",
+        "admin_bot_token presente." if admin_bot_token else "admin_bot_token missing.",
+        "Completa admin_bot_token en TENANTS." if not admin_bot_token else "",
+    ))
 
-    add(_check("client_bot_token_present", "OK" if client_bot_token else "FAIL",
-               "client_bot_token presente." if client_bot_token else "client_bot_token missing.",
-               "Completa client_bot_token en TENANTS." if not client_bot_token else ""))
+    add(_check(
+        "client_bot_token_present",
+        "OK" if client_bot_token else "FAIL",
+        "client_bot_token presente." if client_bot_token else "client_bot_token missing.",
+        "Completa client_bot_token en TENANTS." if not client_bot_token else "",
+    ))
 
-    add(_check("webhook_secret_admin_present", "OK" if secret_admin else "FAIL",
-               "webhook_secret_admin presente." if secret_admin else "webhook_secret_admin missing.",
-               "Completa webhook_secret_admin en TENANTS." if not secret_admin else ""))
+    add(_check(
+        "webhook_secret_admin_present",
+        "OK" if secret_admin else "FAIL",
+        "webhook_secret_admin presente." if secret_admin else "webhook_secret_admin missing.",
+        "Completa webhook_secret_admin en TENANTS." if not secret_admin else "",
+    ))
 
-    add(_check("webhook_secret_client_present", "OK" if secret_client else "FAIL",
-               "webhook_secret_client presente." if secret_client else "webhook_secret_client missing.",
-               "Completa webhook_secret_client en TENANTS." if not secret_client else ""))
+    add(_check(
+        "webhook_secret_client_present",
+        "OK" if secret_client else "FAIL",
+        "webhook_secret_client presente." if secret_client else "webhook_secret_client missing.",
+        "Completa webhook_secret_client en TENANTS." if not secret_client else "",
+    ))
 
-    add(_check("admin_bot_token_shape", "OK" if (admin_bot_token and _is_token_shape_ok(admin_bot_token)) else ("WARN" if admin_bot_token else "WARN"),
-               "admin_bot_token parece correcto." if admin_bot_token else "Sin token para validar.",
-               "Verifica token BotFather." if (admin_bot_token and not _is_token_shape_ok(admin_bot_token)) else ""))
+    add(_check(
+        "admin_bot_token_shape",
+        "OK" if (admin_bot_token and _is_token_shape_ok(admin_bot_token)) else ("WARN" if admin_bot_token else "WARN"),
+        "admin_bot_token parece correcto." if admin_bot_token else "Sin token para validar.",
+        "Verifica token BotFather." if (admin_bot_token and not _is_token_shape_ok(admin_bot_token)) else "",
+    ))
 
-    add(_check("client_bot_token_shape", "OK" if (client_bot_token and _is_token_shape_ok(client_bot_token)) else ("WARN" if client_bot_token else "WARN"),
-               "client_bot_token parece correcto." if client_bot_token else "Sin token para validar.",
-               "Verifica token BotFather." if (client_bot_token and not _is_token_shape_ok(client_bot_token)) else ""))
+    add(_check(
+        "client_bot_token_shape",
+        "OK" if (client_bot_token and _is_token_shape_ok(client_bot_token)) else ("WARN" if client_bot_token else "WARN"),
+        "client_bot_token parece correcto." if client_bot_token else "Sin token para validar.",
+        "Verifica token BotFather." if (client_bot_token and not _is_token_shape_ok(client_bot_token)) else "",
+    ))
 
     admin_chat_id_raw = (tenant.get("admin_chat_id") or "").strip()
     if not admin_chat_id_raw:
@@ -240,7 +281,12 @@ def tenant_full(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[st
             add(_check("admin_chat_id_present", "FAIL", f"admin_chat_id no es numérico: '{admin_chat_id_raw}'", "Debe ser un número (chat_id Telegram)."))
 
     tz = (tenant.get("timezone") or "").strip()
-    add(_check("timezone_present", "OK" if tz else "WARN", f"timezone='{tz}'" if tz else "timezone vacío.", "Recomendado: America/La_Paz" if not tz else ""))
+    add(_check(
+        "timezone_present",
+        "OK" if tz else "WARN",
+        f"timezone='{tz}'" if tz else "timezone vacío.",
+        "Recomendado: America/La_Paz" if not tz else "",
+    ))
 
     orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
     if not orders_sheet_id:
@@ -256,11 +302,19 @@ def tenant_full(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[st
         add(_check("payment_qr_source", "OK", "QR por file_id (preferido)."))
     elif qr_url_norm:
         add(_check("payment_qr_source", "OK", "QR por URL pública."))
-        add(_check("payment_qr_url_format", "OK" if _is_drive_uc_url(qr_url_norm) else "WARN",
-                   "QR URL formato OK." if _is_drive_uc_url(qr_url_norm) else "QR URL no es drive uc?export=download&id=...",
-                   "Convierte a formato uc?export=download&id=<ID>." if not _is_drive_uc_url(qr_url_norm) else ""))
+        add(_check(
+            "payment_qr_url_format",
+            "OK" if _is_drive_uc_url(qr_url_norm) else "WARN",
+            "QR URL formato OK." if _is_drive_uc_url(qr_url_norm) else "QR URL no es drive uc?export=download&id=...",
+            "Convierte a formato uc?export=download&id=<ID>." if not _is_drive_uc_url(qr_url_norm) else "",
+        ))
     else:
-        add(_check("payment_qr_source", "WARN", "No hay QR configurado.", "Configura payment_qr_file_id o payment_qr_url/payment_qr_link en TENANTS."))
+        add(_check(
+            "payment_qr_source",
+            "WARN",
+            "No hay QR configurado.",
+            "Configura payment_qr_file_id o payment_qr_url/payment_qr_link en TENANTS.",
+        ))
 
     try:
         sh = open_spreadsheet_by_key(gc, orders_sheet_id)
@@ -271,28 +325,55 @@ def tenant_full(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[st
 
     orders_required = ["order_id", "created_at", "tenant_id", "customer_name", "customer_contact", "items", "status", "total_amount"]
     menu_required = ["sku", "name", "price", "active", "category"]
+    admin_settings_required = REQUIRED_ADMIN_SETTINGS_HEADERS
 
     orders_diag = _find_ws_by_name_or_headers(sh, "Orders", required_headers=orders_required)
     if not orders_diag.get("found"):
         add(_check("orders_ws_found", "FAIL", "Orders worksheet no encontrada.", "Crea 'Orders' o una hoja con esos headers."))
     else:
         add(_check("orders_ws_found", "OK", f"Orders encontrada: '{orders_diag.get('title')}' ({orders_diag.get('method')})."))
-        add(_check("orders_headers_ok", "OK" if orders_diag.get("headers_ok") else "FAIL",
-                   f"Headers Orders OK (fila {orders_diag.get('header_row')})." if orders_diag.get("headers_ok") else "Headers Orders incompletos.",
-                   "Revisa headers técnicos exactos." if not orders_diag.get("headers_ok") else ""))
+        add(_check(
+            "orders_headers_ok",
+            "OK" if orders_diag.get("headers_ok") else "FAIL",
+            f"Headers Orders OK (fila {orders_diag.get('header_row')})." if orders_diag.get("headers_ok") else "Headers Orders incompletos.",
+            "Revisa headers técnicos exactos." if not orders_diag.get("headers_ok") else "",
+        ))
 
     menu_diag = _find_ws_by_name_or_headers(sh, "Menu", required_headers=menu_required)
     if not menu_diag.get("found"):
         add(_check("menu_ws_found", "FAIL", "Menu worksheet no encontrada.", "Crea 'Menu' o una hoja con esos headers."))
     else:
         add(_check("menu_ws_found", "OK", f"Menu encontrada: '{menu_diag.get('title')}' ({menu_diag.get('method')})."))
-        add(_check("menu_headers_ok", "OK" if menu_diag.get("headers_ok") else "FAIL",
-                   f"Headers Menu OK (fila {menu_diag.get('header_row')})." if menu_diag.get("headers_ok") else "Headers Menu incompletos.",
-                   "Revisa headers técnicos exactos." if not menu_diag.get("headers_ok") else ""))
+        add(_check(
+            "menu_headers_ok",
+            "OK" if menu_diag.get("headers_ok") else "FAIL",
+            f"Headers Menu OK (fila {menu_diag.get('header_row')})." if menu_diag.get("headers_ok") else "Headers Menu incompletos.",
+            "Revisa headers técnicos exactos." if not menu_diag.get("headers_ok") else "",
+        ))
+
+    admin_settings_diag = _find_ws_by_name_or_headers(sh, ADMIN_SETTINGS_SHEET_NAME, required_headers=admin_settings_required)
+    if not admin_settings_diag.get("found"):
+        add(_check(
+            "admin_settings_ws_found",
+            "FAIL",
+            "AdminSettings worksheet no encontrada.",
+            "Crea 'AdminSettings' con headers: key,value,active,scope,updated_at,updated_by,notes",
+        ))
+    else:
+        add(_check(
+            "admin_settings_ws_found",
+            "OK",
+            f"AdminSettings encontrada: '{admin_settings_diag.get('title')}' ({admin_settings_diag.get('method')}).",
+        ))
+        add(_check(
+            "admin_settings_headers_ok",
+            "OK" if admin_settings_diag.get("headers_ok") else "FAIL",
+            f"Headers AdminSettings OK (fila {admin_settings_diag.get('header_row')})." if admin_settings_diag.get("headers_ok") else "Headers AdminSettings incompletos.",
+            "Revisa headers técnicos exactos." if not admin_settings_diag.get("headers_ok") else "",
+        ))
 
     ok = (summary["FAIL"] == 0)
 
-    # quick_fix sin duplicados
     seen = set()
     quick_fix = []
     for c in checks:
@@ -309,13 +390,44 @@ def tenant_full(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[st
         "blockers": blockers,
         "quick_fix": quick_fix[:20],
         "checks": checks,
-        "worksheets": {"orders": orders_diag, "menu": menu_diag},
+        "worksheets": {
+            "orders": orders_diag,
+            "menu": menu_diag,
+            "admin_settings": admin_settings_diag,
+        },
         "qr_debug": {
             "payment_qr_url_raw": qr_url_raw[:200],
             "payment_qr_url_normalized": qr_url_norm[:200],
             "payment_qr_url_is_drive_uc": _is_drive_uc_url(qr_url_norm),
             "payment_qr_file_id_present": bool(qr_file_id),
         },
+    }
+
+
+@router.get("/business_status")
+def business_status(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[str, Any]:
+    """
+    Diagnóstico operativo de negocio usando AdminSettings.
+    """
+    _require_admin_token(token)
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(tenant_id, gc=gc)
+
+    orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
+    if not orders_sheet_id:
+        raise HTTPException(status_code=500, detail="orders_sheet_id missing for tenant")
+
+    tenant_tz = (tenant.get("timezone") or "America/La_Paz").strip()
+    sh = open_spreadsheet_by_key(gc, orders_sheet_id)
+
+    data = resolve_business_status_dict(sh, tenant_tz=tenant_tz)
+
+    return {
+        "ok": True,
+        "tenant_id": tenant.get("tenant_id"),
+        "timezone": tenant_tz,
+        "business_status": data,
     }
 
 
