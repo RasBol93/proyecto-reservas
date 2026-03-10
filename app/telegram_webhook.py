@@ -20,20 +20,19 @@ from app.orders import (
     find_latest_pending_order_for_contact,
     get_order_by_id,
     gen_order_id,
-    build_items_snapshot,  # ✅ NUEVO
+    build_items_snapshot,
 )
 from app.telegram_keyboard import kb
 from app.utils import normalize, log_event
 
-# ✅ stats
 from app.stats import build_periods, resolve_period, build_stats_report_text, log_event_to_sheet
+from app.admin_settings import resolve_business_status
 
 router = APIRouter()
 
 # =========================================================
 # Estado en memoria (DEMO)
 # =========================================================
-# key: (tenant_id, chat_id) -> {"cart":[{"sku":..., "qty":...}], "stage":"...", "tmp": {...}}
 SESSIONS: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
 REMINDER_COOLDOWN_SECONDS = 5 * 60
@@ -138,7 +137,6 @@ def telegram_answer_callback(bot_token: str, callback_query_id: str, text: str =
         log_event("telegram_ack_exception", error=str(e))
 
 
-# ✅ NUEVO: Reply Keyboard (teclado fijo, NO inline)
 def reply_kb(button_rows: List[List[str]], resize: bool = True, one_time: bool = False) -> Dict[str, Any]:
     keyboard = [[{"text": txt} for txt in row] for row in button_rows]
     return {
@@ -207,7 +205,7 @@ def get_payment_qr_url(tenant: Dict[str, Any]) -> str:
 
 
 # -------------------------
-# Multipart helpers (reenviar bytes admin)
+# Multipart helpers
 # -------------------------
 
 def _multipart_encode(fields: Dict[str, str], file_field: str, filename: str, content_type: str, file_bytes: bytes) -> Tuple[bytes, str]:
@@ -284,10 +282,6 @@ def parse_items_field(items_field: Any) -> List[Dict[str, Any]]:
 
 
 def fmt_cart_lines(cart: List[Dict[str, Any]], menu_idx: Dict[str, Any]) -> Tuple[str, float, int]:
-    """
-    Estimado (depende del menú actual). Se usa solo para UI rápida.
-    Los totales reales quedan en items_snapshot + total_amount en Sheets.
-    """
     total_qty = 0
     lines = []
     items_for_total = []
@@ -314,9 +308,6 @@ def fmt_cart_lines(cart: List[Dict[str, Any]], menu_idx: Dict[str, Any]) -> Tupl
 
 
 def fmt_snapshot_lines(items_snapshot: List[Dict[str, Any]]) -> Tuple[str, float, int]:
-    """
-    REAL (congelado en la orden): usa unit_price + line_total del snapshot.
-    """
     total_qty = 0
     total = 0.0
     lines = []
@@ -368,7 +359,64 @@ def build_order_recap_text(
 
 
 # -------------------------
-# Forward proof to admin (clave)
+# Estado del negocio
+# -------------------------
+
+def _get_business_status_safe(orders_sh, tenant_tz: str) -> Dict[str, Any]:
+    try:
+        return resolve_business_status(orders_sh=orders_sh, tenant_tz=tenant_tz).__dict__
+    except Exception as e:
+        log_event("business_status_resolve_failed", error=str(e), tenant_tz=tenant_tz)
+        return {
+            "tenant_tz": tenant_tz,
+            "now_local_iso": "",
+            "today_weekday_code": "",
+            "is_open_today": True,
+            "accepts_orders_now": True,
+            "open_time": "",
+            "close_time": "",
+            "last_order_time": "",
+            "weekly_open_days": [],
+            "today_closed": False,
+            "has_open_override": False,
+            "has_close_override": False,
+            "has_last_order_override": False,
+            "public_message": "",
+        }
+
+
+def _business_block_message(bs: Dict[str, Any]) -> str:
+    public_message = str(bs.get("public_message") or "").strip()
+    if public_message:
+        return public_message
+
+    if bs.get("today_closed"):
+        return "Hoy no estamos atendiendo."
+    if bs.get("is_open_today") and not bs.get("accepts_orders_now"):
+        last_order_time = str(bs.get("last_order_time") or "").strip()
+        if last_order_time:
+            return f"Por hoy ya no estamos tomando pedidos. La última hora de pedido era {last_order_time}."
+        return "Por hoy ya no estamos tomando pedidos."
+
+    return "En este momento no estamos aceptando pedidos."
+
+
+def _send_business_blocked(bot_token: str, chat_id: int, bs: Dict[str, Any]) -> None:
+    msg = _business_block_message(bs)
+    telegram_send_text(bot_token, chat_id, f"⛔ {msg}")
+
+
+def _client_orders_allowed_or_notify(bot_token: str, chat_id: int, orders_sh, tenant_tz: str) -> bool:
+    bs = _get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
+    if bool(bs.get("accepts_orders_now")):
+        return True
+
+    _send_business_blocked(bot_token, chat_id, bs)
+    return False
+
+
+# -------------------------
+# Forward proof to admin
 # -------------------------
 
 def _forward_proof_to_admin(
@@ -449,13 +497,11 @@ def notify_admin_payment_reported(
         telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
         return False
 
-    # ✅ preferir snapshot real
     items_snapshot = parse_items_field(order.get("items_snapshot"))
     if items_snapshot:
         lines_txt, snapshot_total, total_qty = fmt_snapshot_lines(items_snapshot)
         total = snapshot_total
     else:
-        # fallback: items + menú actual (estimado)
         try:
             menu_idx = load_menu_index(orders_sh)
         except Exception as e:
@@ -468,7 +514,6 @@ def notify_admin_payment_reported(
         except Exception:
             total = 0.0
 
-    # proof
     proof_file_id = (order.get("payment_proof_file_id") or "").strip()
     proof_type = (order.get("payment_proof_type") or "").strip()
     proof_caption = (order.get("payment_proof_caption") or "").strip()
@@ -497,12 +542,19 @@ def notify_admin_payment_reported(
     else:
         log_event("admin_missing_proof", tenant_id=tenant_id, order_id=order_id)
 
-    log_event("admin_notify_result", tenant_id=tenant_id, order_id=order_id, ok_txt=bool(ok_txt), ok_proof=bool(ok_proof), is_reminder=bool(is_reminder))
+    log_event(
+        "admin_notify_result",
+        tenant_id=tenant_id,
+        order_id=order_id,
+        ok_txt=bool(ok_txt),
+        ok_proof=bool(ok_proof),
+        is_reminder=bool(is_reminder),
+    )
     return bool(ok_txt)
 
 
 # -------------------------
-# Client keyboards (INLINE)
+# Client keyboards
 # -------------------------
 
 def client_home_kb() -> Dict[str, Any]:
@@ -543,14 +595,12 @@ def contact_admin_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
     ])
 
 
-# ✅ ADMIN: teclado FIJO (reply keyboard)
 def admin_fixed_kb() -> Dict[str, Any]:
     return reply_kb([
         ["📊 Estadísticas"],
     ], resize=True, one_time=False)
 
 
-# ✅ ADMIN: selector de períodos (INLINE)
 def admin_periods_inline_kb(tenant_id: str, periods: List[Tuple[str, str]]) -> Dict[str, Any]:
     rows = []
     for label, key in periods:
@@ -631,9 +681,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         if cb_id:
             telegram_answer_callback(bot_token, cb_id, "OK")
 
-        # -------------------------
-        # ADMIN: confirmar pago
-        # -------------------------
         if mode == "admin" and data.startswith("paid|"):
             parts = data.split("|")
             if len(parts) != 3:
@@ -666,7 +713,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             return {"ok": True}
 
-        # ✅ ADMIN: períodos stats (INLINE)
         if mode == "admin" and data.startswith("admin_stats_period|"):
             parts = data.split("|")
             if len(parts) != 3:
@@ -686,9 +732,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             telegram_send_text(bot_token, chat_id, txt, reply_markup=admin_fixed_kb())
             return {"ok": True}
 
-        # -------------------------
-        # CLIENT callbacks (MENÚ COMPLETO + PAGO)
-        # -------------------------
         if mode == "client":
             sess = get_sess(tenant_id, chat_id)
             tmp = sess.get("tmp") or {}
@@ -699,6 +742,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 return {"ok": True}
 
             if data == "menu":
+                if not _client_orders_allowed_or_notify(bot_token, chat_id, orders_sh, tenant_tz):
+                    return {"ok": True}
+
                 menu_idx = load_menu_index(orders_sh)
                 cats = group_menu_by_category(menu_idx)
 
@@ -716,6 +762,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 return {"ok": True}
 
             if data.startswith("cat|"):
+                if not _client_orders_allowed_or_notify(bot_token, chat_id, orders_sh, tenant_tz):
+                    return {"ok": True}
+
                 cat_norm = data.split("|", 1)[1].strip()
 
                 menu_idx = load_menu_index(orders_sh)
@@ -747,6 +796,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 return {"ok": True}
 
             if data.startswith("prd|"):
+                if not _client_orders_allowed_or_notify(bot_token, chat_id, orders_sh, tenant_tz):
+                    return {"ok": True}
+
                 sku = data.split("|", 1)[1].strip()
                 rows = [
                     [("1", f"qty|{sku}|1"), ("2", f"qty|{sku}|2"), ("3", f"qty|{sku}|3"), ("4", f"qty|{sku}|4")],
@@ -758,6 +810,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 return {"ok": True}
 
             if data.startswith("qty|"):
+                if not _client_orders_allowed_or_notify(bot_token, chat_id, orders_sh, tenant_tz):
+                    return {"ok": True}
+
                 parts = data.split("|")
                 if len(parts) != 3:
                     return {"ok": True}
@@ -823,6 +878,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 return {"ok": True}
 
             if data == "cart_confirm":
+                if not _client_orders_allowed_or_notify(bot_token, chat_id, orders_sh, tenant_tz):
+                    return {"ok": True}
+
                 cart = sess.get("cart") or []
                 if not cart:
                     telegram_send_text(bot_token, chat_id, "Tu carrito está vacío.", reply_markup=client_home_kb())
@@ -967,7 +1025,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         return {"ok": True}
 
     # =========================================================
-    # 2) MENSAJE NORMAL (texto + media)
+    # 2) MENSAJE NORMAL
     # =========================================================
     msg = update.get("message") or update.get("edited_message")
     if msg:
@@ -981,7 +1039,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             telegram_send_text(bot_token, chat_id, f"chat_id = {chat_id}")
             return {"ok": True}
 
-        # CLIENT: upload proof (foto o PDF)
         if mode == "client":
             sess = get_sess(tenant_id, chat_id)
 
@@ -1030,7 +1087,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             if normalize(text) in ("start", "/start", "hola"):
                 clear_sess(tenant_id, chat_id)
 
-                # métricas: conversación iniciada
                 log_event_to_sheet(
                     orders_sh=orders_sh,
                     tenant_id=tenant_id,
@@ -1039,11 +1095,19 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     meta={"source": "telegram", "text": text[:50]},
                 )
 
+                bs = _get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
+                if not bool(bs.get("accepts_orders_now")):
+                    _send_business_blocked(bot_token, chat_id, bs)
+                    return {"ok": True}
+
                 telegram_send_text(bot_token, chat_id, "Bienvenido 👋\nElige una opción:", client_home_kb())
                 return {"ok": True}
 
-            # Captura nombre (confirmación carrito)
             if sess.get("stage") == "awaiting_name":
+                if not _client_orders_allowed_or_notify(bot_token, chat_id, orders_sh, tenant_tz):
+                    sess["stage"] = "idle"
+                    return {"ok": True}
+
                 customer_name = text.strip()
                 if not customer_name:
                     telegram_send_text(bot_token, chat_id, "Dime tu nombre, por favor.")
@@ -1052,7 +1116,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 menu_idx = load_menu_index(orders_sh)
                 cart = sess.get("cart") or []
 
-                # Normaliza cart a [{"sku":..., "qty": int}]
                 items_list: List[Dict[str, Any]] = []
                 for it in cart:
                     sku = str(it.get("sku") or "").strip()
@@ -1071,14 +1134,12 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     sess["stage"] = "idle"
                     return {"ok": True}
 
-                # ✅ Snapshot REAL (congelado)
                 items_snapshot = build_items_snapshot(items_list, menu_idx)
                 lines_real, total_real, total_qty_real = fmt_snapshot_lines(items_snapshot)
 
                 order_id = gen_order_id()
                 requested_time = "pendiente"
 
-                # ✅ guarda orden con snapshot + total real
                 append_order_row(
                     orders_sh=orders_sh,
                     tenant_id=tenant_id,
@@ -1141,7 +1202,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             telegram_send_text(bot_token, chat_id, "Usa /start para ver el menú.", reply_markup=client_home_kb())
             return {"ok": True}
 
-        # ADMIN: aquí vive el botón fijo
         if mode == "admin":
             if normalize(text) in ("📊 estadisticas", "estadisticas", "/stats", "stats"):
                 _assert_admin_authorized(tenant, chat_id, tenant_id)
