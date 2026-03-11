@@ -598,6 +598,8 @@ def contact_admin_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
 def admin_fixed_kb() -> Dict[str, Any]:
     return reply_kb([
         ["📊 Estadísticas"],
+        ["⚙️ Config días y horarios"],
+        ["⚙️ Config menú y precios"],
     ], resize=True, one_time=False)
 
 
@@ -1203,7 +1205,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             return {"ok": True}
 
         if mode == "admin":
-            if normalize(text) in ("📊 estadisticas", "estadisticas", "/stats", "stats"):
+            txt_norm = normalize(text)
+
+            if txt_norm in ("📊 estadisticas", "estadisticas", "/stats", "stats"):
                 _assert_admin_authorized(tenant, chat_id, tenant_id)
                 periods = build_periods(tenant_tz)
                 telegram_send_text(
@@ -1215,7 +1219,87 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
                 return {"ok": True}
 
-            if normalize(text) in ("start", "/start", "hola"):
+            if txt_norm in (
+                "⚙️ config dias y horarios",
+                "config dias y horarios",
+                "dias y horarios",
+                "configuracion dias y horarios",
+                "configuracion de dias y horarios",
+            ):
+                _assert_admin_authorized(tenant, chat_id, tenant_id)
+
+                bs = _get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
+                status_txt = "ABIERTO" if bs.get("accepts_orders_now") else "CERRADO / NO DISPONIBLE"
+
+                msg = (
+                    "⚙️ CONFIG DÍAS Y HORARIOS\n\n"
+                    f"Estado actual: {status_txt}\n"
+                    f"Abre hoy: {'Sí' if bs.get('is_open_today') else 'No'}\n"
+                    f"Acepta pedidos ahora: {'Sí' if bs.get('accepts_orders_now') else 'No'}\n"
+                    f"Hora apertura: {bs.get('open_time') or '-'}\n"
+                    f"Hora cierre: {bs.get('close_time') or '-'}\n"
+                    f"Última hora de pedido: {bs.get('last_order_time') or '-'}\n"
+                    f"Días semanales abiertos: {', '.join(bs.get('weekly_open_days') or []) or '-'}\n"
+                    f"today_closed: {'TRUE' if bs.get('today_closed') else 'FALSE'}\n"
+                    f"Override apertura: {'Sí' if bs.get('has_open_override') else 'No'}\n"
+                    f"Override cierre: {'Sí' if bs.get('has_close_override') else 'No'}\n"
+                    f"Override última hora pedido: {'Sí' if bs.get('has_last_order_override') else 'No'}\n"
+                )
+
+                public_message = str(bs.get("public_message") or "").strip()
+                if public_message:
+                    msg += f"\nMensaje público actual:\n{public_message}"
+
+                msg += "\n\nPróximo paso: aquí construiremos los botones para abrir/cerrar hoy y modificar horarios."
+
+                telegram_send_text(bot_token, chat_id, msg, reply_markup=admin_fixed_kb())
+                return {"ok": True}
+
+            if txt_norm in (
+                "⚙️ config menu y precios",
+                "config menu y precios",
+                "menu y precios",
+                "menú y precios",
+                "configuracion menu y precios",
+                "configuracion de menu y precios",
+            ):
+                _assert_admin_authorized(tenant, chat_id, tenant_id)
+
+                try:
+                    menu_idx = load_menu_index(orders_sh)
+                    cats = group_menu_by_category(menu_idx)
+                except Exception as e:
+                    log_event("admin_menu_panel_load_failed", tenant_id=tenant_id, error=str(e))
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "No pude cargar el menú actual.",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                total_products = len(menu_idx)
+                total_categories = len(cats)
+
+                lines = []
+                for cat, items in cats.items():
+                    lines.append(f"- {cat}: {len(items)} producto(s)")
+
+                detail = "\n".join(lines) if lines else "- Sin categorías"
+
+                msg = (
+                    "⚙️ CONFIG MENÚ Y PRECIOS\n\n"
+                    f"Productos activos: {total_products}\n"
+                    f"Categorías activas: {total_categories}\n\n"
+                    "Resumen por categoría:\n"
+                    f"{detail}\n\n"
+                    "Próximo paso: aquí construiremos la navegación para ver productos, precios y activar/desactivar."
+                )
+
+                telegram_send_text(bot_token, chat_id, msg, reply_markup=admin_fixed_kb())
+                return {"ok": True}
+
+            if txt_norm in ("start", "/start", "hola"):
                 telegram_send_text(bot_token, chat_id, "Admin bot listo ✅", reply_markup=admin_fixed_kb())
                 return {"ok": True}
 
