@@ -6,7 +6,7 @@ import time
 
 from fastapi import HTTPException
 
-from app.sheets import get_ws, read_records_manual
+from app.sheets import get_ws, read_records_manual, detect_header_row
 from app.utils import to_bool, normalize, log_event
 
 
@@ -15,6 +15,8 @@ REQUIRED_MENU_HEADERS = ["sku", "name", "price", "active", "category"]
 # Cache simple por spreadsheet (reduce hits a Sheets)
 # key -> (ts_epoch, idx)
 _MENU_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
+_MENU_ADMIN_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
+
 MENU_CACHE_TTL_SECONDS = 90  # 1.5 min
 
 
@@ -67,17 +69,14 @@ def _parse_price(value: Any) -> Optional[float]:
       - "12,5"
       - " 12,50 "
       - "12 Bs" / "Bs 12" / "12 BOB"
-      - "12.000" (ojo: esto puede ser doce mil o doce; aquí se interpretará como 12.0 si no hay decimales)
+      - "12.000" (aquí se interpreta como el primer número válido)
     Regla: toma el PRIMER número encontrado.
     """
     s = str(value or "").strip()
     if not s:
         return None
 
-    # normalizar separador decimal
     s = s.replace(",", ".")
-
-    # extraer primer número tipo float
     m = re.search(r"(\d+(?:\.\d+)?)", s)
     if not m:
         return None
@@ -86,6 +85,23 @@ def _parse_price(value: Any) -> Optional[float]:
         return float(m.group(1))
     except Exception:
         return None
+
+
+def _format_price_for_sheet(value: float) -> str:
+    try:
+        n = round(float(value), 2)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid price")
+
+    if n < 0:
+        raise HTTPException(status_code=422, detail="price must be >= 0")
+
+    s = f"{n:.2f}"
+    if s.endswith("00"):
+        return str(int(round(n)))
+    if s.endswith("0"):
+        return s[:-1]
+    return s
 
 
 def _cache_key_for_orders_sh(orders_sh) -> str:
@@ -101,9 +117,9 @@ def _cache_key_for_orders_sh(orders_sh) -> str:
     return str(id(orders_sh))
 
 
-def _cache_get(cache_key: str) -> Optional[Dict[str, Dict[str, Any]]]:
+def _cache_get(cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]], cache_key: str) -> Optional[Dict[str, Dict[str, Any]]]:
     now = time.time()
-    v = _MENU_CACHE.get(cache_key)
+    v = cache.get(cache_key)
     if not v:
         return None
     ts, idx = v
@@ -112,49 +128,29 @@ def _cache_get(cache_key: str) -> Optional[Dict[str, Dict[str, Any]]]:
     return None
 
 
-def _cache_set(cache_key: str, idx: Dict[str, Dict[str, Any]]) -> None:
-    _MENU_CACHE[cache_key] = (time.time(), idx)
+def _cache_set(cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]], cache_key: str, idx: Dict[str, Dict[str, Any]]) -> None:
+    cache[cache_key] = (time.time(), idx)
 
 
-def _cache_invalidate(cache_key: str) -> None:
-    if cache_key in _MENU_CACHE:
-        del _MENU_CACHE[cache_key]
+def _cache_invalidate(cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]], cache_key: str) -> None:
+    if cache_key in cache:
+        del cache[cache_key]
 
 
-# -------------------------
-# Public API
-# -------------------------
-
-def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]:
-    """
-    Lee el menú del sheet del tenant.
-
-    Estrategia robusta:
-    1) intenta abrir la pestaña "Menu"
-    2) si no existe, busca cualquier pestaña que contenga los headers técnicos:
-       sku, name, price, active, category
-
-    Devuelve un índice: sku -> {sku, name, price, category}
-    (solo active=TRUE)
-    """
+def invalidate_menu_cache(orders_sh) -> None:
     ck = _cache_key_for_orders_sh(orders_sh)
+    _cache_invalidate(_MENU_CACHE, ck)
+    _cache_invalidate(_MENU_ADMIN_CACHE, ck)
 
-    if not force:
-        cached = _cache_get(ck)
-        if cached is not None:
-            return cached
-    else:
-        _cache_invalidate(ck)
 
+def _get_menu_ws(orders_sh):
     ws = None
 
-    # 1) Camino rápido (nombre estándar)
     try:
         ws = get_ws(orders_sh, "Menu")
     except Exception:
         ws = None
 
-    # 2) Fallback robusto (por headers)
     if ws is None:
         ws = _find_menu_ws_by_headers(orders_sh)
         if ws is not None:
@@ -169,6 +165,64 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
             detail="Menu worksheet not found. Expected a tab named 'Menu' or any tab with headers: sku,name,price,active,category",
         )
 
+    return ws
+
+
+def _get_menu_context(orders_sh) -> Dict[str, Any]:
+    ws = _get_menu_ws(orders_sh)
+
+    try:
+        values = ws.get_all_values()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Cannot read Menu worksheet: {e}")
+
+    if not values:
+        raise HTTPException(status_code=500, detail="Menu worksheet is empty")
+
+    header_row_1based = detect_header_row(values, required_headers=REQUIRED_MENU_HEADERS, max_scan=10)
+    headers_raw = values[header_row_1based - 1]
+    headers_norm = [normalize(h) for h in headers_raw]
+
+    idx_map: Dict[str, int] = {}
+    for i, h in enumerate(headers_norm):
+        if h and h not in idx_map:
+            idx_map[h] = i
+
+    for req in REQUIRED_MENU_HEADERS:
+        if normalize(req) not in idx_map:
+            raise HTTPException(status_code=500, detail=f"Missing required Menu header: {req}")
+
+    return {
+        "ws": ws,
+        "values": values,
+        "header_row_1based": header_row_1based,
+        "headers_raw": headers_raw,
+        "headers_norm": headers_norm,
+        "idx_map": idx_map,
+    }
+
+
+# -------------------------
+# Public API (cliente)
+# -------------------------
+
+def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]:
+    """
+    Lee el menú del sheet del tenant.
+
+    Devuelve un índice SOLO de productos activos:
+      sku -> {sku, name, price, category}
+    """
+    ck = _cache_key_for_orders_sh(orders_sh)
+
+    if not force:
+        cached = _cache_get(_MENU_CACHE, ck)
+        if cached is not None:
+            return cached
+    else:
+        _cache_invalidate(_MENU_CACHE, ck)
+
+    ws = _get_menu_ws(orders_sh)
     rows = read_records_manual(ws, required_headers=REQUIRED_MENU_HEADERS)
 
     idx: Dict[str, Dict[str, Any]] = {}
@@ -220,9 +274,8 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
             "category": category,
         }
 
-    _cache_set(ck, idx)
+    _cache_set(_MENU_CACHE, ck, idx)
 
-    # Log compacto para diagnóstico (no rompe si falla)
     try:
         log_event(
             "menu_loaded",
@@ -278,3 +331,190 @@ def calc_total_amount(items: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str,
         total += float(menu_idx[sku]["price"]) * qty_i
 
     return round(total, 2)
+
+
+# -------------------------
+# Public API (admin)
+# -------------------------
+
+def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]:
+    """
+    Lee TODO el menú, incluyendo activos e inactivos.
+
+    Devuelve:
+      sku -> {
+        sku, name, price, category, active, row_index
+      }
+    """
+    ck = _cache_key_for_orders_sh(orders_sh)
+
+    if not force:
+        cached = _cache_get(_MENU_ADMIN_CACHE, ck)
+        if cached is not None:
+            return cached
+    else:
+        _cache_invalidate(_MENU_ADMIN_CACHE, ck)
+
+    ctx = _get_menu_context(orders_sh)
+    ws = ctx["ws"]
+    values = ctx["values"]
+    header_row_1based = ctx["header_row_1based"]
+    idx_map = ctx["idx_map"]
+
+    idx: Dict[str, Dict[str, Any]] = {}
+    stats = {
+        "rows_in": 0,
+        "skipped_no_sku": 0,
+        "bad_price": 0,
+        "duplicates": 0,
+        "active_true": 0,
+        "active_false": 0,
+    }
+
+    for ridx in range(header_row_1based + 1, len(values) + 1):
+        row = values[ridx - 1]
+        if not any(str(x).strip() for x in row):
+            continue
+
+        stats["rows_in"] += 1
+
+        def g(col_name: str) -> str:
+            i = idx_map.get(normalize(col_name))
+            if i is None:
+                return ""
+            return row[i] if i < len(row) else ""
+
+        sku = str(g("sku") or "").strip()
+        if not sku:
+            stats["skipped_no_sku"] += 1
+            continue
+
+        active = to_bool(g("active"))
+        if active:
+            stats["active_true"] += 1
+        else:
+            stats["active_false"] += 1
+
+        price = _parse_price(g("price"))
+        if price is None:
+            stats["bad_price"] += 1
+            price = 0.0
+
+        name = str(g("name") or "").strip()
+        category = str(g("category") or "").strip() or "Otros"
+
+        if sku in idx:
+            stats["duplicates"] += 1
+
+        idx[sku] = {
+            "sku": sku,
+            "name": name,
+            "price": float(price),
+            "category": category,
+            "active": bool(active),
+            "row_index": ridx,
+        }
+
+    _cache_set(_MENU_ADMIN_CACHE, ck, idx)
+
+    try:
+        log_event(
+            "menu_admin_loaded",
+            worksheet_title=getattr(ws, "title", "unknown"),
+            items=len(idx),
+            stats=stats,
+            ttl_seconds=MENU_CACHE_TTL_SECONDS,
+        )
+    except Exception:
+        pass
+
+    return idx
+
+
+def group_menu_admin_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    cats: Dict[str, List[Dict[str, Any]]] = {}
+
+    for item in menu_idx.values():
+        cat = item.get("category", "") or "Otros"
+        cats.setdefault(cat, []).append(
+            {
+                "sku": item["sku"],
+                "name": item.get("name", ""),
+                "price": item.get("price", 0),
+                "category": cat,
+                "active": bool(item.get("active", False)),
+                "row_index": item.get("row_index"),
+            }
+        )
+
+    for cat in cats:
+        cats[cat] = sorted(cats[cat], key=lambda x: normalize(x.get("name", "")))
+
+    return cats
+
+
+def get_menu_product_or_404(orders_sh, sku: str) -> Dict[str, Any]:
+    sku = str(sku or "").strip()
+    if not sku:
+        raise HTTPException(status_code=400, detail="sku is required")
+
+    idx = load_menu_admin_index(orders_sh, force=False)
+    item = idx.get(sku)
+
+    if item:
+        return item
+
+    idx = load_menu_admin_index(orders_sh, force=True)
+    item = idx.get(sku)
+    if not item:
+        raise HTTPException(status_code=404, detail=f"Product not found: {sku}")
+    return item
+
+
+def set_menu_product_active(orders_sh, sku: str, is_active: bool) -> Dict[str, Any]:
+    item = get_menu_product_or_404(orders_sh, sku)
+    ctx = _get_menu_context(orders_sh)
+    ws = ctx["ws"]
+    idx_map = ctx["idx_map"]
+
+    active_col_idx0 = idx_map.get("active")
+    if active_col_idx0 is None:
+        raise HTTPException(status_code=500, detail="Missing 'active' column in Menu")
+
+    row_index = int(item["row_index"])
+    ws.update_cell(row_index, active_col_idx0 + 1, "TRUE" if is_active else "FALSE")
+
+    invalidate_menu_cache(orders_sh)
+
+    try:
+        log_event("menu_product_active_updated", sku=sku, active=bool(is_active), row_index=row_index)
+    except Exception:
+        pass
+
+    updated = get_menu_product_or_404(orders_sh, sku)
+    return {"ok": True, "sku": sku, "active": bool(updated.get("active", False))}
+
+
+def set_menu_product_price(orders_sh, sku: str, new_price: float) -> Dict[str, Any]:
+    item = get_menu_product_or_404(orders_sh, sku)
+    ctx = _get_menu_context(orders_sh)
+    ws = ctx["ws"]
+    idx_map = ctx["idx_map"]
+
+    price_col_idx0 = idx_map.get("price")
+    if price_col_idx0 is None:
+        raise HTTPException(status_code=500, detail="Missing 'price' column in Menu")
+
+    price_str = _format_price_for_sheet(new_price)
+    row_index = int(item["row_index"])
+    ws.update_cell(row_index, price_col_idx0 + 1, price_str)
+
+    invalidate_menu_cache(orders_sh)
+
+    try:
+        log_event("menu_product_price_updated", sku=sku, price=price_str, row_index=row_index)
+    except Exception:
+        pass
+
+    updated = get_menu_product_or_404(orders_sh, sku)
+    return {"ok": True, "sku": sku, "price": float(updated.get("price", 0.0))}
