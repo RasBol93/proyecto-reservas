@@ -5,7 +5,6 @@ import re
 import time
 import urllib.request
 import urllib.parse
-from datetime import datetime
 from typing import Any, Dict, Optional, List, Tuple, Set
 
 from fastapi import APIRouter, HTTPException
@@ -13,7 +12,17 @@ from fastapi import APIRouter, HTTPException
 from app.config import TELEGRAM_API_BASE
 from app.tenants import get_tenant_or_404, resolve_bot_by_secret
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
-from app.menu import load_menu_index, group_menu_by_category, calc_total_amount
+from app.menu import (
+    load_menu_index,
+    group_menu_by_category,
+    calc_total_amount,
+    load_menu_admin_index,
+    group_menu_admin_by_category,
+    get_menu_product_or_404,
+    set_menu_product_active,
+    set_menu_product_price,
+    invalidate_menu_cache,
+)
 from app.orders import (
     append_order_row,
     update_order_status,
@@ -51,6 +60,15 @@ DAY_LABELS = {
 }
 
 ADMIN_SETTINGS_SHEET_NAME = "AdminSettings"
+
+PRICE_STEP_OPTIONS: List[Tuple[str, float]] = [
+    ("-10", -10.0),
+    ("-5", -5.0),
+    ("-1", -1.0),
+    ("+1", 1.0),
+    ("+5", 5.0),
+    ("+10", 10.0),
+]
 
 
 def get_sess(tenant_id: str, chat_id: int) -> Dict[str, Any]:
@@ -372,6 +390,19 @@ def build_order_recap_text(
     )
 
 
+def _fmt_price_short(v: Any) -> str:
+    try:
+        n = round(float(v), 2)
+    except Exception:
+        return "0"
+    s = f"{n:.2f}"
+    if s.endswith("00"):
+        return str(int(round(n)))
+    if s.endswith("0"):
+        return s[:-1]
+    return s
+
+
 # -------------------------
 # Estado del negocio
 # -------------------------
@@ -451,7 +482,7 @@ def _admin_headers_map(ws) -> Dict[str, int]:
     for i, h in enumerate(header):
         k = normalize(h)
         if k and k not in out:
-            out[k] = i + 1  # 1-based
+            out[k] = i + 1
     return out
 
 
@@ -862,6 +893,210 @@ def _send_admin_late_open_menu(bot_token: str, chat_id: int, tenant_id: str) -> 
         msg,
         reply_markup=_time_grid_kb(prefix="lateopen", tenant_id=tenant_id, back_action="menu"),
     )
+
+
+# -------------------------
+# Admin menú y precios helpers
+# -------------------------
+
+def _admin_menu_home_kb(tenant_id: str, cats: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    cat_names = sorted(cats.keys(), key=lambda x: normalize(x))
+    rows: List[List[Tuple[str, str]]] = []
+
+    for idx, cat in enumerate(cat_names):
+        items = cats.get(cat, [])
+        total_n = len(items)
+        active_n = sum(1 for it in items if bool(it.get("active", False)))
+        rows.append([(f"📂 {cat} ({active_n}/{total_n})", f"admmenu|{tenant_id}|cat|{idx}")])
+
+    rows.append([("🔄 Refrescar menú", f"admmenu|{tenant_id}|refresh")])
+    rows.append([("⬅️ Volver al panel", f"admmenu|{tenant_id}|panel")])
+    return kb(rows)
+
+
+def _send_admin_menu_home(bot_token: str, chat_id: int, tenant_id: str, orders_sh, sess: Dict[str, Any]) -> bool:
+    menu_idx = load_menu_admin_index(orders_sh, force=False)
+    cats = group_menu_admin_by_category(menu_idx)
+    cat_names = sorted(cats.keys(), key=lambda x: normalize(x))
+
+    sess.setdefault("tmp", {})["admin_menu_categories"] = cat_names
+    sess["tmp"].pop("admin_menu_current_category", None)
+    sess["tmp"].pop("admin_menu_price_sku", None)
+    sess["tmp"].pop("admin_menu_price_work", None)
+
+    total_products = len(menu_idx)
+    total_active = sum(1 for v in menu_idx.values() if bool(v.get("active", False)))
+    total_categories = len(cats)
+
+    msg = (
+        "⚙️ CONFIG MENÚ Y PRECIOS\n\n"
+        f"Productos totales: {total_products}\n"
+        f"Productos activos: {total_active}\n"
+        f"Categorías: {total_categories}\n\n"
+        "Elige una categoría:"
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=_admin_menu_home_kb(tenant_id, cats),
+    )
+
+
+def _admin_menu_category_kb(tenant_id: str, category: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    for it in items[:25]:
+        emoji = "🟢" if bool(it.get("active", False)) else "🔴"
+        price_txt = _fmt_price_short(it.get("price", 0))
+        sku = str(it.get("sku") or "").strip()
+        rows.append([(f"{emoji} {it.get('name','')} — Bs {price_txt}", f"admmenu|{tenant_id}|prd|{sku}")])
+
+    rows.append([("🔄 Refrescar categoría", f"admmenu|{tenant_id}|catrefresh")])
+    rows.append([("⬅️ Categorías", f"admmenu|{tenant_id}|home")])
+
+    return kb(rows)
+
+
+def _send_admin_menu_category(bot_token: str, chat_id: int, tenant_id: str, orders_sh, sess: Dict[str, Any], category: str) -> bool:
+    menu_idx = load_menu_admin_index(orders_sh, force=False)
+    cats = group_menu_admin_by_category(menu_idx)
+    items = cats.get(category, [])
+
+    sess.setdefault("tmp", {})["admin_menu_current_category"] = category
+    sess["tmp"].pop("admin_menu_price_sku", None)
+    sess["tmp"].pop("admin_menu_price_work", None)
+
+    total_n = len(items)
+    active_n = sum(1 for it in items if bool(it.get("active", False)))
+
+    msg = (
+        f"📂 CATEGORÍA: {category}\n\n"
+        f"Productos: {total_n}\n"
+        f"Activos: {active_n}\n"
+        f"Inactivos: {max(0, total_n - active_n)}\n\n"
+        "Elige un producto:"
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=_admin_menu_category_kb(tenant_id, category, items),
+    )
+
+
+def _admin_menu_product_kb(tenant_id: str, sku: str, active: bool) -> Dict[str, Any]:
+    toggle_label = "⛔ Desactivar" if active else "✅ Activar"
+
+    return kb([
+        [(toggle_label, f"admmenu|{tenant_id}|toggle|{sku}")],
+        [("💲 Ajustar precio", f"admmenu|{tenant_id}|price|{sku}")],
+        [("⬅️ Volver a categoría", f"admmenu|{tenant_id}|catback")],
+        [("🏠 Categorías", f"admmenu|{tenant_id}|home")],
+    ])
+
+
+def _send_admin_menu_product_detail(bot_token: str, chat_id: int, tenant_id: str, orders_sh, sess: Dict[str, Any], sku: str) -> bool:
+    item = get_menu_product_or_404(orders_sh, sku)
+    sess.setdefault("tmp", {})["admin_menu_last_sku"] = sku
+    sess["tmp"].pop("admin_menu_price_sku", None)
+    sess["tmp"].pop("admin_menu_price_work", None)
+
+    active_txt = "Sí" if bool(item.get("active", False)) else "No"
+    price_txt = _fmt_price_short(item.get("price", 0))
+
+    msg = (
+        "🧾 DETALLE DE PRODUCTO\n\n"
+        f"SKU: {item.get('sku','')}\n"
+        f"Nombre: {item.get('name','')}\n"
+        f"Categoría: {item.get('category','')}\n"
+        f"Activo: {active_txt}\n"
+        f"Precio actual: Bs {price_txt}\n"
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=_admin_menu_product_kb(tenant_id, sku, bool(item.get("active", False))),
+    )
+
+
+def _admin_menu_price_kb(tenant_id: str, sku: str) -> Dict[str, Any]:
+    row1: List[Tuple[str, str]] = []
+    row2: List[Tuple[str, str]] = []
+
+    for label, delta in PRICE_STEP_OPTIONS[:3]:
+        token = f"m{int(abs(delta))}" if delta < 0 else f"p{int(delta)}"
+        row1.append((label, f"admmenu|{tenant_id}|padj|{sku}|{token}"))
+
+    for label, delta in PRICE_STEP_OPTIONS[3:]:
+        token = f"m{int(abs(delta))}" if delta < 0 else f"p{int(delta)}"
+        row2.append((label, f"admmenu|{tenant_id}|padj|{sku}|{token}"))
+
+    return kb([
+        row1,
+        row2,
+        [("💾 Guardar precio", f"admmenu|{tenant_id}|psave|{sku}")],
+        [("↩️ Cancelar", f"admmenu|{tenant_id}|pback|{sku}")],
+    ])
+
+
+def _send_admin_menu_price_editor(bot_token: str, chat_id: int, tenant_id: str, orders_sh, sess: Dict[str, Any], sku: str) -> bool:
+    item = get_menu_product_or_404(orders_sh, sku)
+    tmp = sess.setdefault("tmp", {})
+
+    current_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
+    if current_sku != sku:
+        tmp["admin_menu_price_sku"] = sku
+        tmp["admin_menu_price_work"] = float(item.get("price", 0.0))
+
+    work_price = float(tmp.get("admin_menu_price_work") or 0.0)
+
+    msg = (
+        "💲 AJUSTAR PRECIO\n\n"
+        f"Producto: {item.get('name','')}\n"
+        f"SKU: {item.get('sku','')}\n"
+        f"Precio guardado: Bs {_fmt_price_short(item.get('price', 0))}\n"
+        f"Precio en edición: Bs {_fmt_price_short(work_price)}\n\n"
+        "Usa los botones para subir o bajar el precio.\n"
+        "Luego presiona “Guardar precio”."
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=_admin_menu_price_kb(tenant_id, sku),
+    )
+
+
+def _apply_price_delta(current_value: float, token: str) -> float:
+    token = str(token or "").strip().lower()
+    if not token or len(token) < 2:
+        return current_value
+
+    sign = token[0]
+    num = token[1:]
+
+    try:
+        amount = float(num)
+    except Exception:
+        return current_value
+
+    if sign == "m":
+        new_value = current_value - amount
+    elif sign == "p":
+        new_value = current_value + amount
+    else:
+        return current_value
+
+    if new_value < 0:
+        new_value = 0.0
+
+    return round(new_value, 2)
 
 
 # -------------------------
@@ -1380,6 +1615,136 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             return {"ok": True}
 
+        if mode == "admin" and data.startswith("admmenu|"):
+            _assert_admin_authorized(tenant, chat_id, tenant_id)
+
+            parts = data.split("|")
+            if len(parts) < 3:
+                return {"ok": True}
+
+            cb_tenant_id = parts[1].strip()
+            if cb_tenant_id != tenant_id:
+                raise HTTPException(status_code=400, detail="Tenant mismatch in admin menu callback")
+
+            action = parts[2].strip()
+            sess = get_sess(tenant_id, chat_id)
+            tmp = sess.setdefault("tmp", {})
+
+            if action == "panel":
+                tmp.pop("admin_menu_categories", None)
+                tmp.pop("admin_menu_current_category", None)
+                tmp.pop("admin_menu_last_sku", None)
+                tmp.pop("admin_menu_price_sku", None)
+                tmp.pop("admin_menu_price_work", None)
+                telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
+                return {"ok": True}
+
+            if action == "home":
+                return {"ok": _send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+            if action == "refresh":
+                invalidate_menu_cache(orders_sh)
+                telegram_send_text(bot_token, chat_id, "✅ Menú refrescado.")
+                return {"ok": _send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+            if action == "catrefresh":
+                invalidate_menu_cache(orders_sh)
+                current_category = str(tmp.get("admin_menu_current_category") or "").strip()
+                if not current_category:
+                    return {"ok": _send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+                telegram_send_text(bot_token, chat_id, "✅ Categoría refrescada.")
+                return {"ok": _send_admin_menu_category(bot_token, chat_id, tenant_id, orders_sh, sess, current_category)}
+
+            if action == "cat" and len(parts) == 4:
+                try:
+                    idx = int(parts[3].strip())
+                except Exception:
+                    idx = -1
+
+                menu_idx = load_menu_admin_index(orders_sh, force=False)
+                cats = group_menu_admin_by_category(menu_idx)
+                cat_names = sorted(cats.keys(), key=lambda x: normalize(x))
+
+                if idx < 0 or idx >= len(cat_names):
+                    return {"ok": _send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+                category = cat_names[idx]
+                return {"ok": _send_admin_menu_category(bot_token, chat_id, tenant_id, orders_sh, sess, category)}
+
+            if action == "catback":
+                current_category = str(tmp.get("admin_menu_current_category") or "").strip()
+                if not current_category:
+                    return {"ok": _send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+                return {"ok": _send_admin_menu_category(bot_token, chat_id, tenant_id, orders_sh, sess, current_category)}
+
+            if action == "prd" and len(parts) == 4:
+                sku = parts[3].strip()
+                return {"ok": _send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, sku)}
+
+            if action == "toggle" and len(parts) == 4:
+                sku = parts[3].strip()
+                item_before = get_menu_product_or_404(orders_sh, sku)
+                new_active = not bool(item_before.get("active", False))
+                set_menu_product_active(orders_sh, sku, new_active)
+                item_after = get_menu_product_or_404(orders_sh, sku)
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    f"✅ Estado actualizado.\nProducto: {item_after.get('name','')}\nActivo: {'Sí' if item_after.get('active') else 'No'}",
+                )
+                return {"ok": _send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, sku)}
+
+            if action == "price" and len(parts) == 4:
+                sku = parts[3].strip()
+                return {"ok": _send_admin_menu_price_editor(bot_token, chat_id, tenant_id, orders_sh, sess, sku)}
+
+            if action == "padj" and len(parts) == 5:
+                sku = parts[3].strip()
+                token = parts[4].strip().lower()
+
+                item = get_menu_product_or_404(orders_sh, sku)
+                current_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
+                if current_sku != sku:
+                    tmp["admin_menu_price_sku"] = sku
+                    tmp["admin_menu_price_work"] = float(item.get("price", 0.0))
+
+                work_price = float(tmp.get("admin_menu_price_work") or 0.0)
+                work_price = _apply_price_delta(work_price, token)
+                tmp["admin_menu_price_work"] = work_price
+
+                return {"ok": _send_admin_menu_price_editor(bot_token, chat_id, tenant_id, orders_sh, sess, sku)}
+
+            if action == "psave" and len(parts) == 4:
+                sku = parts[3].strip()
+                current_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
+
+                if current_sku != sku:
+                    item = get_menu_product_or_404(orders_sh, sku)
+                    tmp["admin_menu_price_sku"] = sku
+                    tmp["admin_menu_price_work"] = float(item.get("price", 0.0))
+
+                new_price = float(tmp.get("admin_menu_price_work") or 0.0)
+                result = set_menu_product_price(orders_sh, sku, new_price)
+
+                tmp.pop("admin_menu_price_sku", None)
+                tmp.pop("admin_menu_price_work", None)
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    f"✅ Precio actualizado.\nSKU: {sku}\nNuevo precio: Bs {_fmt_price_short(result.get('price', 0))}",
+                )
+                return {"ok": _send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, sku)}
+
+            if action == "pback" and len(parts) == 4:
+                sku = parts[3].strip()
+                tmp.pop("admin_menu_price_sku", None)
+                tmp.pop("admin_menu_price_work", None)
+                return {"ok": _send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, sku)}
+
+            return {"ok": True}
+
         # -------------------------
         # CLIENT callbacks
         # -------------------------
@@ -1855,6 +2220,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
         if mode == "admin":
             txt_norm = normalize(text)
+            sess = get_sess(tenant_id, chat_id)
 
             if txt_norm in ("estadisticas", "/stats", "stats"):
                 _assert_admin_authorized(tenant, chat_id, tenant_id)
@@ -1884,40 +2250,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 "configuracion de menu y precios",
             ):
                 _assert_admin_authorized(tenant, chat_id, tenant_id)
-
-                try:
-                    menu_idx = load_menu_index(orders_sh)
-                    cats = group_menu_by_category(menu_idx)
-                except Exception as e:
-                    log_event("admin_menu_panel_load_failed", tenant_id=tenant_id, error=str(e))
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        "No pude cargar el menú actual.",
-                        reply_markup=admin_fixed_kb(),
-                    )
-                    return {"ok": True}
-
-                total_products = len(menu_idx)
-                total_categories = len(cats)
-
-                lines = []
-                for cat, items in cats.items():
-                    lines.append(f"- {cat}: {len(items)} producto(s)")
-
-                detail = "\n".join(lines) if lines else "- Sin categorías"
-
-                msg = (
-                    "⚙️ CONFIG MENÚ Y PRECIOS\n\n"
-                    f"Productos activos: {total_products}\n"
-                    f"Categorías activas: {total_categories}\n\n"
-                    "Resumen por categoría:\n"
-                    f"{detail}\n\n"
-                    "Próximo paso: aquí construiremos la navegación para ver productos, precios y activar/desactivar."
-                )
-
-                telegram_send_text(bot_token, chat_id, msg, reply_markup=admin_fixed_kb())
-                return {"ok": True}
+                return {"ok": _send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
             if txt_norm in ("start", "/start", "hola"):
                 telegram_send_text(bot_token, chat_id, "Admin bot listo ✅", reply_markup=admin_fixed_kb())
