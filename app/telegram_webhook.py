@@ -5,6 +5,7 @@ import re
 import time
 import urllib.request
 import urllib.parse
+from datetime import datetime
 from typing import Any, Dict, Optional, List, Tuple, Set
 
 from fastapi import APIRouter, HTTPException
@@ -23,18 +24,10 @@ from app.orders import (
     build_items_snapshot,
 )
 from app.telegram_keyboard import kb
-from app.utils import normalize, log_event
+from app.utils import normalize, log_event, now_iso_utc
 
 from app.stats import build_periods, resolve_period, build_stats_report_text, log_event_to_sheet
-from app.admin_settings import (
-    resolve_business_status,
-    action_set_today_closed,
-    action_set_today_open_force,
-    action_set_weekly_open_days,
-    action_set_weekly_normal_hours,
-    action_set_today_open_late,
-    action_set_today_close_early,
-)
+from app.admin_settings import resolve_business_status
 
 router = APIRouter()
 
@@ -56,6 +49,8 @@ DAY_LABELS = {
     "sab": "Sáb",
     "dom": "Dom",
 }
+
+ADMIN_SETTINGS_SHEET_NAME = "AdminSettings"
 
 
 def get_sess(tenant_id: str, chat_id: int) -> Dict[str, Any]:
@@ -436,6 +431,209 @@ def _client_orders_allowed_or_notify(bot_token: str, chat_id: int, orders_sh, te
 
 
 # -------------------------
+# AdminSettings direct helpers
+# -------------------------
+
+def _get_admin_settings_ws(orders_sh):
+    try:
+        return orders_sh.worksheet(ADMIN_SETTINGS_SHEET_NAME)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Missing worksheet '{ADMIN_SETTINGS_SHEET_NAME}': {e}")
+
+
+def _admin_headers_map(ws) -> Dict[str, int]:
+    values = ws.get_all_values()
+    if not values:
+        raise HTTPException(status_code=500, detail="AdminSettings is empty")
+
+    header = values[0]
+    out: Dict[str, int] = {}
+    for i, h in enumerate(header):
+        k = normalize(h)
+        if k and k not in out:
+            out[k] = i + 1  # 1-based
+    return out
+
+
+def _admin_find_row_by_key(ws, key: str) -> Optional[int]:
+    values = ws.get_all_values()
+    if not values:
+        return None
+
+    key_norm = normalize(key).replace(" ", "_")
+    for ridx in range(2, len(values) + 1):
+        row = values[ridx - 1]
+        cell = row[0] if len(row) >= 1 else ""
+        if normalize(cell).replace(" ", "_") == key_norm:
+            return ridx
+    return None
+
+
+def _admin_upsert_setting(
+    orders_sh,
+    key: str,
+    value: str,
+    scope: str,
+    updated_by: str,
+    notes: str = "",
+    active: str = "TRUE",
+) -> None:
+    ws = _get_admin_settings_ws(orders_sh)
+    headers = _admin_headers_map(ws)
+    ridx = _admin_find_row_by_key(ws, key)
+
+    now_ts = now_iso_utc()
+    key_val = str(key or "").strip()
+    value_val = str(value or "").strip()
+    scope_val = str(scope or "").strip()
+    updated_by_val = str(updated_by or "").strip()
+    notes_val = str(notes or "").strip()
+    active_val = str(active or "TRUE").strip()
+
+    if ridx is None:
+        header_len = max(headers.values()) if headers else 7
+        row = [""] * header_len
+
+        def put(col_name: str, val: str) -> None:
+            c = headers.get(normalize(col_name))
+            if c:
+                row[c - 1] = val
+
+        put("key", key_val)
+        put("value", value_val)
+        put("active", active_val)
+        put("scope", scope_val)
+        put("updated_at", now_ts)
+        put("updated_by", updated_by_val)
+        put("notes", notes_val)
+
+        ws.append_row(row, value_input_option="RAW")
+        return
+
+    def update_if_exists(col_name: str, val: str) -> None:
+        c = headers.get(normalize(col_name))
+        if c:
+            ws.update_cell(ridx, c, val)
+
+    update_if_exists("key", key_val)
+    update_if_exists("value", value_val)
+    update_if_exists("active", active_val)
+    update_if_exists("scope", scope_val)
+    update_if_exists("updated_at", now_ts)
+    update_if_exists("updated_by", updated_by_val)
+    update_if_exists("notes", notes_val)
+
+
+def _admin_set_weekly_open_days(orders_sh, days: List[str], updated_by: str) -> None:
+    safe_days = [d for d in DAY_ORDER if d in set(days or [])]
+    csv = ",".join(safe_days)
+    _admin_upsert_setting(
+        orders_sh=orders_sh,
+        key="weekly_open_days",
+        value=csv,
+        scope="global",
+        updated_by=updated_by,
+        notes="dias normales de apertura",
+    )
+
+
+def _admin_set_weekly_normal_hours(
+    orders_sh,
+    open_time: str,
+    close_time: str,
+    last_order_time: str,
+    updated_by: str,
+) -> None:
+    _admin_upsert_setting(
+        orders_sh=orders_sh,
+        key="weekly_open_time",
+        value=open_time,
+        scope="global",
+        updated_by=updated_by,
+        notes="hora de apertura normal",
+    )
+    _admin_upsert_setting(
+        orders_sh=orders_sh,
+        key="weekly_close_time",
+        value=close_time,
+        scope="global",
+        updated_by=updated_by,
+        notes="hora de cierre normal",
+    )
+    _admin_upsert_setting(
+        orders_sh=orders_sh,
+        key="weekly_last_order_time",
+        value=last_order_time,
+        scope="global",
+        updated_by=updated_by,
+        notes="ultima hora normal de pedido",
+    )
+
+
+def _admin_set_today_closed(orders_sh, enabled: bool, updated_by: str) -> None:
+    _admin_upsert_setting(
+        orders_sh=orders_sh,
+        key="today_closed",
+        value="TRUE" if enabled else "FALSE",
+        scope="today",
+        updated_by=updated_by,
+        notes="negocio cerrado hoy",
+    )
+
+
+def _admin_set_today_open_force(orders_sh, enabled: bool, updated_by: str) -> None:
+    _admin_upsert_setting(
+        orders_sh=orders_sh,
+        key="today_open_force",
+        value="TRUE" if enabled else "FALSE",
+        scope="today",
+        updated_by=updated_by,
+        notes="abrir excepcionalmente hoy",
+    )
+
+
+def _admin_set_today_open_override(orders_sh, open_time: str, updated_by: str) -> None:
+    _admin_upsert_setting(
+        orders_sh=orders_sh,
+        key="today_open_time_override",
+        value=open_time,
+        scope="today",
+        updated_by=updated_by,
+        notes="apertura especial hoy",
+    )
+
+
+def _admin_set_today_close_override(orders_sh, close_time: str, updated_by: str) -> None:
+    _admin_upsert_setting(
+        orders_sh=orders_sh,
+        key="today_close_time_override",
+        value=close_time,
+        scope="today",
+        updated_by=updated_by,
+        notes="cierre especial hoy",
+    )
+
+
+def _admin_set_today_last_order_override(orders_sh, last_order_time: str, updated_by: str) -> None:
+    _admin_upsert_setting(
+        orders_sh=orders_sh,
+        key="today_last_order_time_override",
+        value=last_order_time,
+        scope="today",
+        updated_by=updated_by,
+        notes="ultima hora especial hoy",
+    )
+
+
+def _admin_restore_habitual(orders_sh, updated_by: str) -> None:
+    _admin_set_today_closed(orders_sh, enabled=False, updated_by=updated_by)
+    _admin_set_today_open_force(orders_sh, enabled=False, updated_by=updated_by)
+    _admin_set_today_open_override(orders_sh, open_time="", updated_by=updated_by)
+    _admin_set_today_close_override(orders_sh, close_time="", updated_by=updated_by)
+    _admin_set_today_last_order_override(orders_sh, last_order_time="", updated_by=updated_by)
+
+
+# -------------------------
 # Admin config horarios helpers
 # -------------------------
 
@@ -473,17 +671,22 @@ def _admin_hours_menu_kb(tenant_id: str) -> Dict[str, Any]:
         [("📅 Días normales", f"admhrs|{tenant_id}|days"), ("🕒 Horario normal", f"admhrs|{tenant_id}|norm")],
         [("🌙 Cerrar más temprano hoy", f"admhrs|{tenant_id}|early"), ("🌅 Abrir más tarde hoy", f"admhrs|{tenant_id}|late")],
         [("🔴 No abrir hoy", f"admhrs|{tenant_id}|closed"), ("✨ Abrir excepcionalmente hoy", f"admhrs|{tenant_id}|openforce")],
-        [("🔄 Refrescar", f"admhrs|{tenant_id}|menu")],
+        [("🔄 Volver a lo habitual", f"admhrs|{tenant_id}|habitual")],
     ])
 
 
 def _admin_hours_status_text(bs: Dict[str, Any]) -> str:
     status_txt = "ABIERTO" if bs.get("accepts_orders_now") else "CERRADO / NO DISPONIBLE"
-    days_txt = ", ".join(bs.get("weekly_open_days") or []) or "-"
+    today_code = str(bs.get("today_weekday_code") or "").strip()
+    weekly_days = bs.get("weekly_open_days") or []
+    days_txt = ", ".join(weekly_days) or "-"
+    today_in_weekly = today_code in set(weekly_days)
 
     msg = (
         "⚙️ CONFIG DÍAS Y HORARIOS\n\n"
         f"Estado actual: {status_txt}\n"
+        f"Día de hoy: {today_code or '-'}\n"
+        f"Hoy está dentro de días normales: {'Sí' if today_in_weekly else 'No'}\n"
         f"Abre hoy: {'Sí' if bs.get('is_open_today') else 'No'}\n"
         f"Acepta pedidos ahora: {'Sí' if bs.get('accepts_orders_now') else 'No'}\n"
         f"Hora apertura: {bs.get('open_time') or '-'}\n"
@@ -997,12 +1200,22 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             action = parts[2].strip()
             sess = get_sess(tenant_id, chat_id)
             tmp = sess.setdefault("tmp", {})
+            updated_by = f"admin_bot:{chat_id}"
 
             if action == "menu":
                 tmp.pop("admin_days_selected", None)
                 tmp.pop("admin_norm_open", None)
                 tmp.pop("admin_norm_close", None)
                 tmp.pop("admin_early_close", None)
+                return {"ok": _send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
+
+            if action == "habitual":
+                tmp.pop("admin_days_selected", None)
+                tmp.pop("admin_norm_open", None)
+                tmp.pop("admin_norm_close", None)
+                tmp.pop("admin_early_close", None)
+                _admin_restore_habitual(orders_sh=orders_sh, updated_by=updated_by)
+                telegram_send_text(bot_token, chat_id, "✅ Se restauró la configuración habitual de hoy.")
                 return {"ok": _send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
             if action == "days":
@@ -1024,14 +1237,25 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 return {"ok": _send_admin_days_menu(bot_token, chat_id, tenant_id, sess, bs)}
 
             if action == "dayssave":
-                selected = set(tmp.get("admin_days_selected") or [])
-                action_set_weekly_open_days(
+                selected = [d for d in DAY_ORDER if d in set(tmp.get("admin_days_selected") or [])]
+                _admin_set_weekly_open_days(
                     orders_sh=orders_sh,
-                    days=[d for d in DAY_ORDER if d in selected],
-                    updated_by=f"admin_bot:{chat_id}",
+                    days=selected,
+                    updated_by=updated_by,
                 )
                 tmp.pop("admin_days_selected", None)
-                telegram_send_text(bot_token, chat_id, "✅ Días normales actualizados.")
+
+                bs_after = _get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
+                today_code = str(bs_after.get("today_weekday_code") or "").strip()
+                today_in = today_code in set(bs_after.get("weekly_open_days") or [])
+                force_open = bool(bs_after.get("today_open_force"))
+                today_closed = bool(bs_after.get("today_closed"))
+
+                msg = "✅ Días normales actualizados."
+                if today_code and (not today_in) and (not force_open) and (not today_closed):
+                    msg += f"\n⚠️ Ojo: hoy ({today_code}) quedó fuera de los días normales."
+
+                telegram_send_text(bot_token, chat_id, msg)
                 return {"ok": _send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
             if action == "norm":
@@ -1059,12 +1283,12 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 if not open_time or not close_time:
                     return {"ok": _send_admin_norm_open_menu(bot_token, chat_id, tenant_id)}
 
-                action_set_weekly_normal_hours(
+                _admin_set_weekly_normal_hours(
                     orders_sh=orders_sh,
                     open_time=open_time,
                     close_time=close_time,
                     last_order_time=last_time,
-                    updated_by=f"admin_bot:{chat_id}",
+                    updated_by=updated_by,
                 )
 
                 tmp.pop("admin_norm_open", None)
@@ -1092,12 +1316,10 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 if not close_time:
                     return {"ok": _send_admin_early_close_menu(bot_token, chat_id, tenant_id)}
 
-                action_set_today_close_early(
-                    orders_sh=orders_sh,
-                    close_time=close_time,
-                    last_order_time=last_time,
-                    updated_by=f"admin_bot:{chat_id}",
-                )
+                _admin_set_today_closed(orders_sh=orders_sh, enabled=False, updated_by=updated_by)
+                _admin_set_today_open_force(orders_sh=orders_sh, enabled=False, updated_by=updated_by)
+                _admin_set_today_close_override(orders_sh=orders_sh, close_time=close_time, updated_by=updated_by)
+                _admin_set_today_last_order_override(orders_sh=orders_sh, last_order_time=last_time, updated_by=updated_by)
 
                 tmp.pop("admin_early_close", None)
                 telegram_send_text(
@@ -1112,11 +1334,9 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             if action == "lateopen" and len(parts) == 4:
                 open_time = _compact_to_hhmm(parts[3].strip())
-                action_set_today_open_late(
-                    orders_sh=orders_sh,
-                    open_time=open_time,
-                    updated_by=f"admin_bot:{chat_id}",
-                )
+                _admin_set_today_closed(orders_sh=orders_sh, enabled=False, updated_by=updated_by)
+                _admin_set_today_open_force(orders_sh=orders_sh, enabled=False, updated_by=updated_by)
+                _admin_set_today_open_override(orders_sh=orders_sh, open_time=open_time, updated_by=updated_by)
                 telegram_send_text(
                     bot_token,
                     chat_id,
@@ -1125,30 +1345,36 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 return {"ok": _send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
             if action == "closed":
-                action_set_today_closed(
+                _admin_set_today_closed(
                     orders_sh=orders_sh,
-                    is_closed=True,
-                    updated_by=f"admin_bot:{chat_id}",
+                    enabled=True,
+                    updated_by=updated_by,
                 )
-                action_set_today_open_force(
+                _admin_set_today_open_force(
                     orders_sh=orders_sh,
                     enabled=False,
-                    updated_by=f"admin_bot:{chat_id}",
+                    updated_by=updated_by,
                 )
+                _admin_set_today_open_override(orders_sh=orders_sh, open_time="", updated_by=updated_by)
+                _admin_set_today_close_override(orders_sh=orders_sh, close_time="", updated_by=updated_by)
+                _admin_set_today_last_order_override(orders_sh=orders_sh, last_order_time="", updated_by=updated_by)
                 telegram_send_text(bot_token, chat_id, "✅ Hoy quedó marcado como NO abrir.")
                 return {"ok": _send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
             if action == "openforce":
-                action_set_today_open_force(
+                _admin_set_today_open_force(
                     orders_sh=orders_sh,
                     enabled=True,
-                    updated_by=f"admin_bot:{chat_id}",
+                    updated_by=updated_by,
                 )
-                action_set_today_closed(
+                _admin_set_today_closed(
                     orders_sh=orders_sh,
-                    is_closed=False,
-                    updated_by=f"admin_bot:{chat_id}",
+                    enabled=False,
+                    updated_by=updated_by,
                 )
+                _admin_set_today_open_override(orders_sh=orders_sh, open_time="", updated_by=updated_by)
+                _admin_set_today_close_override(orders_sh=orders_sh, close_time="", updated_by=updated_by)
+                _admin_set_today_last_order_override(orders_sh=orders_sh, last_order_time="", updated_by=updated_by)
                 telegram_send_text(bot_token, chat_id, "✅ Hoy quedó marcado como abrir excepcionalmente.")
                 return {"ok": _send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
@@ -1653,7 +1879,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             if txt_norm in (
                 "config menu y precios",
-                "menu y precios",
                 "menu y precios",
                 "configuracion menu y precios",
                 "configuracion de menu y precios",
