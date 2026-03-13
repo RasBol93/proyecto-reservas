@@ -403,6 +403,22 @@ def _fmt_price_short(v: Any) -> str:
     return s
 
 
+def _extract_first_number(text: str) -> Optional[float]:
+    s = str(text or "").strip().lower()
+    if not s:
+        return None
+
+    s = s.replace(",", ".")
+    m = re.search(r"(-?\d+(?:\.\d+)?)", s)
+    if not m:
+        return None
+
+    try:
+        return float(m.group(1))
+    except Exception:
+        return None
+
+
 # -------------------------
 # Estado del negocio
 # -------------------------
@@ -923,6 +939,7 @@ def _send_admin_menu_home(bot_token: str, chat_id: int, tenant_id: str, orders_s
     sess["tmp"].pop("admin_menu_current_category", None)
     sess["tmp"].pop("admin_menu_price_sku", None)
     sess["tmp"].pop("admin_menu_price_work", None)
+    sess["tmp"].pop("admin_menu_input_mode", None)
 
     total_products = len(menu_idx)
     total_active = sum(1 for v in menu_idx.values() if bool(v.get("active", False)))
@@ -967,6 +984,7 @@ def _send_admin_menu_category(bot_token: str, chat_id: int, tenant_id: str, orde
     sess.setdefault("tmp", {})["admin_menu_current_category"] = category
     sess["tmp"].pop("admin_menu_price_sku", None)
     sess["tmp"].pop("admin_menu_price_work", None)
+    sess["tmp"].pop("admin_menu_input_mode", None)
 
     total_n = len(items)
     active_n = sum(1 for it in items if bool(it.get("active", False)))
@@ -993,6 +1011,8 @@ def _admin_menu_product_kb(tenant_id: str, sku: str, active: bool) -> Dict[str, 
     return kb([
         [(toggle_label, f"admmenu|{tenant_id}|toggle|{sku}")],
         [("💲 Ajustar precio", f"admmenu|{tenant_id}|price|{sku}")],
+        [("✍️ Escribir precio final", f"admmenu|{tenant_id}|pricewrite|{sku}")],
+        [("🏷️ Aplicar descuento %", f"admmenu|{tenant_id}|discount|{sku}")],
         [("⬅️ Volver a categoría", f"admmenu|{tenant_id}|catback")],
         [("🏠 Categorías", f"admmenu|{tenant_id}|home")],
     ])
@@ -1003,6 +1023,7 @@ def _send_admin_menu_product_detail(bot_token: str, chat_id: int, tenant_id: str
     sess.setdefault("tmp", {})["admin_menu_last_sku"] = sku
     sess["tmp"].pop("admin_menu_price_sku", None)
     sess["tmp"].pop("admin_menu_price_work", None)
+    sess["tmp"].pop("admin_menu_input_mode", None)
 
     active_txt = "Sí" if bool(item.get("active", False)) else "No"
     price_txt = _fmt_price_short(item.get("price", 0))
@@ -1636,6 +1657,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 tmp.pop("admin_menu_last_sku", None)
                 tmp.pop("admin_menu_price_sku", None)
                 tmp.pop("admin_menu_price_work", None)
+                tmp.pop("admin_menu_input_mode", None)
                 telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
                 return {"ok": True}
 
@@ -1729,6 +1751,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                 tmp.pop("admin_menu_price_sku", None)
                 tmp.pop("admin_menu_price_work", None)
+                tmp.pop("admin_menu_input_mode", None)
 
                 telegram_send_text(
                     bot_token,
@@ -1741,7 +1764,54 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 sku = parts[3].strip()
                 tmp.pop("admin_menu_price_sku", None)
                 tmp.pop("admin_menu_price_work", None)
+                tmp.pop("admin_menu_input_mode", None)
                 return {"ok": _send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, sku)}
+
+            if action == "pricewrite" and len(parts) == 4:
+                sku = parts[3].strip()
+                item = get_menu_product_or_404(orders_sh, sku)
+                tmp["admin_menu_input_mode"] = "price_final"
+                tmp["admin_menu_price_sku"] = sku
+                tmp["admin_menu_price_work"] = float(item.get("price", 0.0))
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    (
+                        "✍️ ESCRIBIR PRECIO FINAL\n\n"
+                        f"Producto: {item.get('name','')}\n"
+                        f"Precio actual: Bs {_fmt_price_short(item.get('price', 0))}\n\n"
+                        "Escribe el nuevo precio final.\n"
+                        "Ejemplos válidos:\n"
+                        "- 25\n"
+                        "- 25 bs\n"
+                        "- 25 bolivianos"
+                    ),
+                )
+                return {"ok": True}
+
+            if action == "discount" and len(parts) == 4:
+                sku = parts[3].strip()
+                item = get_menu_product_or_404(orders_sh, sku)
+                tmp["admin_menu_input_mode"] = "discount_pct"
+                tmp["admin_menu_price_sku"] = sku
+                tmp["admin_menu_price_work"] = float(item.get("price", 0.0))
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    (
+                        "🏷️ APLICAR DESCUENTO %\n\n"
+                        f"Producto: {item.get('name','')}\n"
+                        f"Precio actual: Bs {_fmt_price_short(item.get('price', 0))}\n\n"
+                        "Escribe el porcentaje de descuento.\n"
+                        "Ejemplos válidos:\n"
+                        "- 10\n"
+                        "- 15%\n"
+                        "- 20 por ciento"
+                    ),
+                )
+                return {"ok": True}
 
             return {"ok": True}
 
@@ -2221,6 +2291,79 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         if mode == "admin":
             txt_norm = normalize(text)
             sess = get_sess(tenant_id, chat_id)
+            tmp = sess.setdefault("tmp", {})
+
+            input_mode = str(tmp.get("admin_menu_input_mode") or "").strip()
+            input_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
+
+            if input_mode and input_sku:
+                _assert_admin_authorized(tenant, chat_id, tenant_id)
+
+                item = get_menu_product_or_404(orders_sh, input_sku)
+                current_price = float(item.get("price", 0.0))
+                n = _extract_first_number(text)
+
+                if n is None:
+                    if input_mode == "price_final":
+                        telegram_send_text(
+                            bot_token,
+                            chat_id,
+                            "No pude leer un número válido.\nEscribe solo el precio o algo como: 25 bs",
+                        )
+                    elif input_mode == "discount_pct":
+                        telegram_send_text(
+                            bot_token,
+                            chat_id,
+                            "No pude leer un porcentaje válido.\nEscribe algo como: 10 o 15%",
+                        )
+                    return {"ok": True}
+
+                if input_mode == "price_final":
+                    if n < 0:
+                        telegram_send_text(bot_token, chat_id, "El precio no puede ser negativo. Intenta otra vez.")
+                        return {"ok": True}
+
+                    result = set_menu_product_price(orders_sh, input_sku, float(n))
+                    tmp.pop("admin_menu_input_mode", None)
+                    tmp.pop("admin_menu_price_sku", None)
+                    tmp.pop("admin_menu_price_work", None)
+
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"✅ Precio actualizado.\nSKU: {input_sku}\nNuevo precio: Bs {_fmt_price_short(result.get('price', 0))}",
+                    )
+                    return {"ok": _send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
+
+                if input_mode == "discount_pct":
+                    if n < 0:
+                        telegram_send_text(bot_token, chat_id, "El descuento no puede ser negativo. Intenta otra vez.")
+                        return {"ok": True}
+                    if n > 100:
+                        telegram_send_text(bot_token, chat_id, "El descuento no puede ser mayor a 100%. Intenta otra vez.")
+                        return {"ok": True}
+
+                    new_price = round(current_price * (1.0 - (float(n) / 100.0)), 2)
+                    if new_price < 0:
+                        new_price = 0.0
+
+                    result = set_menu_product_price(orders_sh, input_sku, new_price)
+                    tmp.pop("admin_menu_input_mode", None)
+                    tmp.pop("admin_menu_price_sku", None)
+                    tmp.pop("admin_menu_price_work", None)
+
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        (
+                            f"✅ Descuento aplicado.\n"
+                            f"SKU: {input_sku}\n"
+                            f"Descuento: {n}%\n"
+                            f"Precio anterior: Bs {_fmt_price_short(current_price)}\n"
+                            f"Nuevo precio: Bs {_fmt_price_short(result.get('price', 0))}"
+                        ),
+                    )
+                    return {"ok": _send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
 
             if txt_norm in ("estadisticas", "/stats", "stats"):
                 _assert_admin_authorized(tenant, chat_id, tenant_id)
