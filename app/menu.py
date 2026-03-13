@@ -69,7 +69,6 @@ def _parse_price(value: Any) -> Optional[float]:
       - "12,5"
       - " 12,50 "
       - "12 Bs" / "Bs 12" / "12 BOB"
-      - "12.000" (aquí se interpreta como el primer número válido)
     Regla: toma el PRIMER número encontrado.
     """
     s = str(value or "").strip()
@@ -202,6 +201,32 @@ def _get_menu_context(orders_sh) -> Dict[str, Any]:
     }
 
 
+def _looks_like_headerish_menu_row(sku: str, name: str, price_raw: str, active_raw: str, category: str) -> bool:
+    """
+    Evita que se cuele una fila de headers técnicos o de traducción como producto real.
+    """
+    sku_n = normalize(sku)
+    name_n = normalize(name)
+    price_n = normalize(price_raw)
+    active_n = normalize(active_raw)
+    category_n = normalize(category)
+
+    headerish_values = {
+        "sku", "codigo", "codigo sku", "identificador",
+        "name", "nombre",
+        "price", "precio",
+        "active", "activo",
+        "category", "categoria",
+    }
+
+    matches = 0
+    for v in [sku_n, name_n, price_n, active_n, category_n]:
+        if v in headerish_values:
+            matches += 1
+
+    return matches >= 3
+
+
 # -------------------------
 # Public API (cliente)
 # -------------------------
@@ -232,11 +257,21 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
         "skipped_no_sku": 0,
         "skipped_inactive": 0,
         "skipped_bad_price": 0,
+        "skipped_headerish": 0,
         "duplicates": 0,
     }
 
     for r in rows:
         sku = str(r.get("sku", "") or "").strip()
+        name = str(r.get("name", "") or "").strip()
+        price_raw = str(r.get("price", "") or "").strip()
+        active_raw = str(r.get("active", "") or "").strip()
+        category = str(r.get("category", "") or "").strip() or "Otros"
+
+        if _looks_like_headerish_menu_row(sku, name, price_raw, active_raw, category):
+            stats["skipped_headerish"] += 1
+            continue
+
         if not sku:
             stats["skipped_no_sku"] += 1
             continue
@@ -247,13 +282,10 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
 
         stats["active_in"] += 1
 
-        price = _parse_price(r.get("price", ""))
+        price = _parse_price(price_raw)
         if price is None:
             stats["skipped_bad_price"] += 1
             continue
-
-        name = str(r.get("name", "") or "").strip()
-        category = str(r.get("category", "") or "").strip() or "Otros"
 
         if sku in idx:
             stats["duplicates"] += 1
@@ -340,11 +372,6 @@ def calc_total_amount(items: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str,
 def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]:
     """
     Lee TODO el menú, incluyendo activos e inactivos.
-
-    Devuelve:
-      sku -> {
-        sku, name, price, category, active, row_index
-      }
     """
     ck = _cache_key_for_orders_sh(orders_sh)
 
@@ -365,6 +392,7 @@ def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str,
     stats = {
         "rows_in": 0,
         "skipped_no_sku": 0,
+        "skipped_headerish": 0,
         "bad_price": 0,
         "duplicates": 0,
         "active_true": 0,
@@ -385,23 +413,29 @@ def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str,
             return row[i] if i < len(row) else ""
 
         sku = str(g("sku") or "").strip()
+        name = str(g("name") or "").strip()
+        price_raw = str(g("price") or "").strip()
+        active_raw = str(g("active") or "").strip()
+        category = str(g("category") or "").strip() or "Otros"
+
+        if _looks_like_headerish_menu_row(sku, name, price_raw, active_raw, category):
+            stats["skipped_headerish"] += 1
+            continue
+
         if not sku:
             stats["skipped_no_sku"] += 1
             continue
 
-        active = to_bool(g("active"))
+        active = to_bool(active_raw)
         if active:
             stats["active_true"] += 1
         else:
             stats["active_false"] += 1
 
-        price = _parse_price(g("price"))
+        price = _parse_price(price_raw)
         if price is None:
             stats["bad_price"] += 1
             price = 0.0
-
-        name = str(g("name") or "").strip()
-        category = str(g("category") or "").strip() or "Otros"
 
         if sku in idx:
             stats["duplicates"] += 1
