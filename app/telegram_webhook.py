@@ -1131,201 +1131,6 @@ def _apply_price_delta(current_value: float, token: str) -> float:
 
 
 # -------------------------
-# Admin notify
-# -------------------------
-
-def notify_admin_payment_reported(
-    tenant: Dict[str, Any],
-    tenant_id: str,
-    orders_sh,
-    order_id: str,
-    is_reminder: bool = False,
-) -> bool:
-    admin_token = get_admin_bot_token(tenant)
-    admin_chat_id = get_admin_chat_id(tenant)
-
-    if not admin_token or not admin_chat_id:
-        log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_admin_token_or_chat")
-        return False
-
-    order = get_order_by_id(orders_sh, order_id)
-    if not order:
-        telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
-        return False
-
-    items_snapshot = parse_items_field(order.get("items_snapshot"))
-    if items_snapshot:
-        lines_txt, snapshot_total, total_qty = fmt_snapshot_lines(items_snapshot)
-        total = snapshot_total
-    else:
-        try:
-            menu_idx = load_menu_index(orders_sh)
-        except Exception as e:
-            log_event("admin_menu_load_error", tenant_id=tenant_id, error=str(e))
-            menu_idx = {}
-        cart = parse_items_field(order.get("items"))
-        lines_txt, _, total_qty = fmt_cart_lines(cart, menu_idx)
-        try:
-            total = float(order.get("total_amount") or 0)
-        except Exception:
-            total = 0.0
-
-    proof_file_id = (order.get("payment_proof_file_id") or "").strip()
-    proof_type = (order.get("payment_proof_type") or "").strip()
-    proof_caption = (order.get("payment_proof_caption") or "").strip()
-
-    confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{order_id}")]])
-
-    title = "🔔 RECORDATORIO — PAGO REPORTADO" if is_reminder else "💳 PAGO REPORTADO"
-    txt = (
-        f"{title}\n\n"
-        f"Tenant: {tenant_id}\n"
-        f"ID: {order_id}\n"
-        f"Cliente: {order.get('customer_name','')}\n"
-        f"Contacto(chat_id): {order.get('customer_contact','')}\n"
-        f"Hora recogida: {order.get('requested_time','pendiente')}\n"
-        f"Cantidad total: {total_qty}\n"
-        f"Total: {total:.2f} BOB\n\n"
-        f"Detalle:\n{lines_txt}\n\n"
-        "Presiona ✅ Confirmar pago cuando verifiques."
-    )
-
-    ok_txt = telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn)
-
-    ok_proof = False
-    if proof_file_id and proof_type:
-        ok_proof = _forward_proof_to_admin(tenant, tenant_id, proof_file_id, proof_type, proof_caption)
-    else:
-        log_event("admin_missing_proof", tenant_id=tenant_id, order_id=order_id)
-
-    log_event(
-        "admin_notify_result",
-        tenant_id=tenant_id,
-        order_id=order_id,
-        ok_txt=bool(ok_txt),
-        ok_proof=bool(ok_proof),
-        is_reminder=bool(is_reminder),
-    )
-    return bool(ok_txt)
-
-
-# -------------------------
-# Forward proof to admin
-# -------------------------
-
-def _forward_proof_to_admin(
-    tenant: Dict[str, Any],
-    tenant_id: str,
-    proof_file_id: str,
-    proof_type: str,
-    proof_caption: str,
-) -> bool:
-    client_token = get_client_bot_token(tenant)
-    admin_token = get_admin_bot_token(tenant)
-    admin_chat_id = get_admin_chat_id(tenant)
-
-    if not client_token or not admin_token or not admin_chat_id:
-        log_event(
-            "forward_proof_missing_config",
-            tenant_id=tenant_id,
-            has_client=bool(client_token),
-            has_admin=bool(admin_token),
-            has_admin_chat=bool(admin_chat_id),
-        )
-        return False
-
-    try:
-        file_path = _telegram_get_file_path(client_token, proof_file_id)
-        file_bytes = _telegram_download_file_bytes(client_token, file_path)
-        filename = file_path.split("/")[-1] if file_path else "proof"
-        caption = proof_caption or ("Comprobante (foto)" if proof_type == "photo" else "Comprobante (archivo)")
-
-        if proof_type == "photo":
-            return _telegram_send_file_bytes_admin(
-                admin_token=admin_token,
-                method="sendPhoto",
-                chat_id=admin_chat_id,
-                file_field="photo",
-                filename=filename or "proof.jpg",
-                content_type="image/jpeg",
-                file_bytes=file_bytes,
-                caption=caption,
-            )
-
-        return _telegram_send_file_bytes_admin(
-            admin_token=admin_token,
-            method="sendDocument",
-            chat_id=admin_chat_id,
-            file_field="document",
-            filename=filename or "proof.pdf",
-            content_type="application/octet-stream",
-            file_bytes=file_bytes,
-            caption=caption,
-        )
-
-    except Exception as e:
-        log_event("forward_proof_failed", tenant_id=tenant_id, error=str(e))
-        return False
-
-
-# -------------------------
-# Client keyboards
-# -------------------------
-
-def client_home_kb() -> Dict[str, Any]:
-    return kb([
-        [("📋 Ver menú", "menu")],
-        [("🛒 Ver carrito", "cart")],
-    ])
-
-
-def cart_kb(has_items: bool) -> Dict[str, Any]:
-    rows = []
-    if has_items:
-        rows.append([("✅ Confirmar pedido", "cart_confirm")])
-        rows.append([("🧹 Vaciar carrito", "cart_clear")])
-    rows.append([("⬅️ Seguir comprando", "menu")])
-    rows.append([("🏠 Inicio", "home")])
-    return kb(rows)
-
-
-def i_paid_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
-    return kb([
-        [("✅ Ya pagué", f"i_paid|{tenant_id}|{order_id}")],
-        [("🏠 Inicio", "home")],
-    ])
-
-
-def paid_actions_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
-    return kb([
-        [("🔔 Recordar al administrador", f"remind|{tenant_id}|{order_id}")],
-        [("🏠 Inicio", "home")],
-    ])
-
-
-def contact_admin_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
-    return kb([
-        [("💬 Contactar al administrador", f"contact|{tenant_id}|{order_id}")],
-        [("🏠 Inicio", "home")],
-    ])
-
-
-def admin_fixed_kb() -> Dict[str, Any]:
-    return reply_kb([
-        ["📊 Estadísticas"],
-        ["⚙️ Config días y horarios"],
-        ["⚙️ Config menú y precios"],
-    ], resize=True, one_time=False)
-
-
-def admin_periods_inline_kb(tenant_id: str, periods: List[Tuple[str, str]]) -> Dict[str, Any]:
-    rows = []
-    for label, key in periods:
-        rows.append([(f"📊 {label}", f"admin_stats_period|{tenant_id}|{key}")])
-    return kb(rows)
-
-
-# -------------------------
 # Helpers seguridad/parsing
 # -------------------------
 
@@ -2353,9 +2158,10 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                         log_event("admin_product_photo_download_failed", tenant_id=tenant_id, sku=input_sku, error=str(e))
                         return {"ok": True}
 
+                    upload_chat_id = get_admin_chat_id(tenant) or chat_id
                     upload_url = f"{TELEGRAM_API_BASE}/bot{client_token}/sendPhoto"
                     body, ctype = _multipart_encode(
-                        fields={"chat_id": str(chat_id)},
+                        fields={"chat_id": str(upload_chat_id)},
                         file_field="photo",
                         filename="product.jpg",
                         content_type="image/jpeg",
@@ -2384,10 +2190,31 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                     try:
                         client_file_id = data_up["result"]["photo"][-1]["file_id"]
+                        temp_message_id = data_up["result"]["message_id"]
                     except Exception:
                         telegram_send_text(bot_token, chat_id, "No pude obtener el file_id final del bot cliente.")
                         log_event("admin_product_photo_missing_client_file_id", tenant_id=tenant_id, sku=input_sku, response=data_up)
                         return {"ok": True}
+
+                    # borrar inmediatamente el mensaje temporal para que no quede visible
+                    try:
+                        telegram_api_call(
+                            client_token,
+                            "deleteMessage",
+                            {
+                                "chat_id": upload_chat_id,
+                                "message_id": temp_message_id,
+                            },
+                        )
+                    except Exception as e:
+                        log_event(
+                            "admin_product_temp_message_delete_failed",
+                            tenant_id=tenant_id,
+                            sku=input_sku,
+                            chat_id=upload_chat_id,
+                            message_id=temp_message_id,
+                            error=str(e),
+                        )
 
                     ws = orders_sh.worksheet("Menu")
                     values = ws.get_all_values()
