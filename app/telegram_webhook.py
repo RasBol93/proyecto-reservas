@@ -2325,7 +2325,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             # ===============================
             # ADMIN subida de foto producto
             # ===============================
-         if input_mode == "awaiting_photo" and input_sku:
+        if input_mode == "awaiting_photo" and input_sku:
     _assert_admin_authorized(tenant, chat_id, tenant_id)
 
     if msg.get("photo"):
