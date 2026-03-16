@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException
 
 from app.config import TELEGRAM_API_BASE
 from app.tenants import get_tenant_or_404, resolve_bot_by_secret
-from app.sheets import get_gspread_client, open_spreadsheet_by_key
+from app.sheets import get_gspread_client, open_spreadsheet_by_key, detect_header_row
 from app.menu import (
     load_menu_index,
     group_menu_by_category,
@@ -1013,6 +1013,7 @@ def _admin_menu_product_kb(tenant_id: str, sku: str, active: bool) -> Dict[str, 
         [("💲 Ajustar precio", f"admmenu|{tenant_id}|price|{sku}")],
         [("✍️ Escribir precio final", f"admmenu|{tenant_id}|pricewrite|{sku}")],
         [("🏷️ Aplicar descuento %", f"admmenu|{tenant_id}|discount|{sku}")],
+        [("🖼 Subir foto producto", f"admmenu|{tenant_id}|photo|{sku}")],
         [("⬅️ Volver a categoría", f"admmenu|{tenant_id}|catback")],
         [("🏠 Categorías", f"admmenu|{tenant_id}|home")],
     ])
@@ -1813,6 +1814,20 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 )
                 return {"ok": True}
 
+            if action == "photo" and len(parts) == 4:
+                sku = parts[3].strip()
+                tmp["admin_menu_input_mode"] = "awaiting_photo"
+                tmp["admin_menu_price_sku"] = sku
+
+                item = get_menu_product_or_404(orders_sh, sku)
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    f"📷 Envía ahora la foto para:\n{item.get('name','')}"
+                )
+                return {"ok": True}
+
             return {"ok": True}
 
         # -------------------------
@@ -1879,6 +1894,17 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 rows.append([("🏠 Inicio", "home")])
 
                 telegram_send_text(bot_token, chat_id, f"🍽 {real_cat} — elige un producto:", kb(rows))
+
+                for it in items:
+                    photo_file_id = str(it.get("photo_file_id") or "").strip()
+                    if photo_file_id:
+                        telegram_send_photo(
+                            bot_token,
+                            chat_id,
+                            photo_file_id,
+                            caption=f"{it['name']}\nBs {it['price']}",
+                        )
+
                 return {"ok": True}
 
             if data.startswith("prd|"):
@@ -2295,6 +2321,70 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
             input_mode = str(tmp.get("admin_menu_input_mode") or "").strip()
             input_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
+
+            # ===============================
+            # ADMIN subida de foto producto
+            # ===============================
+            if input_mode == "awaiting_photo" and input_sku:
+                _assert_admin_authorized(tenant, chat_id, tenant_id)
+
+                if msg.get("photo"):
+                    file_id = msg["photo"][-1]["file_id"]
+
+                    ws = orders_sh.worksheet("Menu")
+                    values = ws.get_all_values()
+                    if not values:
+                        telegram_send_text(bot_token, chat_id, "No pude leer la hoja Menu.")
+                        return {"ok": True}
+
+                    header_row_1based = detect_header_row(
+                        values,
+                        required_headers=["sku", "name", "price", "active", "category"],
+                        max_scan=10,
+                    )
+                    header = values[header_row_1based - 1]
+
+                    try:
+                        sku_col = header.index("sku") + 1
+                        photo_col = header.index("photo_file_id") + 1
+                    except ValueError:
+                        telegram_send_text(bot_token, chat_id, "Falta la columna 'photo_file_id' en la hoja Menu.")
+                        return {"ok": True}
+
+                    found = False
+                    for i in range(header_row_1based + 1, len(values) + 1):
+                        row = values[i - 1]
+                        sku_val = row[sku_col - 1] if len(row) >= sku_col else ""
+                        if str(sku_val).strip() == input_sku:
+                            ws.update_cell(i, photo_col, file_id)
+                            found = True
+                            break
+
+                    if not found:
+                        telegram_send_text(bot_token, chat_id, f"No encontré el producto SKU {input_sku} en la hoja Menu.")
+                        return {"ok": True}
+
+                    invalidate_menu_cache(orders_sh)
+
+                    tmp.pop("admin_menu_input_mode", None)
+                    tmp.pop("admin_menu_price_sku", None)
+
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "✅ Foto guardada correctamente",
+                    )
+
+                    return {"ok": _send_admin_menu_product_detail(
+                        bot_token, chat_id, tenant_id, orders_sh, sess, input_sku
+                    )}
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "📷 Estoy esperando una foto del producto. Envíala como imagen de Telegram.",
+                )
+                return {"ok": True}
 
             if input_mode and input_sku:
                 _assert_admin_authorized(tenant, chat_id, tenant_id)
