@@ -921,213 +921,198 @@ def _send_admin_late_open_menu(bot_token: str, chat_id: int, tenant_id: str) -> 
 
 
 # -------------------------
-# Admin menú y precios helpers
+# Forward proof to admin
 # -------------------------
 
-def _admin_menu_home_kb(tenant_id: str, cats: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
-    cat_names = sorted(cats.keys(), key=lambda x: normalize(x))
-    rows: List[List[Tuple[str, str]]] = []
+def _forward_proof_to_admin(
+    tenant: Dict[str, Any],
+    tenant_id: str,
+    proof_file_id: str,
+    proof_type: str,
+    proof_caption: str,
+) -> bool:
+    client_token = get_client_bot_token(tenant)
+    admin_token = get_admin_bot_token(tenant)
+    admin_chat_id = get_admin_chat_id(tenant)
 
-    for idx, cat in enumerate(cat_names):
-        items = cats.get(cat, [])
-        total_n = len(items)
-        active_n = sum(1 for it in items if bool(it.get("active", False)))
-        rows.append([(f"📂 {cat} ({active_n}/{total_n})", f"admmenu|{tenant_id}|cat|{idx}")])
-
-    rows.append([("🔄 Refrescar menú", f"admmenu|{tenant_id}|refresh")])
-    rows.append([("⬅️ Volver al panel", f"admmenu|{tenant_id}|panel")])
-    return kb(rows)
-
-
-def _send_admin_menu_home(bot_token: str, chat_id: int, tenant_id: str, orders_sh, sess: Dict[str, Any]) -> bool:
-    menu_idx = load_menu_admin_index(orders_sh, force=False)
-    cats = group_menu_admin_by_category(menu_idx)
-    cat_names = sorted(cats.keys(), key=lambda x: normalize(x))
-
-    sess.setdefault("tmp", {})["admin_menu_categories"] = cat_names
-    sess["tmp"].pop("admin_menu_current_category", None)
-    sess["tmp"].pop("admin_menu_price_sku", None)
-    sess["tmp"].pop("admin_menu_price_work", None)
-    sess["tmp"].pop("admin_menu_input_mode", None)
-
-    total_products = len(menu_idx)
-    total_active = sum(1 for v in menu_idx.values() if bool(v.get("active", False)))
-    total_categories = len(cats)
-
-    msg = (
-        "⚙️ CONFIG MENÚ Y PRECIOS\n\n"
-        f"Productos totales: {total_products}\n"
-        f"Productos activos: {total_active}\n"
-        f"Categorías: {total_categories}\n\n"
-        "Elige una categoría:"
-    )
-
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        msg,
-        reply_markup=_admin_menu_home_kb(tenant_id, cats),
-    )
-
-
-def _admin_menu_category_kb(tenant_id: str, category: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    rows: List[List[Tuple[str, str]]] = []
-
-    for it in items[:25]:
-        emoji = "🟢" if bool(it.get("active", False)) else "🔴"
-        price_txt = _fmt_price_short(it.get("price", 0))
-        sku = str(it.get("sku") or "").strip()
-        rows.append([(f"{emoji} {it.get('name','')} — Bs {price_txt}", f"admmenu|{tenant_id}|prd|{sku}")])
-
-    rows.append([("🔄 Refrescar categoría", f"admmenu|{tenant_id}|catrefresh")])
-    rows.append([("⬅️ Categorías", f"admmenu|{tenant_id}|home")])
-
-    return kb(rows)
-
-
-def _send_admin_menu_category(bot_token: str, chat_id: int, tenant_id: str, orders_sh, sess: Dict[str, Any], category: str) -> bool:
-    menu_idx = load_menu_admin_index(orders_sh, force=False)
-    cats = group_menu_admin_by_category(menu_idx)
-    items = cats.get(category, [])
-
-    sess.setdefault("tmp", {})["admin_menu_current_category"] = category
-    sess["tmp"].pop("admin_menu_price_sku", None)
-    sess["tmp"].pop("admin_menu_price_work", None)
-    sess["tmp"].pop("admin_menu_input_mode", None)
-
-    total_n = len(items)
-    active_n = sum(1 for it in items if bool(it.get("active", False)))
-
-    msg = (
-        f"📂 CATEGORÍA: {category}\n\n"
-        f"Productos: {total_n}\n"
-        f"Activos: {active_n}\n"
-        f"Inactivos: {max(0, total_n - active_n)}\n\n"
-        "Elige un producto:"
-    )
-
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        msg,
-        reply_markup=_admin_menu_category_kb(tenant_id, category, items),
-    )
-
-
-def _admin_menu_product_kb(tenant_id: str, sku: str, active: bool) -> Dict[str, Any]:
-    toggle_label = "⛔ Desactivar" if active else "✅ Activar"
-
-    return kb([
-        [(toggle_label, f"admmenu|{tenant_id}|toggle|{sku}")],
-        [("💲 Ajustar precio", f"admmenu|{tenant_id}|price|{sku}")],
-        [("✍️ Escribir precio final", f"admmenu|{tenant_id}|pricewrite|{sku}")],
-        [("🏷️ Aplicar descuento %", f"admmenu|{tenant_id}|discount|{sku}")],
-        [("🖼 Subir foto producto", f"admmenu|{tenant_id}|photo|{sku}")],
-        [("⬅️ Volver a categoría", f"admmenu|{tenant_id}|catback")],
-        [("🏠 Categorías", f"admmenu|{tenant_id}|home")],
-    ])
-
-
-def _send_admin_menu_product_detail(bot_token: str, chat_id: int, tenant_id: str, orders_sh, sess: Dict[str, Any], sku: str) -> bool:
-    item = get_menu_product_or_404(orders_sh, sku)
-    sess.setdefault("tmp", {})["admin_menu_last_sku"] = sku
-    sess["tmp"].pop("admin_menu_price_sku", None)
-    sess["tmp"].pop("admin_menu_price_work", None)
-    sess["tmp"].pop("admin_menu_input_mode", None)
-
-    active_txt = "Sí" if bool(item.get("active", False)) else "No"
-    price_txt = _fmt_price_short(item.get("price", 0))
-
-    msg = (
-        "🧾 DETALLE DE PRODUCTO\n\n"
-        f"SKU: {item.get('sku','')}\n"
-        f"Nombre: {item.get('name','')}\n"
-        f"Categoría: {item.get('category','')}\n"
-        f"Activo: {active_txt}\n"
-        f"Precio actual: Bs {price_txt}\n"
-    )
-
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        msg,
-        reply_markup=_admin_menu_product_kb(tenant_id, sku, bool(item.get("active", False))),
-    )
-
-
-def _admin_menu_price_kb(tenant_id: str, sku: str) -> Dict[str, Any]:
-    row1: List[Tuple[str, str]] = []
-    row2: List[Tuple[str, str]] = []
-
-    for label, delta in PRICE_STEP_OPTIONS[:3]:
-        token = f"m{int(abs(delta))}" if delta < 0 else f"p{int(delta)}"
-        row1.append((label, f"admmenu|{tenant_id}|padj|{sku}|{token}"))
-
-    for label, delta in PRICE_STEP_OPTIONS[3:]:
-        token = f"m{int(abs(delta))}" if delta < 0 else f"p{int(delta)}"
-        row2.append((label, f"admmenu|{tenant_id}|padj|{sku}|{token}"))
-
-    return kb([
-        row1,
-        row2,
-        [("💾 Guardar precio", f"admmenu|{tenant_id}|psave|{sku}")],
-        [("↩️ Cancelar", f"admmenu|{tenant_id}|pback|{sku}")],
-    ])
-
-
-def _send_admin_menu_price_editor(bot_token: str, chat_id: int, tenant_id: str, orders_sh, sess: Dict[str, Any], sku: str) -> bool:
-    item = get_menu_product_or_404(orders_sh, sku)
-    tmp = sess.setdefault("tmp", {})
-
-    current_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
-    if current_sku != sku:
-        tmp["admin_menu_price_sku"] = sku
-        tmp["admin_menu_price_work"] = float(item.get("price", 0.0))
-
-    work_price = float(tmp.get("admin_menu_price_work") or 0.0)
-
-    msg = (
-        "💲 AJUSTAR PRECIO\n\n"
-        f"Producto: {item.get('name','')}\n"
-        f"SKU: {item.get('sku','')}\n"
-        f"Precio guardado: Bs {_fmt_price_short(item.get('price', 0))}\n"
-        f"Precio en edición: Bs {_fmt_price_short(work_price)}\n\n"
-        "Usa los botones para subir o bajar el precio.\n"
-        "Luego presiona “Guardar precio”."
-    )
-
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        msg,
-        reply_markup=_admin_menu_price_kb(tenant_id, sku),
-    )
-
-
-def _apply_price_delta(current_value: float, token: str) -> float:
-    token = str(token or "").strip().lower()
-    if not token or len(token) < 2:
-        return current_value
-
-    sign = token[0]
-    num = token[1:]
+    if not client_token or not admin_token or not admin_chat_id:
+        log_event(
+            "forward_proof_missing_config",
+            tenant_id=tenant_id,
+            has_client=bool(client_token),
+            has_admin=bool(admin_token),
+            has_admin_chat=bool(admin_chat_id),
+        )
+        return False
 
     try:
-        amount = float(num)
-    except Exception:
-        return current_value
+        file_path = _telegram_get_file_path(client_token, proof_file_id)
+        file_bytes = _telegram_download_file_bytes(client_token, file_path)
+        filename = file_path.split("/")[-1] if file_path else "proof"
+        caption = proof_caption or ("Comprobante (foto)" if proof_type == "photo" else "Comprobante (archivo)")
 
-    if sign == "m":
-        new_value = current_value - amount
-    elif sign == "p":
-        new_value = current_value + amount
+        if proof_type == "photo":
+            return _telegram_send_file_bytes_admin(
+                admin_token=admin_token,
+                method="sendPhoto",
+                chat_id=admin_chat_id,
+                file_field="photo",
+                filename=filename or "proof.jpg",
+                content_type="image/jpeg",
+                file_bytes=file_bytes,
+                caption=caption,
+            )
+
+        return _telegram_send_file_bytes_admin(
+            admin_token=admin_token,
+            method="sendDocument",
+            chat_id=admin_chat_id,
+            file_field="document",
+            filename=filename or "proof.pdf",
+            content_type="application/octet-stream",
+            file_bytes=file_bytes,
+            caption=caption,
+        )
+
+    except Exception as e:
+        log_event("forward_proof_failed", tenant_id=tenant_id, error=str(e))
+        return False
+
+
+# -------------------------
+# Admin notify
+# -------------------------
+
+def notify_admin_payment_reported(
+    tenant: Dict[str, Any],
+    tenant_id: str,
+    orders_sh,
+    order_id: str,
+    is_reminder: bool = False,
+) -> bool:
+    admin_token = get_admin_bot_token(tenant)
+    admin_chat_id = get_admin_chat_id(tenant)
+
+    if not admin_token or not admin_chat_id:
+        log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_admin_token_or_chat")
+        return False
+
+    order = get_order_by_id(orders_sh, order_id)
+    if not order:
+        telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
+        return False
+
+    items_snapshot = parse_items_field(order.get("items_snapshot"))
+    if items_snapshot:
+        lines_txt, snapshot_total, total_qty = fmt_snapshot_lines(items_snapshot)
+        total = snapshot_total
     else:
-        return current_value
+        try:
+            menu_idx = load_menu_index(orders_sh)
+        except Exception as e:
+            log_event("admin_menu_load_error", tenant_id=tenant_id, error=str(e))
+            menu_idx = {}
+        cart = parse_items_field(order.get("items"))
+        lines_txt, _, total_qty = fmt_cart_lines(cart, menu_idx)
+        try:
+            total = float(order.get("total_amount") or 0)
+        except Exception:
+            total = 0.0
 
-    if new_value < 0:
-        new_value = 0.0
+    proof_file_id = (order.get("payment_proof_file_id") or "").strip()
+    proof_type = (order.get("payment_proof_type") or "").strip()
+    proof_caption = (order.get("payment_proof_caption") or "").strip()
 
-    return round(new_value, 2)
+    confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{order_id}")]])
+
+    title = "🔔 RECORDATORIO — PAGO REPORTADO" if is_reminder else "💳 PAGO REPORTADO"
+    txt = (
+        f"{title}\n\n"
+        f"Tenant: {tenant_id}\n"
+        f"ID: {order_id}\n"
+        f"Cliente: {order.get('customer_name','')}\n"
+        f"Contacto(chat_id): {order.get('customer_contact','')}\n"
+        f"Hora recogida: {order.get('requested_time','pendiente')}\n"
+        f"Cantidad total: {total_qty}\n"
+        f"Total: {total:.2f} BOB\n\n"
+        f"Detalle:\n{lines_txt}\n\n"
+        "Presiona ✅ Confirmar pago cuando verifiques."
+    )
+
+    ok_txt = telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn)
+
+    ok_proof = False
+    if proof_file_id and proof_type:
+        ok_proof = _forward_proof_to_admin(tenant, tenant_id, proof_file_id, proof_type, proof_caption)
+    else:
+        log_event("admin_missing_proof", tenant_id=tenant_id, order_id=order_id)
+
+    log_event(
+        "admin_notify_result",
+        tenant_id=tenant_id,
+        order_id=order_id,
+        ok_txt=bool(ok_txt),
+        ok_proof=bool(ok_proof),
+        is_reminder=bool(is_reminder),
+    )
+    return bool(ok_txt)
+
+
+# -------------------------
+# Client keyboards
+# -------------------------
+
+def client_home_kb() -> Dict[str, Any]:
+    return kb([
+        [("📋 Ver menú", "menu")],
+        [("🛒 Ver carrito", "cart")],
+    ])
+
+
+def cart_kb(has_items: bool) -> Dict[str, Any]:
+    rows = []
+    if has_items:
+        rows.append([("✅ Confirmar pedido", "cart_confirm")])
+        rows.append([("🧹 Vaciar carrito", "cart_clear")])
+    rows.append([("⬅️ Seguir comprando", "menu")])
+    rows.append([("🏠 Inicio", "home")])
+    return kb(rows)
+
+
+def i_paid_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
+    return kb([
+        [("✅ Ya pagué", f"i_paid|{tenant_id}|{order_id}")],
+        [("🏠 Inicio", "home")],
+    ])
+
+
+def paid_actions_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
+    return kb([
+        [("🔔 Recordar al administrador", f"remind|{tenant_id}|{order_id}")],
+        [("🏠 Inicio", "home")],
+    ])
+
+
+def contact_admin_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
+    return kb([
+        [("💬 Contactar al administrador", f"contact|{tenant_id}|{order_id}")],
+        [("🏠 Inicio", "home")],
+    ])
+
+
+def admin_fixed_kb() -> Dict[str, Any]:
+    return reply_kb([
+        ["📊 Estadísticas"],
+        ["⚙️ Config días y horarios"],
+        ["⚙️ Config menú y precios"],
+    ], resize=True, one_time=False)
+
+
+def admin_periods_inline_kb(tenant_id: str, periods: List[Tuple[str, str]]) -> Dict[str, Any]:
+    rows = []
+    for label, key in periods:
+        rows.append([(f"📊 {label}", f"admin_stats_period|{tenant_id}|{key}")])
+    return kb(rows)
 
 
 # -------------------------
@@ -1421,7 +1406,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     enabled=True,
                     updated_by=updated_by,
                 )
-                _admin_set_today_open_force(
+                _admin_set_today_open_FORCE = _admin_set_today_open_force
+                _admin_set_today_open_FORCE(
                     orders_sh=orders_sh,
                     enabled=False,
                     updated_by=updated_by,
@@ -2136,85 +2122,12 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             input_mode = str(tmp.get("admin_menu_input_mode") or "").strip()
             input_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
 
-            # ===============================
-            # ADMIN subida de foto producto
-            # ===============================
+            # subida de foto producto (estado estable que ya te funcionaba)
             if input_mode == "awaiting_photo" and input_sku:
                 _assert_admin_authorized(tenant, chat_id, tenant_id)
 
                 if msg.get("photo"):
-                    admin_file_id = msg["photo"][-1]["file_id"]
-
-                    client_token = get_client_bot_token(tenant)
-                    if not client_token:
-                        telegram_send_text(bot_token, chat_id, "Falta configurar client_bot_token para este tenant.")
-                        return {"ok": True}
-
-                    try:
-                        admin_file_path = _telegram_get_file_path(bot_token, admin_file_id)
-                        file_bytes = _telegram_download_file_bytes(bot_token, admin_file_path)
-                    except Exception as e:
-                        telegram_send_text(bot_token, chat_id, "No pude descargar la foto enviada.")
-                        log_event("admin_product_photo_download_failed", tenant_id=tenant_id, sku=input_sku, error=str(e))
-                        return {"ok": True}
-
-                    upload_chat_id = get_admin_chat_id(tenant) or chat_id
-                    upload_url = f"{TELEGRAM_API_BASE}/bot{client_token}/sendPhoto"
-                    body, ctype = _multipart_encode(
-                        fields={"chat_id": str(upload_chat_id)},
-                        file_field="photo",
-                        filename="product.jpg",
-                        content_type="image/jpeg",
-                        file_bytes=file_bytes,
-                    )
-                    req = urllib.request.Request(
-                        upload_url,
-                        data=body,
-                        headers={"Content-Type": ctype},
-                        method="POST",
-                    )
-
-                    try:
-                        with urllib.request.urlopen(req, timeout=30) as resp:
-                            raw = resp.read().decode("utf-8")
-                            data_up = json.loads(raw)
-                    except Exception as e:
-                        telegram_send_text(bot_token, chat_id, "No pude re-subir la foto al bot cliente.")
-                        log_event("admin_product_photo_reupload_failed", tenant_id=tenant_id, sku=input_sku, error=str(e))
-                        return {"ok": True}
-
-                    if not data_up.get("ok"):
-                        telegram_send_text(bot_token, chat_id, "La foto no pudo subirse al bot cliente.")
-                        log_event("admin_product_photo_reupload_not_ok", tenant_id=tenant_id, sku=input_sku, response=data_up)
-                        return {"ok": True}
-
-                    try:
-                        client_file_id = data_up["result"]["photo"][-1]["file_id"]
-                        temp_message_id = data_up["result"]["message_id"]
-                    except Exception:
-                        telegram_send_text(bot_token, chat_id, "No pude obtener el file_id final del bot cliente.")
-                        log_event("admin_product_photo_missing_client_file_id", tenant_id=tenant_id, sku=input_sku, response=data_up)
-                        return {"ok": True}
-
-                    # borrar inmediatamente el mensaje temporal para que no quede visible
-                    try:
-                        telegram_api_call(
-                            client_token,
-                            "deleteMessage",
-                            {
-                                "chat_id": upload_chat_id,
-                                "message_id": temp_message_id,
-                            },
-                        )
-                    except Exception as e:
-                        log_event(
-                            "admin_product_temp_message_delete_failed",
-                            tenant_id=tenant_id,
-                            sku=input_sku,
-                            chat_id=upload_chat_id,
-                            message_id=temp_message_id,
-                            error=str(e),
-                        )
+                    file_id = msg["photo"][-1]["file_id"]
 
                     ws = orders_sh.worksheet("Menu")
                     values = ws.get_all_values()
@@ -2241,7 +2154,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                         row = values[i - 1]
                         sku_val = row[sku_col - 1] if len(row) >= sku_col else ""
                         if str(sku_val).strip() == input_sku:
-                            ws.update_cell(i, photo_col, client_file_id)
+                            ws.update_cell(i, photo_col, file_id)
                             found = True
                             break
 
@@ -2257,7 +2170,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        "✅ Foto guardada correctamente para el bot cliente.",
+                        "✅ Foto guardada correctamente",
                     )
 
                     return {"ok": _send_admin_menu_product_detail(
