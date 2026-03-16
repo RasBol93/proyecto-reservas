@@ -2325,66 +2325,115 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             # ===============================
             # ADMIN subida de foto producto
             # ===============================
-            if input_mode == "awaiting_photo" and input_sku:
-                _assert_admin_authorized(tenant, chat_id, tenant_id)
+         if input_mode == "awaiting_photo" and input_sku:
+    _assert_admin_authorized(tenant, chat_id, tenant_id)
 
-                if msg.get("photo"):
-                    file_id = msg["photo"][-1]["file_id"]
+    if msg.get("photo"):
+        admin_file_id = msg["photo"][-1]["file_id"]
 
-                    ws = orders_sh.worksheet("Menu")
-                    values = ws.get_all_values()
-                    if not values:
-                        telegram_send_text(bot_token, chat_id, "No pude leer la hoja Menu.")
-                        return {"ok": True}
+        client_token = get_client_bot_token(tenant)
+        if not client_token:
+            telegram_send_text(bot_token, chat_id, "Falta configurar client_bot_token para este tenant.")
+            return {"ok": True}
 
-                    header_row_1based = detect_header_row(
-                        values,
-                        required_headers=["sku", "name", "price", "active", "category"],
-                        max_scan=10,
-                    )
-                    header = values[header_row_1based - 1]
+        try:
+            admin_file_path = _telegram_get_file_path(bot_token, admin_file_id)
+            file_bytes = _telegram_download_file_bytes(bot_token, admin_file_path)
+        except Exception as e:
+            telegram_send_text(bot_token, chat_id, "No pude descargar la foto enviada.")
+            log_event("admin_product_photo_download_failed", tenant_id=tenant_id, sku=input_sku, error=str(e))
+            return {"ok": True}
 
-                    try:
-                        sku_col = header.index("sku") + 1
-                        photo_col = header.index("photo_file_id") + 1
-                    except ValueError:
-                        telegram_send_text(bot_token, chat_id, "Falta la columna 'photo_file_id' en la hoja Menu.")
-                        return {"ok": True}
+        upload_url = f"{TELEGRAM_API_BASE}/bot{client_token}/sendPhoto"
+        body, ctype = _multipart_encode(
+            fields={"chat_id": str(chat_id)},
+            file_field="photo",
+            filename="product.jpg",
+            content_type="image/jpeg",
+            file_bytes=file_bytes,
+        )
+        req = urllib.request.Request(
+            upload_url,
+            data=body,
+            headers={"Content-Type": ctype},
+            method="POST",
+        )
 
-                    found = False
-                    for i in range(header_row_1based + 1, len(values) + 1):
-                        row = values[i - 1]
-                        sku_val = row[sku_col - 1] if len(row) >= sku_col else ""
-                        if str(sku_val).strip() == input_sku:
-                            ws.update_cell(i, photo_col, file_id)
-                            found = True
-                            break
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8")
+                data_up = json.loads(raw)
+        except Exception as e:
+            telegram_send_text(bot_token, chat_id, "No pude re-subir la foto al bot cliente.")
+            log_event("admin_product_photo_reupload_failed", tenant_id=tenant_id, sku=input_sku, error=str(e))
+            return {"ok": True}
 
-                    if not found:
-                        telegram_send_text(bot_token, chat_id, f"No encontré el producto SKU {input_sku} en la hoja Menu.")
-                        return {"ok": True}
+        if not data_up.get("ok"):
+            telegram_send_text(bot_token, chat_id, "La foto no pudo subirse al bot cliente.")
+            log_event("admin_product_photo_reupload_not_ok", tenant_id=tenant_id, sku=input_sku, response=data_up)
+            return {"ok": True}
 
-                    invalidate_menu_cache(orders_sh)
+        try:
+            client_file_id = data_up["result"]["photo"][-1]["file_id"]
+        except Exception:
+            telegram_send_text(bot_token, chat_id, "No pude obtener el file_id final del bot cliente.")
+            log_event("admin_product_photo_missing_client_file_id", tenant_id=tenant_id, sku=input_sku, response=data_up)
+            return {"ok": True}
 
-                    tmp.pop("admin_menu_input_mode", None)
-                    tmp.pop("admin_menu_price_sku", None)
+        ws = orders_sh.worksheet("Menu")
+        values = ws.get_all_values()
+        if not values:
+            telegram_send_text(bot_token, chat_id, "No pude leer la hoja Menu.")
+            return {"ok": True}
 
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        "✅ Foto guardada correctamente",
-                    )
+        header_row_1based = detect_header_row(
+            values,
+            required_headers=["sku", "name", "price", "active", "category"],
+            max_scan=10,
+        )
+        header = values[header_row_1based - 1]
 
-                    return {"ok": _send_admin_menu_product_detail(
-                        bot_token, chat_id, tenant_id, orders_sh, sess, input_sku
-                    )}
+        try:
+            sku_col = header.index("sku") + 1
+            photo_col = header.index("photo_file_id") + 1
+        except ValueError:
+            telegram_send_text(bot_token, chat_id, "Falta la columna 'photo_file_id' en la hoja Menu.")
+            return {"ok": True}
 
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    "📷 Estoy esperando una foto del producto. Envíala como imagen de Telegram.",
-                )
-                return {"ok": True}
+        found = False
+        for i in range(header_row_1based + 1, len(values) + 1):
+            row = values[i - 1]
+            sku_val = row[sku_col - 1] if len(row) >= sku_col else ""
+            if str(sku_val).strip() == input_sku:
+                ws.update_cell(i, photo_col, client_file_id)
+                found = True
+                break
+
+        if not found:
+            telegram_send_text(bot_token, chat_id, f"No encontré el producto SKU {input_sku} en la hoja Menu.")
+            return {"ok": True}
+
+        invalidate_menu_cache(orders_sh)
+
+        tmp.pop("admin_menu_input_mode", None)
+        tmp.pop("admin_menu_price_sku", None)
+
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            "✅ Foto guardada correctamente para el bot cliente.",
+        )
+
+        return {"ok": _send_admin_menu_product_detail(
+            bot_token, chat_id, tenant_id, orders_sh, sess, input_sku
+        )}
+
+    telegram_send_text(
+        bot_token,
+        chat_id,
+        "📷 Estoy esperando una foto del producto. Envíala como imagen de Telegram.",
+    )
+    return {"ok": True}
 
             if input_mode and input_sku:
                 _assert_admin_authorized(tenant, chat_id, tenant_id)
