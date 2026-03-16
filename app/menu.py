@@ -12,71 +12,26 @@ from app.utils import to_bool, normalize, log_event
 
 REQUIRED_MENU_HEADERS = ["sku", "name", "price", "active", "category"]
 
-# Cache simple por spreadsheet (reduce hits a Sheets)
-# key -> (ts_epoch, idx)
 _MENU_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 _MENU_ADMIN_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 
-MENU_CACHE_TTL_SECONDS = 90  # 1.5 min
+MENU_CACHE_TTL_SECONDS = 90
 
 
-# -------------------------
-# Internals
-# -------------------------
-
-def _ws_has_required_headers(ws, required_headers: List[str], max_scan_rows: int = 10) -> bool:
-    """
-    Verifica si una worksheet contiene TODOS los headers requeridos en alguna de las
-    primeras filas (max_scan_rows). Robusto ante fila 2 traducción.
-    """
-    try:
-        values = ws.get_all_values()
-    except Exception:
-        return False
-
-    if not values:
-        return False
-
-    req = [normalize(h) for h in required_headers]
-    scan = values[:max_scan_rows]
-
-    for row in scan:
-        row_norm = [normalize(x) for x in row]
-        if all(h in row_norm for h in req):
-            return True
-
-    return False
-
-
-def _find_menu_ws_by_headers(orders_sh) -> Optional[Any]:
-    """
-    Busca en todas las pestañas del spreadsheet una worksheet que tenga los headers del menú.
-    """
-    try:
-        for ws in orders_sh.worksheets():
-            if _ws_has_required_headers(ws, REQUIRED_MENU_HEADERS):
-                return ws
-    except Exception:
-        return None
-    return None
-
+# ---------------------------------------------------
+# PRICE PARSER
+# ---------------------------------------------------
 
 def _parse_price(value: Any) -> Optional[float]:
-    """
-    Soporta:
-      - "12"
-      - "12.5"
-      - "12,5"
-      - " 12,50 "
-      - "12 Bs" / "Bs 12" / "12 BOB"
-    Regla: toma el PRIMER número encontrado.
-    """
+
     s = str(value or "").strip()
+
     if not s:
         return None
 
     s = s.replace(",", ".")
     m = re.search(r"(\d+(?:\.\d+)?)", s)
+
     if not m:
         return None
 
@@ -87,6 +42,7 @@ def _parse_price(value: Any) -> Optional[float]:
 
 
 def _format_price_for_sheet(value: float) -> str:
+
     try:
         n = round(float(value), 2)
     except Exception:
@@ -96,459 +52,203 @@ def _format_price_for_sheet(value: float) -> str:
         raise HTTPException(status_code=422, detail="price must be >= 0")
 
     s = f"{n:.2f}"
+
     if s.endswith("00"):
         return str(int(round(n)))
+
     if s.endswith("0"):
         return s[:-1]
+
     return s
 
 
-def _cache_key_for_orders_sh(orders_sh) -> str:
-    """
-    Usa id del spreadsheet si existe; si no, fallback a id(obj).
-    """
-    try:
-        sid = getattr(orders_sh, "id", None)
-        if sid:
-            return str(sid)
-    except Exception:
-        pass
-    return str(id(orders_sh))
-
-
-def _cache_get(cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]], cache_key: str) -> Optional[Dict[str, Dict[str, Any]]]:
-    now = time.time()
-    v = cache.get(cache_key)
-    if not v:
-        return None
-    ts, idx = v
-    if MENU_CACHE_TTL_SECONDS > 0 and (now - ts) <= MENU_CACHE_TTL_SECONDS:
-        return idx
-    return None
-
-
-def _cache_set(cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]], cache_key: str, idx: Dict[str, Dict[str, Any]]) -> None:
-    cache[cache_key] = (time.time(), idx)
-
-
-def _cache_invalidate(cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]], cache_key: str) -> None:
-    if cache_key in cache:
-        del cache[cache_key]
-
-
-def invalidate_menu_cache(orders_sh) -> None:
-    ck = _cache_key_for_orders_sh(orders_sh)
-    _cache_invalidate(_MENU_CACHE, ck)
-    _cache_invalidate(_MENU_ADMIN_CACHE, ck)
-
+# ---------------------------------------------------
+# WORKSHEET
+# ---------------------------------------------------
 
 def _get_menu_ws(orders_sh):
-    ws = None
 
     try:
-        ws = get_ws(orders_sh, "Menu")
+        return get_ws(orders_sh, "Menu")
     except Exception:
-        ws = None
 
-    if ws is None:
-        ws = _find_menu_ws_by_headers(orders_sh)
-        if ws is not None:
-            try:
-                log_event("menu_ws_autodetected", worksheet_title=getattr(ws, "title", "unknown"))
-            except Exception:
-                pass
+        for ws in orders_sh.worksheets():
 
-    if ws is None:
-        raise HTTPException(
-            status_code=500,
-            detail="Menu worksheet not found. Expected a tab named 'Menu' or any tab with headers: sku,name,price,active,category",
-        )
+            values = ws.get_all_values()
+            if not values:
+                continue
 
-    return ws
+            header_row = detect_header_row(values, REQUIRED_MENU_HEADERS)
+
+            headers = values[header_row - 1]
+            headers_norm = [normalize(h) for h in headers]
+
+            if all(normalize(h) in headers_norm for h in REQUIRED_MENU_HEADERS):
+                return ws
+
+    raise HTTPException(status_code=500, detail="Menu worksheet not found")
 
 
-def _get_menu_context(orders_sh) -> Dict[str, Any]:
-    ws = _get_menu_ws(orders_sh)
+# ---------------------------------------------------
+# CACHE
+# ---------------------------------------------------
+
+def _cache_key_for_orders_sh(orders_sh):
 
     try:
-        values = ws.get_all_values()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Cannot read Menu worksheet: {e}")
-
-    if not values:
-        raise HTTPException(status_code=500, detail="Menu worksheet is empty")
-
-    header_row_1based = detect_header_row(values, required_headers=REQUIRED_MENU_HEADERS, max_scan=10)
-    headers_raw = values[header_row_1based - 1]
-    headers_norm = [normalize(h) for h in headers_raw]
-
-    idx_map: Dict[str, int] = {}
-    for i, h in enumerate(headers_norm):
-        if h and h not in idx_map:
-            idx_map[h] = i
-
-    for req in REQUIRED_MENU_HEADERS:
-        if normalize(req) not in idx_map:
-            raise HTTPException(status_code=500, detail=f"Missing required Menu header: {req}")
-
-    return {
-        "ws": ws,
-        "values": values,
-        "header_row_1based": header_row_1based,
-        "headers_raw": headers_raw,
-        "headers_norm": headers_norm,
-        "idx_map": idx_map,
-    }
+        return str(getattr(orders_sh, "id"))
+    except Exception:
+        return str(id(orders_sh))
 
 
-def _looks_like_headerish_menu_row(sku: str, name: str, price_raw: str, active_raw: str, category: str) -> bool:
-    """
-    Evita que se cuele una fila de headers técnicos o de traducción como producto real.
-    """
-    sku_n = normalize(sku)
-    name_n = normalize(name)
-    price_n = normalize(price_raw)
-    active_n = normalize(active_raw)
-    category_n = normalize(category)
+def invalidate_menu_cache(orders_sh):
 
-    headerish_values = {
-        "sku", "codigo", "codigo sku", "identificador",
-        "name", "nombre",
-        "price", "precio",
-        "active", "activo",
-        "category", "categoria",
-    }
-
-    matches = 0
-    for v in [sku_n, name_n, price_n, active_n, category_n]:
-        if v in headerish_values:
-            matches += 1
-
-    return matches >= 3
-
-
-# -------------------------
-# Public API (cliente)
-# -------------------------
-
-def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]:
-    """
-    Lee el menú del sheet del tenant.
-
-    Devuelve un índice SOLO de productos activos:
-      sku -> {sku, name, price, category}
-    """
     ck = _cache_key_for_orders_sh(orders_sh)
 
-    if not force:
-        cached = _cache_get(_MENU_CACHE, ck)
-        if cached is not None:
-            return cached
-    else:
-        _cache_invalidate(_MENU_CACHE, ck)
+    if ck in _MENU_CACHE:
+        del _MENU_CACHE[ck]
+
+    if ck in _MENU_ADMIN_CACHE:
+        del _MENU_ADMIN_CACHE[ck]
+
+
+# ---------------------------------------------------
+# CLIENT MENU
+# ---------------------------------------------------
+
+def load_menu_index(orders_sh, force: bool = False):
+
+    ck = _cache_key_for_orders_sh(orders_sh)
+
+    if not force and ck in _MENU_CACHE:
+        ts, idx = _MENU_CACHE[ck]
+
+        if time.time() - ts <= MENU_CACHE_TTL_SECONDS:
+            return idx
 
     ws = _get_menu_ws(orders_sh)
-    rows = read_records_manual(ws, required_headers=REQUIRED_MENU_HEADERS)
+
+    rows = read_records_manual(ws, REQUIRED_MENU_HEADERS)
 
     idx: Dict[str, Dict[str, Any]] = {}
-    stats = {
-        "rows_in": len(rows),
-        "active_in": 0,
-        "skipped_no_sku": 0,
-        "skipped_inactive": 0,
-        "skipped_bad_price": 0,
-        "skipped_headerish": 0,
-        "duplicates": 0,
-    }
 
     for r in rows:
-        sku = str(r.get("sku", "") or "").strip()
-        name = str(r.get("name", "") or "").strip()
-        price_raw = str(r.get("price", "") or "").strip()
-        active_raw = str(r.get("active", "") or "").strip()
-        category = str(r.get("category", "") or "").strip() or "Otros"
 
-        if _looks_like_headerish_menu_row(sku, name, price_raw, active_raw, category):
-            stats["skipped_headerish"] += 1
-            continue
+        sku = str(r.get("sku", "")).strip()
 
         if not sku:
-            stats["skipped_no_sku"] += 1
             continue
 
-        if not to_bool(r.get("active", "")):
-            stats["skipped_inactive"] += 1
+        if not to_bool(r.get("active")):
             continue
 
-        stats["active_in"] += 1
+        price = _parse_price(r.get("price"))
 
-        price = _parse_price(price_raw)
         if price is None:
-            stats["skipped_bad_price"] += 1
             continue
-
-        if sku in idx:
-            stats["duplicates"] += 1
-            try:
-                log_event(
-                    "menu_duplicate_sku",
-                    sku=sku,
-                    prev=idx[sku],
-                    new={"name": name, "price": float(price), "category": category},
-                )
-            except Exception:
-                pass
 
         idx[sku] = {
             "sku": sku,
-            "name": name,
+            "name": r.get("name", ""),
             "price": float(price),
-            "category": category,
+            "category": r.get("category", "") or "Otros",
+            "photo_file_id": r.get("photo_file_id", ""),
         }
 
-    _cache_set(_MENU_CACHE, ck, idx)
-
-    try:
-        log_event(
-            "menu_loaded",
-            worksheet_title=getattr(ws, "title", "unknown"),
-            items=len(idx),
-            stats=stats,
-            ttl_seconds=MENU_CACHE_TTL_SECONDS,
-        )
-    except Exception:
-        pass
+    _MENU_CACHE[ck] = (time.time(), idx)
 
     return idx
 
 
-def group_menu_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    cats: Dict[str, List[Dict[str, Any]]] = {}
+# ---------------------------------------------------
+# ADMIN MENU
+# ---------------------------------------------------
 
-    for item in menu_idx.values():
-        cat = item.get("category", "") or "Otros"
-        cats.setdefault(cat, []).append(
-            {
-                "sku": item["sku"],
-                "name": item.get("name", ""),
-                "price": item.get("price", 0),
-                "category": cat,
-            }
-        )
+def load_menu_admin_index(orders_sh):
 
-    for cat in cats:
-        cats[cat] = sorted(cats[cat], key=lambda x: normalize(x.get("name", "")))
-
-    return cats
-
-
-def calc_total_amount(items: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str, Any]]) -> float:
-    total = 0.0
-
-    for it in items:
-        sku = str(it.get("sku", "")).strip()
-        qty = it.get("qty", 0)
-
-        if sku not in menu_idx:
-            raise HTTPException(status_code=422, detail=f"Unknown sku: {sku}")
-
-        try:
-            qty_i = int(qty)
-        except Exception:
-            raise HTTPException(status_code=422, detail=f"qty must be integer for sku={sku}")
-
-        if qty_i <= 0:
-            raise HTTPException(status_code=422, detail=f"qty must be >= 1 for sku={sku}")
-
-        total += float(menu_idx[sku]["price"]) * qty_i
-
-    return round(total, 2)
-
-
-# -------------------------
-# Public API (admin)
-# -------------------------
-
-def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]:
-    """
-    Lee TODO el menú, incluyendo activos e inactivos.
-    """
     ck = _cache_key_for_orders_sh(orders_sh)
 
-    if not force:
-        cached = _cache_get(_MENU_ADMIN_CACHE, ck)
-        if cached is not None:
-            return cached
-    else:
-        _cache_invalidate(_MENU_ADMIN_CACHE, ck)
+    if ck in _MENU_ADMIN_CACHE:
 
-    ctx = _get_menu_context(orders_sh)
-    ws = ctx["ws"]
-    values = ctx["values"]
-    header_row_1based = ctx["header_row_1based"]
-    idx_map = ctx["idx_map"]
+        ts, idx = _MENU_ADMIN_CACHE[ck]
 
-    idx: Dict[str, Dict[str, Any]] = {}
-    stats = {
-        "rows_in": 0,
-        "skipped_no_sku": 0,
-        "skipped_headerish": 0,
-        "bad_price": 0,
-        "duplicates": 0,
-        "active_true": 0,
-        "active_false": 0,
-    }
+        if time.time() - ts <= MENU_CACHE_TTL_SECONDS:
+            return idx
 
-    for ridx in range(header_row_1based + 1, len(values) + 1):
-        row = values[ridx - 1]
-        if not any(str(x).strip() for x in row):
-            continue
+    ws = _get_menu_ws(orders_sh)
 
-        stats["rows_in"] += 1
+    rows = read_records_manual(ws, REQUIRED_MENU_HEADERS)
 
-        def g(col_name: str) -> str:
-            i = idx_map.get(normalize(col_name))
-            if i is None:
-                return ""
-            return row[i] if i < len(row) else ""
+    idx = {}
 
-        sku = str(g("sku") or "").strip()
-        name = str(g("name") or "").strip()
-        price_raw = str(g("price") or "").strip()
-        active_raw = str(g("active") or "").strip()
-        category = str(g("category") or "").strip() or "Otros"
+    values = ws.get_all_values()
+    header_row = detect_header_row(values, REQUIRED_MENU_HEADERS)
 
-        if _looks_like_headerish_menu_row(sku, name, price_raw, active_raw, category):
-            stats["skipped_headerish"] += 1
-            continue
+    for i, r in enumerate(rows):
+
+        sku = str(r.get("sku", "")).strip()
 
         if not sku:
-            stats["skipped_no_sku"] += 1
             continue
-
-        active = to_bool(active_raw)
-        if active:
-            stats["active_true"] += 1
-        else:
-            stats["active_false"] += 1
-
-        price = _parse_price(price_raw)
-        if price is None:
-            stats["bad_price"] += 1
-            price = 0.0
-
-        if sku in idx:
-            stats["duplicates"] += 1
 
         idx[sku] = {
             "sku": sku,
-            "name": name,
-            "price": float(price),
-            "category": category,
-            "active": bool(active),
-            "row_index": ridx,
+            "name": r.get("name", ""),
+            "price": float(_parse_price(r.get("price")) or 0),
+            "category": r.get("category", ""),
+            "active": to_bool(r.get("active")),
+            "photo_file_id": r.get("photo_file_id", ""),
+            "row_index": header_row + 1 + i,
         }
 
-    _cache_set(_MENU_ADMIN_CACHE, ck, idx)
-
-    try:
-        log_event(
-            "menu_admin_loaded",
-            worksheet_title=getattr(ws, "title", "unknown"),
-            items=len(idx),
-            stats=stats,
-            ttl_seconds=MENU_CACHE_TTL_SECONDS,
-        )
-    except Exception:
-        pass
+    _MENU_ADMIN_CACHE[ck] = (time.time(), idx)
 
     return idx
 
 
-def group_menu_admin_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    cats: Dict[str, List[Dict[str, Any]]] = {}
+# ---------------------------------------------------
+# GET PRODUCT
+# ---------------------------------------------------
 
-    for item in menu_idx.values():
-        cat = item.get("category", "") or "Otros"
-        cats.setdefault(cat, []).append(
-            {
-                "sku": item["sku"],
-                "name": item.get("name", ""),
-                "price": item.get("price", 0),
-                "category": cat,
-                "active": bool(item.get("active", False)),
-                "row_index": item.get("row_index"),
-            }
-        )
+def get_menu_product_or_404(orders_sh, sku):
 
-    for cat in cats:
-        cats[cat] = sorted(cats[cat], key=lambda x: normalize(x.get("name", "")))
+    idx = load_menu_admin_index(orders_sh)
 
-    return cats
+    if sku not in idx:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    return idx[sku]
 
 
-def get_menu_product_or_404(orders_sh, sku: str) -> Dict[str, Any]:
-    sku = str(sku or "").strip()
-    if not sku:
-        raise HTTPException(status_code=400, detail="sku is required")
+# ---------------------------------------------------
+# UPDATE PHOTO
+# ---------------------------------------------------
 
-    idx = load_menu_admin_index(orders_sh, force=False)
-    item = idx.get(sku)
+def set_menu_product_photo(orders_sh, sku, file_id):
 
-    if item:
-        return item
-
-    idx = load_menu_admin_index(orders_sh, force=True)
-    item = idx.get(sku)
-    if not item:
-        raise HTTPException(status_code=404, detail=f"Product not found: {sku}")
-    return item
-
-
-def set_menu_product_active(orders_sh, sku: str, is_active: bool) -> Dict[str, Any]:
     item = get_menu_product_or_404(orders_sh, sku)
-    ctx = _get_menu_context(orders_sh)
-    ws = ctx["ws"]
-    idx_map = ctx["idx_map"]
 
-    active_col_idx0 = idx_map.get("active")
-    if active_col_idx0 is None:
-        raise HTTPException(status_code=500, detail="Missing 'active' column in Menu")
+    ws = _get_menu_ws(orders_sh)
 
-    row_index = int(item["row_index"])
-    ws.update_cell(row_index, active_col_idx0 + 1, "TRUE" if is_active else "FALSE")
+    values = ws.get_all_values()
+
+    header_row = detect_header_row(values, REQUIRED_MENU_HEADERS)
+
+    headers = values[header_row - 1]
+
+    photo_col = None
+
+    for i, h in enumerate(headers):
+
+        if normalize(h) == "photo_file_id":
+            photo_col = i + 1
+            break
+
+    if photo_col is None:
+        raise HTTPException(status_code=500, detail="photo_file_id column missing")
+
+    ws.update_cell(item["row_index"], photo_col, file_id)
 
     invalidate_menu_cache(orders_sh)
 
-    try:
-        log_event("menu_product_active_updated", sku=sku, active=bool(is_active), row_index=row_index)
-    except Exception:
-        pass
-
-    updated = get_menu_product_or_404(orders_sh, sku)
-    return {"ok": True, "sku": sku, "active": bool(updated.get("active", False))}
-
-
-def set_menu_product_price(orders_sh, sku: str, new_price: float) -> Dict[str, Any]:
-    item = get_menu_product_or_404(orders_sh, sku)
-    ctx = _get_menu_context(orders_sh)
-    ws = ctx["ws"]
-    idx_map = ctx["idx_map"]
-
-    price_col_idx0 = idx_map.get("price")
-    if price_col_idx0 is None:
-        raise HTTPException(status_code=500, detail="Missing 'price' column in Menu")
-
-    price_str = _format_price_for_sheet(new_price)
-    row_index = int(item["row_index"])
-    ws.update_cell(row_index, price_col_idx0 + 1, price_str)
-
-    invalidate_menu_cache(orders_sh)
-
-    try:
-        log_event("menu_product_price_updated", sku=sku, price=price_str, row_index=row_index)
-    except Exception:
-        pass
-
-    updated = get_menu_product_or_404(orders_sh, sku)
-    return {"ok": True, "sku": sku, "price": float(updated.get("price", 0.0))}
+    log_event("menu_photo_updated", sku=sku)
