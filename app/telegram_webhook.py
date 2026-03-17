@@ -1616,6 +1616,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     enabled=True,
                     updated_by=updated_by,
                 )
+                _admin_set_today_open_FORCE = None
                 _admin_set_today_open_force(
                     orders_sh=orders_sh,
                     enabled=False,
@@ -2341,8 +2342,14 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     admin_file_id = msg["photo"][-1]["file_id"]
 
                     client_token = get_client_bot_token(tenant)
+                    admin_chat_id = get_admin_chat_id(tenant)
+
                     if not client_token:
                         telegram_send_text(bot_token, chat_id, "Falta configurar client_bot_token para este tenant.")
+                        return {"ok": True}
+
+                    if not admin_chat_id:
+                        telegram_send_text(bot_token, chat_id, "Falta configurar admin_chat_id para este tenant.")
                         return {"ok": True}
 
                     try:
@@ -2355,7 +2362,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
                     upload_url = f"{TELEGRAM_API_BASE}/bot{client_token}/sendPhoto"
                     body, ctype = _multipart_encode(
-                        fields={"chat_id": str(chat_id)},
+                        fields={"chat_id": str(admin_chat_id)},
                         file_field="photo",
                         filename="product.jpg",
                         content_type="image/jpeg",
