@@ -18,7 +18,7 @@ _TENANTS_CACHE_AT: Optional[str] = None
 _TENANTS_CACHE_AT_TS: Optional[float] = None  # epoch seconds
 
 # TTL opcional (en segundos). 0 = sin TTL (solo self-heal por miss)
-TENANTS_CACHE_TTL_SECONDS = 180  # 3 min (sube a 10-30 min cuando estés estable)
+TENANTS_CACHE_TTL_SECONDS = 180  # 3 min
 
 
 def tenants_cache_info() -> Dict[str, Any]:
@@ -120,16 +120,12 @@ def _build_row_getter(headers_norm: List[str]):
 
 def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
     """
-    Lee Tenants desde el spreadsheet de configuración (RESERVACIONES_CONFIG).
+    Lee Tenants desde el spreadsheet de configuración.
 
     Compatibilidad tokens/secrets:
       - admin_bot_token + webhook_secret_admin (nuevo)
       - bot_token + webhook_secret (viejo fallback)
       - bot_token_admin / bot_token_client (alternos)
-
-    IMPORTANTE:
-      - Agregar columnas NO debe romper nada.
-      - Si una columna no existe, get() devuelve "".
     """
     global _TENANTS_CACHE, _TENANTS_CACHE_AT, _TENANTS_CACHE_AT_TS
 
@@ -153,13 +149,20 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
         _TENANTS_CACHE_AT_TS = time.time()
         return _TENANTS_CACHE
 
-    header_idx = _detect_header_row(values, required_headers=["tenant_id", "orders_sheet_id", "active"])
+    header_idx = _detect_header_row(
+        values,
+        required_headers=["tenant_id", "orders_sheet_id", "active"]
+    )
     headers_raw = values[header_idx]
     headers_norm = [normalize(h) for h in headers_raw]
     get = _build_row_getter(headers_norm)
 
     tenants: Dict[str, Dict[str, Any]] = {}
-    skipped: Dict[str, int] = {"missing_tenant_id": 0, "inactive": 0, "missing_orders_sheet_id": 0}
+    skipped: Dict[str, int] = {
+        "missing_tenant_id": 0,
+        "inactive": 0,
+        "missing_orders_sheet_id": 0,
+    }
 
     for row in values[header_idx + 1:]:
         tid_raw = _safe_str(get(row, "tenant_id")).strip()
@@ -177,18 +180,15 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
             skipped["inactive"] += 1
             continue
 
-        # orders sheet id es esencial para operar
         orders_sheet_id = _safe_str(get(row, "orders_sheet_id")).strip()
         if not orders_sheet_id:
-            # lo dejamos inactivo "de facto" para no romper runtime
             skipped["missing_orders_sheet_id"] += 1
             continue
 
-        # tokens + secrets (compat)
         admin_bot_token = _pick_first_nonempty(
             get(row, "admin_bot_token"),
-            get(row, "bot_token"),          # viejo
-            get(row, "bot_token_admin"),    # alterno
+            get(row, "bot_token"),
+            get(row, "bot_token_admin"),
         )
         client_bot_token = _pick_first_nonempty(
             get(row, "client_bot_token"),
@@ -197,9 +197,11 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
 
         webhook_secret_admin = _pick_first_nonempty(
             get(row, "webhook_secret_admin"),
-            get(row, "webhook_secret"),     # viejo
+            get(row, "webhook_secret"),
         )
-        webhook_secret_client = _pick_first_nonempty(get(row, "webhook_secret_client"))
+        webhook_secret_client = _pick_first_nonempty(
+            get(row, "webhook_secret_client")
+        )
 
         tenant_obj: Dict[str, Any] = {
             "tenant_id": tid,
@@ -220,12 +222,15 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
             "admin_chat_id": _safe_str(get(row, "admin_chat_id")).strip(),
             "timezone": (_safe_str(get(row, "timezone")) or "America/La_Paz").strip(),
             "admin_whatsapp": _safe_str(get(row, "admin_whatsapp")).strip(),
+            "admin_username": _safe_str(get(row, "admin_username")).strip(),
 
-            # ✅ QR fields (CLAVE)
-            # (si las columnas no existen, queda "")
+            # QR
             "payment_qr_file_id": _safe_str(get(row, "payment_qr_file_id")).strip(),
             "payment_qr_url": _safe_str(get(row, "payment_qr_url")).strip(),
             "payment_qr_link": _safe_str(get(row, "payment_qr_link")).strip(),
+
+            # FOTO PRODUCTOS EN DRIVE
+            "product_photos_drive_folder_id": _safe_str(get(row, "product_photos_drive_folder_id")).strip(),
         }
 
         tenants[tid] = tenant_obj
@@ -234,7 +239,6 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
     _TENANTS_CACHE_AT = now_iso_utc()
     _TENANTS_CACHE_AT_TS = time.time()
 
-    # Log útil (sin spamear demasiado)
     try:
         log_event(
             "tenants_loaded",
@@ -252,8 +256,8 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
 def get_tenant_or_404(tenant_id: str, gc=None) -> Dict[str, Any]:
     """
     Self-heal:
-    - Intenta con cache (respetando TTL)
-    - Si no encuentra, fuerza reload UNA vez (por si cambiaste Sheets y el server no reinició)
+    - intenta con cache
+    - si no encuentra, fuerza reload una vez
     """
     tid = _norm_tenant_id(tenant_id)
     if not tid:
@@ -264,13 +268,11 @@ def get_tenant_or_404(tenant_id: str, gc=None) -> Dict[str, Any]:
     if t:
         return t
 
-    # 🔁 Self-heal reload
     tenants = load_tenants(gc=gc, force=True)
     t = tenants.get(tid)
     if not t:
         raise HTTPException(status_code=404, detail=f"Tenant not found or inactive: {tenant_id}")
 
-    # log “self-heal hit”
     try:
         log_event("tenant_self_heal_reload", tenant_id=tid)
     except Exception:
@@ -303,13 +305,10 @@ def resolve_bot_by_secret(tenant: Dict[str, Any], secret: str) -> Tuple[str, str
 
 
 # =========================================================
-# ✅ Validator (base para /admin/diag)
+# Validator
 # =========================================================
 
 def validate_tenant_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    No lanza exception. Devuelve diagnóstico claro para humanos.
-    """
     errors: List[str] = []
     warnings: List[str] = []
 
@@ -319,7 +318,6 @@ def validate_tenant_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
     if not orders_sheet_id:
         errors.append("orders_sheet_id missing")
 
-    # tokens/secrets
     admin_bot_token = (tenant.get("admin_bot_token") or "").strip()
     client_bot_token = (tenant.get("client_bot_token") or "").strip()
     secret_admin = (tenant.get("webhook_secret_admin") or "").strip()
@@ -330,7 +328,6 @@ def validate_tenant_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
     if not client_bot_token:
         warnings.append("client_bot_token missing (client bot no funcionará)")
 
-    # forma típica de token telegram: "12345:ABC..."
     if admin_bot_token and ":" not in admin_bot_token:
         warnings.append("admin_bot_token shape looks wrong (expected ':')")
     if client_bot_token and ":" not in client_bot_token:
@@ -346,19 +343,20 @@ def validate_tenant_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
     if secret_client and len(secret_client) < 8:
         warnings.append("webhook_secret_client too short (recommend >= 8)")
 
-    # QR (requerido si orders_enabled)
     orders_enabled = bool(tenant.get("orders_enabled"))
     qr_file_id = (tenant.get("payment_qr_file_id") or "").strip()
     qr_url = (tenant.get("payment_qr_url") or tenant.get("payment_qr_link") or "").strip()
 
-    if orders_enabled:
-        if not (qr_file_id or qr_url):
-            errors.append("QR missing: set payment_qr_file_id or payment_qr_url/payment_qr_link")
+    if orders_enabled and not (qr_file_id or qr_url):
+        errors.append("QR missing: set payment_qr_file_id or payment_qr_url/payment_qr_link")
 
-    # admin_chat_id recomendado si orders_enabled (porque hay confirmación pago)
     admin_chat_id = (tenant.get("admin_chat_id") or "").strip()
     if orders_enabled and not admin_chat_id:
         warnings.append("admin_chat_id missing (no podrás recibir notificaciones/confirmar pagos)")
+
+    folder_id = (tenant.get("product_photos_drive_folder_id") or "").strip()
+    if not folder_id:
+        warnings.append("product_photos_drive_folder_id missing (no podrás subir fotos de productos a Drive)")
 
     return {
         "tenant_id": tid,
@@ -374,6 +372,7 @@ def validate_tenant_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
 
         "has_qr_file_id": bool(qr_file_id),
         "has_qr_url": bool(qr_url),
+        "has_product_photos_drive_folder_id": bool(folder_id),
 
         "errors": errors,
         "warnings": warnings,
