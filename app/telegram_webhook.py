@@ -1,6 +1,7 @@
 # app/telegram_webhook.py
 
 import io
+import os
 import json
 import re
 import time
@@ -9,6 +10,7 @@ import urllib.parse
 from typing import Any, Dict, Optional, List, Tuple, Set
 
 from fastapi import APIRouter, HTTPException
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
@@ -18,7 +20,6 @@ from app.sheets import (
     get_gspread_client,
     open_spreadsheet_by_key,
     detect_header_row,
-    get_google_credentials,
 )
 from app.menu import (
     load_menu_index,
@@ -75,6 +76,11 @@ PRICE_STEP_OPTIONS: List[Tuple[str, float]] = [
     ("+1", 1.0),
     ("+5", 5.0),
     ("+10", 10.0),
+]
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
 ]
 
 
@@ -252,7 +258,19 @@ def get_payment_qr_url(tenant: Dict[str, Any]) -> str:
 # -------------------------
 
 def get_drive_service():
-    creds = get_google_credentials()
+    raw = os.getenv("GCP_CREDENTIALS_JSON", "").strip()
+    if not raw:
+        raise RuntimeError("Missing env var GCP_CREDENTIALS_JSON")
+
+    try:
+        info = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"GCP_CREDENTIALS_JSON is not valid JSON: {e}")
+
+    creds = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=GOOGLE_SCOPES,
+    )
     return build("drive", "v3", credentials=creds)
 
 
