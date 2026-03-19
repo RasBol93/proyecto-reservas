@@ -229,7 +229,7 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
             "payment_qr_url": _safe_str(get(row, "payment_qr_url")).strip(),
             "payment_qr_link": _safe_str(get(row, "payment_qr_link")).strip(),
 
-            # FOTO PRODUCTOS EN DRIVE
+            # fotos de productos
             "product_photos_drive_folder_id": _safe_str(get(row, "product_photos_drive_folder_id")).strip(),
         }
 
