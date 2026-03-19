@@ -1,7 +1,5 @@
 # app/telegram_webhook.py
 
-import io
-import os
 import json
 import re
 import time
@@ -10,9 +8,6 @@ import urllib.parse
 from typing import Any, Dict, Optional, List, Tuple, Set
 
 from fastapi import APIRouter, HTTPException
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 
 from app.config import TELEGRAM_API_BASE
 from app.tenants import get_tenant_or_404, resolve_bot_by_secret
@@ -45,6 +40,7 @@ from app.telegram_keyboard import kb
 from app.utils import normalize, log_event, now_iso_utc
 from app.stats import build_periods, resolve_period, build_stats_report_text, log_event_to_sheet
 from app.admin_settings import resolve_business_status
+from app.image_storage import upload_product_photo_for_tenant
 
 router = APIRouter()
 
@@ -76,11 +72,6 @@ PRICE_STEP_OPTIONS: List[Tuple[str, float]] = [
     ("+1", 1.0),
     ("+5", 5.0),
     ("+10", 10.0),
-]
-
-GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/spreadsheets",
 ]
 
 
@@ -222,10 +213,6 @@ def get_payment_qr_file_id(tenant: Dict[str, Any]) -> str:
     return (tenant.get("payment_qr_file_id") or "").strip()
 
 
-def get_product_photos_drive_folder_id(tenant: Dict[str, Any]) -> str:
-    return (tenant.get("product_photos_drive_folder_id") or "").strip()
-
-
 def _drive_file_id_from_url(url: str) -> Optional[str]:
     if not url:
         return None
@@ -251,66 +238,6 @@ def _normalize_public_qr_url(url: str) -> str:
 def get_payment_qr_url(tenant: Dict[str, Any]) -> str:
     raw = (tenant.get("payment_qr_url") or tenant.get("payment_qr_link") or "").strip()
     return _normalize_public_qr_url(raw)
-
-
-# -------------------------
-# Drive helpers
-# -------------------------
-
-def get_drive_service():
-    raw = os.getenv("GCP_CREDENTIALS_JSON", "").strip()
-    if not raw:
-        raise RuntimeError("Missing env var GCP_CREDENTIALS_JSON")
-
-    try:
-        info = json.loads(raw)
-    except Exception as e:
-        raise RuntimeError(f"GCP_CREDENTIALS_JSON is not valid JSON: {e}")
-
-    creds = service_account.Credentials.from_service_account_info(
-        info,
-        scopes=GOOGLE_SCOPES,
-    )
-    return build("drive", "v3", credentials=creds)
-
-
-def upload_product_photo_to_drive(
-    folder_id: str,
-    tenant_id: str,
-    sku: str,
-    file_bytes: bytes,
-    mime_type: str = "image/jpeg",
-) -> str:
-    service = get_drive_service()
-
-    ext = "jpg"
-    if mime_type == "image/png":
-        ext = "png"
-    elif mime_type == "image/webp":
-        ext = "webp"
-
-    file_name = f"{tenant_id}_{sku}_{int(time.time())}.{ext}"
-    media = MediaIoBaseUpload(io.BytesIO(file_bytes), mimetype=mime_type, resumable=False)
-
-    created = service.files().create(
-        body={
-            "name": file_name,
-            "parents": [folder_id],
-        },
-        media_body=media,
-        fields="id",
-        supportsAllDrives=True,
-    ).execute()
-
-    file_id = created["id"]
-
-    service.permissions().create(
-        fileId=file_id,
-        body={"type": "anyone", "role": "reader"},
-        supportsAllDrives=True,
-    ).execute()
-
-    return f"https://drive.google.com/uc?export=view&id={file_id}"
 
 
 # -------------------------
@@ -2467,11 +2394,6 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 if msg.get("photo"):
                     admin_file_id = msg["photo"][-1]["file_id"]
 
-                    folder_id = get_product_photos_drive_folder_id(tenant)
-                    if not folder_id:
-                        telegram_send_text(bot_token, chat_id, "Falta configurar product_photos_drive_folder_id para este tenant.")
-                        return {"ok": True}
-
                     try:
                         admin_file_path = _telegram_get_file_path(bot_token, admin_file_id)
                         file_bytes = _telegram_download_file_bytes(bot_token, admin_file_path)
@@ -2483,16 +2405,16 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                         elif low_path.endswith(".webp"):
                             content_type = "image/webp"
 
-                        photo_url = upload_product_photo_to_drive(
-                            folder_id=folder_id,
+                        photo_url = upload_product_photo_for_tenant(
+                            tenant=tenant,
                             tenant_id=tenant_id,
                             sku=input_sku,
                             file_bytes=file_bytes,
                             mime_type=content_type,
                         )
                     except Exception as e:
-                        telegram_send_text(bot_token, chat_id, "No pude subir la foto a Google Drive.")
-                        log_event("admin_product_photo_drive_upload_failed", tenant_id=tenant_id, sku=input_sku, error=str(e))
+                        telegram_send_text(bot_token, chat_id, "No pude subir la foto al storage configurado.")
+                        log_event("admin_product_photo_storage_upload_failed", tenant_id=tenant_id, sku=input_sku, error=str(e))
                         return {"ok": True}
 
                     found = _set_menu_photo_url(orders_sh, input_sku, photo_url)
@@ -2509,7 +2431,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        "✅ Foto guardada correctamente en Drive y vinculada al producto.",
+                        "✅ Foto guardada correctamente y vinculada al producto.",
                     )
 
                     return {"ok": _send_admin_menu_product_detail(
