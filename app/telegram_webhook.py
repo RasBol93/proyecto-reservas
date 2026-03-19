@@ -299,6 +299,7 @@ def upload_product_photo_to_drive(
         },
         media_body=media,
         fields="id",
+        supportsAllDrives=True,
     ).execute()
 
     file_id = created["id"]
@@ -306,6 +307,7 @@ def upload_product_photo_to_drive(
     service.permissions().create(
         fileId=file_id,
         body={"type": "anyone", "role": "reader"},
+        supportsAllDrives=True,
     ).execute()
 
     return f"https://drive.google.com/uc?export=view&id={file_id}"
