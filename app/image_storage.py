@@ -30,6 +30,18 @@ def _normalize_cloudinary_url(url: str) -> str:
     return _safe_str(url)
 
 
+def _normalize_provider(raw: str) -> str:
+    v = _safe_str(raw).lower()
+
+    if v in {"cloudinary", "cloud"}:
+        return "cloudinary"
+
+    if v in {"google_drive", "gdrive", "drive", "google"}:
+        return "google_drive"
+
+    return ""
+
+
 def _get_storage_provider(tenant: Dict[str, Any]) -> str:
     """
     Prioridad:
@@ -38,12 +50,12 @@ def _get_storage_provider(tenant: Dict[str, Any]) -> str:
     3) si hay product_photos_drive_folder_id => google_drive
     4) fallback => cloudinary
     """
-    provider = _safe_str(tenant.get("image_storage_provider")).lower()
-    if provider in {"cloudinary", "google_drive"}:
+    provider = _normalize_provider(tenant.get("image_storage_provider"))
+    if provider:
         return provider
 
-    env_provider = _safe_str(os.getenv("IMAGE_STORAGE_PROVIDER")).lower()
-    if env_provider in {"cloudinary", "google_drive"}:
+    env_provider = _normalize_provider(os.getenv("IMAGE_STORAGE_PROVIDER"))
+    if env_provider:
         return env_provider
 
     if _safe_str(tenant.get("product_photos_drive_folder_id")):
@@ -59,9 +71,15 @@ def _get_storage_provider(tenant: Dict[str, Any]) -> str:
 def _configure_cloudinary_from_tenant_or_env(tenant: Dict[str, Any]) -> None:
     """
     Busca credenciales en este orden:
-    1) columnas Tenants
-    2) variables de entorno
+    1) CLOUDINARY_URL en env
+    2) columnas Tenants
+    3) variables de entorno separadas
     """
+    cloudinary_url = _safe_str(os.getenv("CLOUDINARY_URL"))
+    if cloudinary_url:
+        cloudinary.config(cloudinary_url=cloudinary_url, secure=True)
+        return
+
     cloud_name = (
         _safe_str(tenant.get("cloudinary_cloud_name"))
         or _safe_str(os.getenv("CLOUDINARY_CLOUD_NAME"))
@@ -77,7 +95,7 @@ def _configure_cloudinary_from_tenant_or_env(tenant: Dict[str, Any]) -> None:
 
     if not cloud_name or not api_key or not api_secret:
         raise RuntimeError(
-            "Cloudinary no configurado. Faltan cloud_name/api_key/api_secret "
+            "Cloudinary no configurado. Falta CLOUDINARY_URL o cloud_name/api_key/api_secret "
             "en Tenants o en variables de entorno."
         )
 
