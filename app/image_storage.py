@@ -1,6 +1,9 @@
+# app/image_storage.py
+
 import io
+import os
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import cloudinary
 import cloudinary.uploader
@@ -30,13 +33,18 @@ def _normalize_cloudinary_url(url: str) -> str:
 def _get_storage_provider(tenant: Dict[str, Any]) -> str:
     """
     Prioridad:
-    1) image_storage_provider
-    2) si hay product_photos_drive_folder_id => google_drive
-    3) fallback => cloudinary
+    1) image_storage_provider en Tenants
+    2) env IMAGE_STORAGE_PROVIDER
+    3) si hay product_photos_drive_folder_id => google_drive
+    4) fallback => cloudinary
     """
     provider = _safe_str(tenant.get("image_storage_provider")).lower()
     if provider in {"cloudinary", "google_drive"}:
         return provider
+
+    env_provider = _safe_str(os.getenv("IMAGE_STORAGE_PROVIDER")).lower()
+    if env_provider in {"cloudinary", "google_drive"}:
+        return env_provider
 
     if _safe_str(tenant.get("product_photos_drive_folder_id")):
         return "google_drive"
@@ -48,15 +56,29 @@ def _get_storage_provider(tenant: Dict[str, Any]) -> str:
 # CLOUDINARY
 # =========================================================
 
-def _configure_cloudinary_from_tenant(tenant: Dict[str, Any]) -> None:
-    cloud_name = _safe_str(tenant.get("cloudinary_cloud_name"))
-    api_key = _safe_str(tenant.get("cloudinary_api_key"))
-    api_secret = _safe_str(tenant.get("cloudinary_api_secret"))
+def _configure_cloudinary_from_tenant_or_env(tenant: Dict[str, Any]) -> None:
+    """
+    Busca credenciales en este orden:
+    1) columnas Tenants
+    2) variables de entorno
+    """
+    cloud_name = (
+        _safe_str(tenant.get("cloudinary_cloud_name"))
+        or _safe_str(os.getenv("CLOUDINARY_CLOUD_NAME"))
+    )
+    api_key = (
+        _safe_str(tenant.get("cloudinary_api_key"))
+        or _safe_str(os.getenv("CLOUDINARY_API_KEY"))
+    )
+    api_secret = (
+        _safe_str(tenant.get("cloudinary_api_secret"))
+        or _safe_str(os.getenv("CLOUDINARY_API_SECRET"))
+    )
 
     if not cloud_name or not api_key or not api_secret:
         raise RuntimeError(
-            "Cloudinary no configurado. Faltan cloudinary_cloud_name, "
-            "cloudinary_api_key o cloudinary_api_secret en la hoja Tenants."
+            "Cloudinary no configurado. Faltan cloud_name/api_key/api_secret "
+            "en Tenants o en variables de entorno."
         )
 
     cloudinary.config(
@@ -74,12 +96,16 @@ def upload_product_photo_to_cloudinary(
     file_bytes: bytes,
     mime_type: str = "image/jpeg",
 ) -> str:
-    _configure_cloudinary_from_tenant(tenant)
+    _configure_cloudinary_from_tenant_or_env(tenant)
 
     ext = _guess_ext_from_mime(mime_type)
     public_id = f"{tenant_id}_{sku}_{int(time.time())}"
 
-    folder = _safe_str(tenant.get("cloudinary_folder")) or "product_photos"
+    folder = (
+        _safe_str(tenant.get("cloudinary_folder"))
+        or _safe_str(os.getenv("CLOUDINARY_FOLDER"))
+        or "product_photos"
+    )
 
     result = cloudinary.uploader.upload(
         io.BytesIO(file_bytes),
