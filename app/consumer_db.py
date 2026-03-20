@@ -5,8 +5,9 @@ from datetime import datetime, timedelta, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from app.sheets import detect_header_row
 from app.telegram_keyboard import kb
-from app.utils import log_event
+from app.utils import log_event, normalize
 
 
 MAX_TELEGRAM_TEXT = 3500
@@ -133,6 +134,11 @@ def _to_local(dt: datetime, tenant_tz: str) -> datetime:
     return dt.astimezone(tz)
 
 
+def _normalize_header_name(h: Any) -> str:
+    s = str(h or "").strip()
+    return normalize(s).replace(" ", "_")
+
+
 def _load_orders_records(orders_sh) -> List[Dict[str, Any]]:
     ws = None
 
@@ -151,10 +157,52 @@ def _load_orders_records(orders_sh) -> List[Dict[str, Any]]:
             return []
 
     try:
-        return ws.get_all_records()
+        values = ws.get_all_values()
     except Exception as e:
-        log_event("consumer_db_get_all_records_failed", error=str(e))
+        log_event("consumer_db_get_all_values_failed", error=str(e))
         return []
+
+    if not values:
+        log_event("consumer_db_empty_sheet")
+        return []
+
+    try:
+        header_row_1based = detect_header_row(
+            values,
+            required_headers=["created_at", "customer_name", "customer_contact", "status"],
+            max_scan=min(10, len(values)),
+        )
+    except Exception as e:
+        log_event("consumer_db_detect_header_failed", error=str(e))
+        return []
+
+    header = values[header_row_1based - 1]
+    header_norm = [_normalize_header_name(h) for h in header]
+
+    records: List[Dict[str, Any]] = []
+    for ridx in range(header_row_1based + 1, len(values) + 1):
+        row = values[ridx - 1]
+
+        # Saltar fila completamente vacía
+        if not any(str(cell or "").strip() for cell in row):
+            continue
+
+        rec: Dict[str, Any] = {}
+        for col_idx, key in enumerate(header_norm):
+            if not key:
+                continue
+            rec[key] = row[col_idx] if col_idx < len(row) else ""
+
+        records.append(rec)
+
+    log_event(
+        "consumer_db_records_loaded",
+        worksheet_title=getattr(ws, "title", ""),
+        header_row=header_row_1based,
+        total_rows=len(values),
+        loaded_records=len(records),
+    )
+    return records
 
 
 def _parse_items_snapshot(order: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -328,7 +376,7 @@ def aggregate_consumers(
             c["latest_name"] = name
 
     output: List[Dict[str, Any]] = []
-    for contact, c in consumers.items():
+    for _, c in consumers.items():
         if c["orders_count"] < min_orders:
             continue
 
@@ -336,7 +384,7 @@ def aggregate_consumers(
 
         output.append({
             "name": resolved_name,
-            "contact": contact,
+            "contact": c["contact"],
             "orders_count": int(c["orders_count"]),
             "total_spent": round(float(c["total_spent"]), 2),
             "last_purchase_dt": c["last_purchase_dt"],
@@ -349,6 +397,14 @@ def aggregate_consumers(
             -float(x["total_spent"]),
             str(x["name"]).lower(),
         )
+    )
+
+    log_event(
+        "consumer_db_aggregate_done",
+        period_key=period_key,
+        min_orders=min_orders,
+        paid_orders_in_period=paid_orders_in_period,
+        consumers_found=len(output),
     )
 
     return period, output, paid_orders_in_period
