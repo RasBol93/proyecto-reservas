@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, time as dtime
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
+from app.menu import load_menu_index
 from app.sheets import detect_header_row
 from app.telegram_keyboard import kb
 from app.utils import log_event, normalize
@@ -183,7 +184,6 @@ def _load_orders_records(orders_sh) -> List[Dict[str, Any]]:
     for ridx in range(header_row_1based + 1, len(values) + 1):
         row = values[ridx - 1]
 
-        # Saltar fila completamente vacía
         if not any(str(cell or "").strip() for cell in row):
             continue
 
@@ -237,15 +237,30 @@ def _parse_items(order: Dict[str, Any]) -> List[Dict[str, Any]]:
         return []
 
 
-def _extract_product_counts(order: Dict[str, Any]) -> Counter:
+def _resolve_product_name_from_sku(sku: str, menu_idx: Dict[str, Any]) -> str:
+    sku = str(sku or "").strip()
+    if not sku:
+        return ""
+    item = menu_idx.get(sku) or {}
+    name = str(item.get("name") or "").strip()
+    return name or sku
+
+
+def _extract_product_counts(order: Dict[str, Any], menu_idx: Dict[str, Any]) -> Counter:
     out: Counter = Counter()
 
     items_snapshot = _parse_items_snapshot(order)
     if items_snapshot:
         for it in items_snapshot:
-            name = str(it.get("name") or it.get("sku") or "").strip()
+            name = str(it.get("name") or "").strip()
+            sku = str(it.get("sku") or "").strip()
+
+            if not name and sku:
+                name = _resolve_product_name_from_sku(sku, menu_idx)
+
             if not name:
                 continue
+
             try:
                 qty = int(it.get("qty") or 1)
             except Exception:
@@ -256,9 +271,15 @@ def _extract_product_counts(order: Dict[str, Any]) -> Counter:
 
     items = _parse_items(order)
     for it in items:
-        name = str(it.get("name") or it.get("sku") or "").strip()
+        sku = str(it.get("sku") or "").strip()
+        name = str(it.get("name") or "").strip()
+
+        if not name and sku:
+            name = _resolve_product_name_from_sku(sku, menu_idx)
+
         if not name:
             continue
+
         try:
             qty = int(it.get("qty") or 1)
         except Exception:
@@ -320,6 +341,12 @@ def aggregate_consumers(
     period = resolve_consumer_period(period_key, tenant_tz)
     rows = _load_orders_records(orders_sh)
 
+    try:
+        menu_idx = load_menu_index(orders_sh, force=False)
+    except Exception as e:
+        log_event("consumer_db_menu_load_failed", error=str(e))
+        menu_idx = {}
+
     consumers: Dict[str, Dict[str, Any]] = {}
     paid_orders_in_period = 0
 
@@ -348,7 +375,7 @@ def aggregate_consumers(
         except Exception:
             total_amount = 0.0
 
-        product_counts = _extract_product_counts(row)
+        product_counts = _extract_product_counts(row, menu_idx)
 
         if contact not in consumers:
             consumers[contact] = {
