@@ -1,16 +1,22 @@
 # app/image_storage.py
 
 import io
+import json
 import os
 import time
 from typing import Any, Dict
 
 import cloudinary
 import cloudinary.uploader
+from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
-from app.sheets import get_google_credentials
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 
 
 def _safe_str(v: Any) -> str:
@@ -30,18 +36,6 @@ def _normalize_cloudinary_url(url: str) -> str:
     return _safe_str(url)
 
 
-def _normalize_provider(raw: str) -> str:
-    v = _safe_str(raw).lower()
-
-    if v in {"cloudinary", "cloud"}:
-        return "cloudinary"
-
-    if v in {"google_drive", "gdrive", "drive", "google"}:
-        return "google_drive"
-
-    return ""
-
-
 def _get_storage_provider(tenant: Dict[str, Any]) -> str:
     """
     Prioridad:
@@ -50,12 +44,12 @@ def _get_storage_provider(tenant: Dict[str, Any]) -> str:
     3) si hay product_photos_drive_folder_id => google_drive
     4) fallback => cloudinary
     """
-    provider = _normalize_provider(tenant.get("image_storage_provider"))
-    if provider:
+    provider = _safe_str(tenant.get("image_storage_provider")).lower()
+    if provider in {"cloudinary", "google_drive"}:
         return provider
 
-    env_provider = _normalize_provider(os.getenv("IMAGE_STORAGE_PROVIDER"))
-    if env_provider:
+    env_provider = _safe_str(os.getenv("IMAGE_STORAGE_PROVIDER")).lower()
+    if env_provider in {"cloudinary", "google_drive"}:
         return env_provider
 
     if _safe_str(tenant.get("product_photos_drive_folder_id")):
@@ -71,15 +65,9 @@ def _get_storage_provider(tenant: Dict[str, Any]) -> str:
 def _configure_cloudinary_from_tenant_or_env(tenant: Dict[str, Any]) -> None:
     """
     Busca credenciales en este orden:
-    1) CLOUDINARY_URL en env
-    2) columnas Tenants
-    3) variables de entorno separadas
+    1) columnas Tenants
+    2) variables de entorno
     """
-    cloudinary_url = _safe_str(os.getenv("CLOUDINARY_URL"))
-    if cloudinary_url:
-        cloudinary.config(cloudinary_url=cloudinary_url, secure=True)
-        return
-
     cloud_name = (
         _safe_str(tenant.get("cloudinary_cloud_name"))
         or _safe_str(os.getenv("CLOUDINARY_CLOUD_NAME"))
@@ -95,7 +83,7 @@ def _configure_cloudinary_from_tenant_or_env(tenant: Dict[str, Any]) -> None:
 
     if not cloud_name or not api_key or not api_secret:
         raise RuntimeError(
-            "Cloudinary no configurado. Falta CLOUDINARY_URL o cloud_name/api_key/api_secret "
+            "Cloudinary no configurado. Faltan cloud_name/api_key/api_secret "
             "en Tenants o en variables de entorno."
         )
 
@@ -145,8 +133,28 @@ def upload_product_photo_to_cloudinary(
 # GOOGLE DRIVE
 # =========================================================
 
+def _get_google_credentials_from_env():
+    """
+    Carga credenciales SOLO cuando realmente se usa Google Drive.
+    Así no rompe el arranque del proyecto si todavía estás en Cloudinary.
+    """
+    raw = _safe_str(os.getenv("GCP_CREDENTIALS_JSON"))
+    if not raw:
+        raise RuntimeError("Missing env var GCP_CREDENTIALS_JSON")
+
+    try:
+        info = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"GCP_CREDENTIALS_JSON is not valid JSON: {e}")
+
+    return service_account.Credentials.from_service_account_info(
+        info,
+        scopes=GOOGLE_SCOPES,
+    )
+
+
 def get_drive_service():
-    creds = get_google_credentials()
+    creds = _get_google_credentials_from_env()
     return build("drive", "v3", credentials=creds)
 
 
