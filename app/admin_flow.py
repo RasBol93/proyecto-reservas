@@ -19,7 +19,6 @@ from app.webhook_helpers import (
     get_sess,
     get_client_bot_token,
     assert_admin_authorized,
-    safe_int,
     set_menu_photo_url,
     admin_fixed_kb,
     admin_periods_inline_kb,
@@ -54,7 +53,69 @@ from app.admin_menu import (
     send_admin_menu_price_editor,
     apply_price_delta,
 )
-from app.payment_flow import notify_admin_payment_reported
+from app.consumer_db import (
+    consumer_periods_inline_kb,
+    consumer_filters_inline_kb,
+    build_consumers_report_pages,
+    resolve_consumer_period,
+    consumer_filter_label,
+)
+
+
+def _send_consumers_menu(bot_token: str, chat_id: int, tenant_id: str) -> bool:
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        "👥 BASE DE CONSUMIDORES\n\nElige un período:",
+        reply_markup=consumer_periods_inline_kb(tenant_id),
+    )
+
+
+def _send_consumers_filters(bot_token: str, chat_id: int, tenant_id: str, period_key: str, tenant_tz: str) -> bool:
+    period = resolve_consumer_period(period_key, tenant_tz)
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        (
+            "👥 BASE DE CONSUMIDORES\n\n"
+            f"Período elegido: {period.label}\n\n"
+            "Ahora elige qué lista quieres ver:"
+        ),
+        reply_markup=consumer_filters_inline_kb(tenant_id, period_key),
+    )
+
+
+def _send_consumers_report(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    tenant_tz: str,
+    period_key: str,
+    filter_key: str,
+) -> bool:
+    pages = build_consumers_report_pages(
+        orders_sh=orders_sh,
+        tenant_tz=tenant_tz,
+        period_key=period_key,
+        filter_key=filter_key,
+    )
+
+    if not pages:
+        pages = ["No encontré resultados."]
+
+    for idx, page in enumerate(pages):
+        if idx == len(pages) - 1:
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                page,
+                reply_markup=consumer_filters_inline_kb(tenant_id, period_key),
+            )
+        else:
+            telegram_send_text(bot_token, chat_id, page)
+
+    return True
 
 
 def handle_admin_callback(
@@ -115,6 +176,45 @@ def handle_admin_callback(
         txt = build_stats_report_text(orders_sh, tenant_id=tenant_id, tenant_tz=tenant_tz, period=period)
 
         telegram_send_text(bot_token, chat_id, txt, reply_markup=admin_fixed_kb())
+        return {"ok": True}
+
+    if data.startswith("admcons|"):
+        assert_admin_authorized(tenant, chat_id, tenant_id)
+
+        parts = data.split("|")
+        if len(parts) < 3:
+            return {"ok": True}
+
+        cb_tenant_id = parts[1].strip()
+        if cb_tenant_id != tenant_id:
+            raise HTTPException(status_code=400, detail="Tenant mismatch in consumer db callback")
+
+        action = parts[2].strip()
+
+        if action == "panel":
+            telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
+            return {"ok": True}
+
+        if action == "menu":
+            return {"ok": _send_consumers_menu(bot_token, chat_id, tenant_id)}
+
+        if action == "period" and len(parts) == 4:
+            period_key = parts[3].strip()
+            return {"ok": _send_consumers_filters(bot_token, chat_id, tenant_id, period_key, tenant_tz)}
+
+        if action == "report" and len(parts) == 5:
+            period_key = parts[3].strip()
+            filter_key = parts[4].strip()
+            return {"ok": _send_consumers_report(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                tenant_id=tenant_id,
+                orders_sh=orders_sh,
+                tenant_tz=tenant_tz,
+                period_key=period_key,
+                filter_key=filter_key,
+            )}
+
         return {"ok": True}
 
     if data.startswith("admhrs|"):
@@ -645,6 +745,15 @@ def handle_admin_message(
         )
         telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
         return {"ok": True}
+
+    if txt_norm in (
+        "base de consumidores",
+        "consumidores",
+        "clientes",
+        "base consumidores",
+    ):
+        assert_admin_authorized(tenant, chat_id, tenant_id)
+        return {"ok": _send_consumers_menu(bot_token, chat_id, tenant_id)}
 
     if txt_norm in (
         "config dias y horarios",
