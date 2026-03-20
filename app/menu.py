@@ -10,12 +10,11 @@ from app.utils import to_bool, normalize, log_event
 
 REQUIRED_MENU_HEADERS = ["sku", "name", "price", "active", "category"]
 
-# Cache simple por spreadsheet (reduce hits a Sheets)
-# key -> (ts_epoch, idx)
+# Cache simple por spreadsheet
 _MENU_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 _MENU_ADMIN_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 
-MENU_CACHE_TTL_SECONDS = 90  # 1.5 min
+MENU_CACHE_TTL_SECONDS = 90
 
 
 # -------------------------
@@ -238,6 +237,7 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
         active_raw = str(r.get("active", "") or "").strip()
         category = str(r.get("category", "") or "").strip() or "Otros"
         photo_file_id = str(r.get("photo_file_id", "") or "").strip()
+        photo_url = str(r.get("photo_url", "") or "").strip()
 
         if _looks_like_headerish_menu_row(sku, name, price_raw, active_raw, category):
             stats["skipped_headerish"] += 1
@@ -265,7 +265,13 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
                     "menu_duplicate_sku",
                     sku=sku,
                     prev=idx[sku],
-                    new={"name": name, "price": float(price), "category": category},
+                    new={
+                        "name": name,
+                        "price": float(price),
+                        "category": category,
+                        "photo_url": photo_url,
+                        "photo_file_id": photo_file_id,
+                    },
                 )
             except Exception:
                 pass
@@ -276,6 +282,7 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
             "price": float(price),
             "category": category,
             "photo_file_id": photo_file_id,
+            "photo_url": photo_url,
         }
 
     _cache_set(_MENU_CACHE, ck, idx)
@@ -306,6 +313,7 @@ def group_menu_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, Lis
                 "price": item.get("price", 0),
                 "category": cat,
                 "photo_file_id": item.get("photo_file_id", ""),
+                "photo_url": item.get("photo_url", ""),
             }
         )
 
@@ -388,6 +396,7 @@ def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str,
         active_raw = str(g("active") or "").strip()
         category = str(g("category") or "").strip() or "Otros"
         photo_file_id = str(g("photo_file_id") or "").strip()
+        photo_url = str(g("photo_url") or "").strip()
 
         if _looks_like_headerish_menu_row(sku, name, price_raw, active_raw, category):
             stats["skipped_headerish"] += 1
@@ -418,6 +427,7 @@ def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str,
             "category": category,
             "active": bool(active),
             "photo_file_id": photo_file_id,
+            "photo_url": photo_url,
             "row_index": ridx,
         }
 
@@ -450,6 +460,7 @@ def group_menu_admin_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[st
                 "category": cat,
                 "active": bool(item.get("active", False)),
                 "photo_file_id": item.get("photo_file_id", ""),
+                "photo_url": item.get("photo_url", ""),
                 "row_index": item.get("row_index"),
             }
         )
