@@ -355,6 +355,7 @@ def admin_fixed_kb() -> Dict[str, Any]:
         ["⚙️ Config días y horarios"],
         ["⚙️ Config menú y precios"],
         ["👥 Base de consumidores"],
+        ["➕ Crear pedido"],
     ], resize=True, one_time=False)
 
 
