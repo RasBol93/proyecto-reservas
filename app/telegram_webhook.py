@@ -9,103 +9,212 @@ from app.utils import normalize, log_event
 from app.webhook_helpers import safe_int
 from app.client_flow import handle_client_callback, handle_client_message
 from app.admin_flow import handle_admin_callback, handle_admin_message
+from app.alerts import alert_webhook_error, alert_tenant_error, alert_sheet_error
 
 router = APIRouter()
 
 
 @router.post("/telegram/webhook/{tenant_id}/{secret}")
 async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
-    tenant_id = (tenant_id or "").strip()
-    if not tenant_id:
-        return {"ok": True}
-
-    gc = get_gspread_client()
-    tenant = get_tenant_or_404(tenant_id, gc=gc)
-
-    mode, bot_token = resolve_bot_by_secret(tenant, secret)
-    if not bot_token:
-        return {"ok": True}
-
-    orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
-    if not orders_sheet_id:
-        return {"ok": True}
-
-    orders_sh = open_spreadsheet_by_key(gc, orders_sheet_id)
-    tenant_tz = (tenant.get("timezone") or "America/La_Paz").strip()
-
-    cb = update.get("callback_query")
-    if cb:
-        data = (cb.get("data") or "").strip()
-        cb_id = cb.get("id")
-
-        msg_obj = cb.get("message") or {}
-        chat_obj = msg_obj.get("chat") or {}
-        chat_id = safe_int(chat_obj.get("id"))
-        if chat_id is None:
-            log_event("callback_missing_chat_id", tenant_id=tenant_id, data=data)
+    mode = ""
+    try:
+        tenant_id = (tenant_id or "").strip()
+        if not tenant_id:
+            log_event("webhook_missing_tenant_id")
             return {"ok": True}
 
-        if cb_id:
-            telegram_answer_callback(bot_token, cb_id, "OK")
+        log_event(
+            "webhook_received",
+            tenant_id=tenant_id,
+            has_callback=bool(update.get("callback_query")),
+            has_message=bool(update.get("message")),
+            has_edited_message=bool(update.get("edited_message")),
+        )
 
-        if mode == "client":
-            return handle_client_callback(
-                tenant=tenant,
+        gc = get_gspread_client()
+
+        try:
+            tenant = get_tenant_or_404(tenant_id, gc=gc)
+        except Exception as e:
+            log_event(
+                "webhook_tenant_lookup_error",
                 tenant_id=tenant_id,
-                bot_token=bot_token,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            alert_tenant_error(tenant_id=tenant_id, error=str(e))
+            return {"ok": True}
+
+        try:
+            mode, bot_token = resolve_bot_by_secret(tenant, secret)
+        except Exception as e:
+            log_event(
+                "webhook_secret_resolve_error",
+                tenant_id=tenant_id,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            alert_tenant_error(tenant_id=tenant_id, error=str(e))
+            return {"ok": True}
+
+        if not bot_token:
+            log_event("webhook_invalid_secret", tenant_id=tenant_id)
+            return {"ok": True}
+
+        log_event("webhook_bot_resolved", tenant_id=tenant_id, mode=mode)
+
+        orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
+        if not orders_sheet_id:
+            log_event("webhook_missing_orders_sheet_id", tenant_id=tenant_id, mode=mode)
+            alert_tenant_error(tenant_id=tenant_id, error="orders_sheet_id missing")
+            return {"ok": True}
+
+        try:
+            orders_sh = open_spreadsheet_by_key(gc, orders_sheet_id)
+        except Exception as e:
+            log_event(
+                "webhook_orders_sheet_open_error",
+                tenant_id=tenant_id,
+                mode=mode,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            alert_sheet_error(tenant_id=tenant_id, error=str(e), extra_key="webhook_open_orders_sheet")
+            return {"ok": True}
+
+        tenant_tz = (tenant.get("timezone") or "America/La_Paz").strip()
+
+        cb = update.get("callback_query")
+        if cb:
+            data = (cb.get("data") or "").strip()
+            cb_id = cb.get("id")
+
+            msg_obj = cb.get("message") or {}
+            chat_obj = msg_obj.get("chat") or {}
+            chat_id = safe_int(chat_obj.get("id"))
+
+            if chat_id is None:
+                log_event(
+                    "callback_missing_chat_id",
+                    tenant_id=tenant_id,
+                    mode=mode,
+                    data=data,
+                )
+                return {"ok": True}
+
+            log_event(
+                "callback_received",
+                tenant_id=tenant_id,
+                mode=mode,
                 chat_id=chat_id,
                 data=data,
-                orders_sh=orders_sh,
-                tenant_tz=tenant_tz,
             )
 
-        if mode == "admin":
-            return handle_admin_callback(
-                tenant=tenant,
-                tenant_id=tenant_id,
-                bot_token=bot_token,
-                chat_id=chat_id,
-                data=data,
-                orders_sh=orders_sh,
-                tenant_tz=tenant_tz,
-            )
+            if cb_id:
+                telegram_answer_callback(bot_token, cb_id, "OK")
 
-        return {"ok": True}
+            if mode == "client":
+                log_event(
+                    "callback_dispatch_client",
+                    tenant_id=tenant_id,
+                    chat_id=chat_id,
+                    data=data,
+                )
+                return handle_client_callback(
+                    tenant=tenant,
+                    tenant_id=tenant_id,
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    data=data,
+                    orders_sh=orders_sh,
+                    tenant_tz=tenant_tz,
+                )
 
-    msg = update.get("message") or update.get("edited_message")
-    if msg:
-        chat_id = safe_int((msg.get("chat") or {}).get("id"))
-        if chat_id is None:
+            if mode == "admin":
+                log_event(
+                    "callback_dispatch_admin",
+                    tenant_id=tenant_id,
+                    chat_id=chat_id,
+                    data=data,
+                )
+                return handle_admin_callback(
+                    tenant=tenant,
+                    tenant_id=tenant_id,
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    data=data,
+                    orders_sh=orders_sh,
+                    tenant_tz=tenant_tz,
+                )
+
+            log_event("callback_unknown_mode", tenant_id=tenant_id, mode=mode, chat_id=chat_id)
             return {"ok": True}
 
-        text = (msg.get("text") or "").strip()
+        msg = update.get("message") or update.get("edited_message")
+        if msg:
+            chat_id = safe_int((msg.get("chat") or {}).get("id"))
+            if chat_id is None:
+                log_event("message_missing_chat_id", tenant_id=tenant_id, mode=mode)
+                return {"ok": True}
 
-        if normalize(text) in ("/id", "id"):
-            telegram_send_text(bot_token, chat_id, f"chat_id = {chat_id}")
+            text = (msg.get("text") or "").strip()
+
+            log_event(
+                "message_received",
+                tenant_id=tenant_id,
+                mode=mode,
+                chat_id=chat_id,
+                has_text=bool(text),
+                has_photo=bool(msg.get("photo")),
+                has_document=bool(msg.get("document")),
+            )
+
+            if normalize(text) in ("/id", "id"):
+                telegram_send_text(bot_token, chat_id, f"chat_id = {chat_id}")
+                log_event("message_id_command", tenant_id=tenant_id, mode=mode, chat_id=chat_id)
+                return {"ok": True}
+
+            if mode == "client":
+                log_event("message_dispatch_client", tenant_id=tenant_id, chat_id=chat_id)
+                return handle_client_message(
+                    tenant=tenant,
+                    tenant_id=tenant_id,
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    msg=msg,
+                    orders_sh=orders_sh,
+                    tenant_tz=tenant_tz,
+                )
+
+            if mode == "admin":
+                log_event("message_dispatch_admin", tenant_id=tenant_id, chat_id=chat_id)
+                return handle_admin_message(
+                    tenant=tenant,
+                    tenant_id=tenant_id,
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    msg=msg,
+                    orders_sh=orders_sh,
+                    tenant_tz=tenant_tz,
+                )
+
+            log_event("message_unknown_mode", tenant_id=tenant_id, mode=mode, chat_id=chat_id)
             return {"ok": True}
 
-        if mode == "client":
-            return handle_client_message(
-                tenant=tenant,
-                tenant_id=tenant_id,
-                bot_token=bot_token,
-                chat_id=chat_id,
-                msg=msg,
-                orders_sh=orders_sh,
-                tenant_tz=tenant_tz,
-            )
-
-        if mode == "admin":
-            return handle_admin_message(
-                tenant=tenant,
-                tenant_id=tenant_id,
-                bot_token=bot_token,
-                chat_id=chat_id,
-                msg=msg,
-                orders_sh=orders_sh,
-                tenant_tz=tenant_tz,
-            )
-
+        log_event("webhook_ignored_update", tenant_id=tenant_id, mode=mode)
         return {"ok": True}
 
-    return {"ok": True}
+    except Exception as e:
+        log_event(
+            "webhook_unhandled_error",
+            tenant_id=(tenant_id or "").strip(),
+            mode=mode,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        alert_webhook_error(
+            tenant_id=(tenant_id or "").strip(),
+            mode=mode,
+            error=str(e),
+        )
+        return {"ok": True}
