@@ -7,13 +7,19 @@ from typing import Any, Dict, Optional, List, Tuple
 from fastapi import APIRouter, HTTPException, Query
 
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
-from app.tenants import get_tenant_or_404
+from app.tenants import (
+    get_tenant_or_404,
+    tenants_cache_info,
+    validate_tenant_config,
+)
 from app.utils import normalize
 from app.admin_settings import (
     ADMIN_SETTINGS_SHEET_NAME,
     REQUIRED_ADMIN_SETTINGS_HEADERS,
     resolve_business_status_dict,
 )
+from app.menu import load_menu_admin_index, group_menu_admin_by_category
+from app.orders import get_order_by_id
 
 router = APIRouter(prefix="/admin/diag", tags=["admin"])
 
@@ -141,6 +147,109 @@ def _is_token_shape_ok(tok: str) -> bool:
     if not tok:
         return False
     return (":" in tok) and (len(tok) >= 20)
+
+
+def _safe_order_ws(sh):
+    try:
+        return sh.worksheet("ORDERS")
+    except Exception:
+        try:
+            return sh.worksheet("Orders")
+        except Exception:
+            return sh.get_worksheet(0)
+
+
+def _safe_count_data_rows(ws) -> int:
+    try:
+        values = ws.get_all_values()
+        if not values:
+            return 0
+        return max(0, len(values) - 1)
+    except Exception:
+        return 0
+
+
+def _safe_menu_runtime(orders_sh) -> Dict[str, Any]:
+    try:
+        menu_idx = load_menu_admin_index(orders_sh, force=False)
+        cats = group_menu_admin_by_category(menu_idx)
+
+        active_products = 0
+        inactive_products = 0
+        with_photo_url = 0
+        with_photo_file_id = 0
+        without_photo = 0
+
+        for _, item in menu_idx.items():
+            active = bool(item.get("active", False))
+            if active:
+                active_products += 1
+            else:
+                inactive_products += 1
+
+            photo_url = str(item.get("photo_url") or "").strip()
+            photo_file_id = str(item.get("photo_file_id") or "").strip()
+            if photo_url:
+                with_photo_url += 1
+            elif photo_file_id:
+                with_photo_file_id += 1
+            else:
+                without_photo += 1
+
+        return {
+            "ok": True,
+            "categories_count": len(cats),
+            "products_count": len(menu_idx),
+            "active_products": active_products,
+            "inactive_products": inactive_products,
+            "with_photo_url": with_photo_url,
+            "with_photo_file_id": with_photo_file_id,
+            "without_photo": without_photo,
+            "category_names": sorted(list(cats.keys()), key=lambda x: normalize(x))[:50],
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
+
+
+def _safe_orders_runtime(orders_sh, order_id: str = "") -> Dict[str, Any]:
+    try:
+        ws = _safe_order_ws(orders_sh)
+        total_rows = _safe_count_data_rows(ws)
+
+        out: Dict[str, Any] = {
+            "ok": True,
+            "orders_rows_count": total_rows,
+        }
+
+        oid = (order_id or "").strip()
+        if oid:
+            order = get_order_by_id(orders_sh, oid)
+            out["lookup_order_id"] = oid
+            out["order_found"] = bool(order)
+            if order:
+                out["order"] = {
+                    "order_id": order.get("order_id"),
+                    "tenant_id": order.get("tenant_id"),
+                    "customer_name": order.get("customer_name"),
+                    "customer_contact": order.get("customer_contact"),
+                    "status": order.get("status"),
+                    "source": order.get("source"),
+                    "created_at": order.get("created_at"),
+                    "requested_time": order.get("requested_time"),
+                    "total_amount": order.get("total_amount"),
+                    "payment_proof_type": order.get("payment_proof_type"),
+                    "payment_proof_file_id_present": bool((order.get("payment_proof_file_id") or "").strip()),
+                    "payment_confirmed_at": order.get("payment_confirmed_at"),
+                }
+        return out
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+        }
 
 
 @router.get("/tenant")
@@ -428,6 +537,60 @@ def business_status(tenant_id: str = Query(...), token: str = Query(...)) -> Dic
         "tenant_id": tenant.get("tenant_id"),
         "timezone": tenant_tz,
         "business_status": data,
+    }
+
+
+@router.get("/runtime")
+def runtime_diag(
+    tenant_id: str = Query(...),
+    token: str = Query(...),
+    order_id: str = Query(default=""),
+) -> Dict[str, Any]:
+    """
+    Diagnóstico runtime:
+    - cache tenants
+    - config validada
+    - apertura real de sheet
+    - estado actual del negocio
+    - estado del menú
+    - lookup opcional de pedido
+    """
+    _require_admin_token(token)
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(tenant_id, gc=gc)
+    cfg = validate_tenant_config(tenant)
+
+    orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
+    if not orders_sheet_id:
+        raise HTTPException(status_code=500, detail="orders_sheet_id missing for tenant")
+
+    tenant_tz = (tenant.get("timezone") or "America/La_Paz").strip()
+    sh = open_spreadsheet_by_key(gc, orders_sheet_id)
+
+    business = resolve_business_status_dict(sh, tenant_tz=tenant_tz)
+    menu_runtime = _safe_menu_runtime(sh)
+    orders_runtime = _safe_orders_runtime(sh, order_id=order_id)
+
+    runtime_summary = {
+        "tenant_ok": True,
+        "tenant_config_ok": bool(cfg.get("ok")),
+        "business_accepts_orders_now": bool(business.get("accepts_orders_now")),
+        "menu_ok": bool(menu_runtime.get("ok")),
+        "orders_ok": bool(orders_runtime.get("ok")),
+    }
+
+    return {
+        "ok": True,
+        "tenant_id": tenant.get("tenant_id"),
+        "tenant_id_raw": tenant.get("tenant_id_raw"),
+        "timezone": tenant_tz,
+        "runtime_summary": runtime_summary,
+        "tenant_cache": tenants_cache_info(),
+        "tenant_config": cfg,
+        "business_status": business,
+        "menu_runtime": menu_runtime,
+        "orders_runtime": orders_runtime,
     }
 
 
