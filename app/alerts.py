@@ -1,8 +1,7 @@
 # app/alerts.py
 
 import time
-from collections import deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from app.config import get_alert_config
 from app.telegram_api import telegram_send_alert
@@ -10,263 +9,382 @@ from app.utils import log_event
 
 
 # =========================================================
-# RUNTIME MEMORY
+# CACHE / RATE LIMIT ANTI-SPAM
 # =========================================================
 
-MAX_RUNTIME_EVENTS = 200
-MAX_RUNTIME_ERRORS = 200
-MAX_RUNTIME_ALERTS = 100
+_ALERT_LAST_SENT_AT: Dict[str, float] = {}
 
-_RUNTIME_EVENTS: Deque[Dict[str, Any]] = deque(maxlen=MAX_RUNTIME_EVENTS)
-_RUNTIME_ERRORS: Deque[Dict[str, Any]] = deque(maxlen=MAX_RUNTIME_ERRORS)
-_RUNTIME_ALERTS: Deque[Dict[str, Any]] = deque(maxlen=MAX_RUNTIME_ALERTS)
-
-_LAST_ALERT_AT_BY_KEY: Dict[str, float] = {}
-
-DEFAULT_ALERT_COOLDOWN_SECONDS = 300  # 5 min
+# cooldown por evento-clave
+ALERT_COOLDOWN_SECONDS = 60
 
 
-def _now_ts() -> int:
-    return int(time.time())
+def _now_ts() -> float:
+    return time.time()
 
 
-def _safe_text(v: Any, max_len: int = 500) -> str:
-    s = str(v or "").strip()
-    if len(s) > max_len:
-        return s[:max_len] + "..."
-    return s
-
-
-def _push_event(bucket: Deque[Dict[str, Any]], item: Dict[str, Any]) -> None:
-    try:
-        bucket.append(item)
-    except Exception:
-        pass
-
-
-# =========================================================
-# PUBLIC RUNTIME LOGGING
-# =========================================================
-
-def record_runtime_event(
-    event_type: str,
-    severity: str = "info",
-    tenant_id: str = "",
-    module: str = "",
-    action: str = "",
-    order_id: str = "",
-    chat_id: str = "",
-    details: str = "",
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    item = {
-        "ts": _now_ts(),
-        "event_type": _safe_text(event_type, 120),
-        "severity": _safe_text(severity, 20).lower(),
-        "tenant_id": _safe_text(tenant_id, 120),
-        "module": _safe_text(module, 120),
-        "action": _safe_text(action, 120),
-        "order_id": _safe_text(order_id, 120),
-        "chat_id": _safe_text(chat_id, 120),
-        "details": _safe_text(details, 500),
-        "extra": extra or {},
-    }
-
-    _push_event(_RUNTIME_EVENTS, item)
-
-    if item["severity"] in ("error", "critical"):
-        _push_event(_RUNTIME_ERRORS, item)
-
-    try:
-        log_event(
-            "runtime_event",
-            severity=item["severity"],
-            tenant_id=item["tenant_id"],
-            module=item["module"],
-            action=item["action"],
-            order_id=item["order_id"],
-            chat_id=item["chat_id"],
-            details=item["details"],
-        )
-    except Exception:
-        pass
-
-    return item
-
-
-def get_runtime_snapshot(limit: int = 20) -> Dict[str, Any]:
-    limit = max(1, min(int(limit or 20), 100))
-
-    events = list(_RUNTIME_EVENTS)[-limit:]
-    errors = list(_RUNTIME_ERRORS)[-limit:]
-    alerts = list(_RUNTIME_ALERTS)[-limit:]
-
-    now = _now_ts()
-    errors_last_15m = [x for x in _RUNTIME_ERRORS if (now - int(x.get("ts") or 0)) <= 900]
-    alerts_last_15m = [x for x in _RUNTIME_ALERTS if (now - int(x.get("ts") or 0)) <= 900]
-
-    return {
-        "ok": True,
-        "now_ts": now,
-        "totals": {
-            "events_buffered": len(_RUNTIME_EVENTS),
-            "errors_buffered": len(_RUNTIME_ERRORS),
-            "alerts_buffered": len(_RUNTIME_ALERTS),
-            "errors_last_15m": len(errors_last_15m),
-            "alerts_last_15m": len(alerts_last_15m),
-        },
-        "recent_events": events,
-        "recent_errors": errors,
-        "recent_alerts": alerts,
-    }
-
-
-# =========================================================
-# ALERTING
-# =========================================================
-
-def _build_alert_key(
-    code: str,
-    tenant_id: str = "",
-    module: str = "",
-    order_id: str = "",
-) -> str:
+def _build_alert_key(event: str, tenant_id: str = "", order_id: str = "", extra_key: str = "") -> str:
     return "|".join([
-        _safe_text(code, 120),
-        _safe_text(tenant_id, 120),
-        _safe_text(module, 120),
-        _safe_text(order_id, 120),
+        str(event or "").strip(),
+        str(tenant_id or "").strip(),
+        str(order_id or "").strip(),
+        str(extra_key or "").strip(),
     ])
 
 
-def _should_send_alert(alert_key: str, cooldown_seconds: int) -> bool:
-    now = time.time()
-    last = float(_LAST_ALERT_AT_BY_KEY.get(alert_key) or 0)
-    if last and (now - last) < max(1, cooldown_seconds):
+def _should_send_alert(key: str, cooldown_seconds: int = ALERT_COOLDOWN_SECONDS) -> bool:
+    now = _now_ts()
+    last = _ALERT_LAST_SENT_AT.get(key)
+
+    if last is not None and (now - last) < cooldown_seconds:
         return False
-    _LAST_ALERT_AT_BY_KEY[alert_key] = now
+
+    _ALERT_LAST_SENT_AT[key] = now
     return True
 
 
-def send_system_alert(
-    code: str,
-    message: str,
-    tenant_id: str = "",
-    module: str = "",
-    order_id: str = "",
-    chat_id: str = "",
-    severity: str = "critical",
-    cooldown_seconds: int = DEFAULT_ALERT_COOLDOWN_SECONDS,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    cfg = get_alert_config()
-
-    runtime_item = record_runtime_event(
-        event_type=code,
-        severity=severity,
-        tenant_id=tenant_id,
-        module=module,
-        action="alert_triggered",
-        order_id=order_id,
-        chat_id=chat_id,
-        details=message,
-        extra=extra or {},
-    )
-
-    alert_key = _build_alert_key(code=code, tenant_id=tenant_id, module=module, order_id=order_id)
-
-    if not cfg.get("enabled"):
-        result = {
-            "ok": False,
-            "sent": False,
-            "reason": "alerts_not_configured",
-            "runtime_event": runtime_item,
-        }
-        _push_event(_RUNTIME_ALERTS, {
-            "ts": _now_ts(),
-            "code": code,
-            "tenant_id": tenant_id,
-            "module": module,
-            "order_id": order_id,
-            "chat_id": chat_id,
-            "message": _safe_text(message, 500),
-            "sent": False,
-            "reason": "alerts_not_configured",
-        })
-        return result
-
-    if not _should_send_alert(alert_key, cooldown_seconds):
-        result = {
-            "ok": True,
-            "sent": False,
-            "reason": "cooldown_active",
-            "runtime_event": runtime_item,
-        }
-        _push_event(_RUNTIME_ALERTS, {
-            "ts": _now_ts(),
-            "code": code,
-            "tenant_id": tenant_id,
-            "module": module,
-            "order_id": order_id,
-            "chat_id": chat_id,
-            "message": _safe_text(message, 500),
-            "sent": False,
-            "reason": "cooldown_active",
-        })
-        return result
-
-    bot_token = cfg.get("bot_token") or ""
-    alert_chat_id = cfg.get("chat_id")
-
-    text_lines: List[str] = [
-        f"Código: {code}",
-        f"Módulo: {module or '-'}",
-        f"Tenant: {tenant_id or '-'}",
-        f"Order: {order_id or '-'}",
-        f"Chat: {chat_id or '-'}",
-        "",
-        _safe_text(message, 1500),
-    ]
-    text = "\n".join(text_lines)
-
-    sent = False
-    try:
-        sent = telegram_send_alert(bot_token=bot_token, chat_id=int(alert_chat_id), text=text)
-    except Exception as e:
-        try:
-            log_event("system_alert_send_exception", code=code, module=module, tenant_id=tenant_id, error=str(e))
-        except Exception:
-            pass
-        sent = False
-
-    alert_item = {
-        "ts": _now_ts(),
-        "code": code,
-        "tenant_id": tenant_id,
-        "module": module,
-        "order_id": order_id,
-        "chat_id": chat_id,
-        "message": _safe_text(message, 500),
-        "sent": bool(sent),
-        "reason": "sent" if sent else "send_failed",
+def alerts_cache_info() -> Dict[str, Any]:
+    return {
+        "tracked_keys": len(_ALERT_LAST_SENT_AT),
+        "cooldown_seconds": ALERT_COOLDOWN_SECONDS,
+        "keys": list(_ALERT_LAST_SENT_AT.keys())[:100],
     }
-    _push_event(_RUNTIME_ALERTS, alert_item)
 
-    try:
+
+def reset_alerts_cache() -> Dict[str, Any]:
+    _ALERT_LAST_SENT_AT.clear()
+    return {"ok": True, "cleared": True}
+
+
+# =========================================================
+# FORMATTERS
+# =========================================================
+
+def _safe_str(v: Any) -> str:
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
+def _compact_error(error: Any, max_len: int = 500) -> str:
+    s = _safe_str(error)
+    if len(s) <= max_len:
+        return s
+    return s[:max_len] + "..."
+
+
+def _format_extra_lines(**kwargs: Any) -> str:
+    lines = []
+    for k, v in kwargs.items():
+        if v is None:
+            continue
+        s = _safe_str(v)
+        if not s:
+            continue
+        lines.append(f"{k}: {s}")
+    return "\n".join(lines)
+
+
+def _build_alert_text(title: str, message: str = "", **kwargs: Any) -> str:
+    parts = [f"🚨 {title}".strip()]
+
+    msg = _safe_str(message)
+    if msg:
+        parts.append(msg)
+
+    extra = _format_extra_lines(**kwargs)
+    if extra:
+        parts.append(extra)
+
+    return "\n\n".join(parts).strip()
+
+
+# =========================================================
+# ENVÍO CENTRAL
+# =========================================================
+
+def send_alert(
+    event: str,
+    title: str,
+    message: str = "",
+    tenant_id: str = "",
+    order_id: str = "",
+    extra_key: str = "",
+    cooldown_seconds: int = ALERT_COOLDOWN_SECONDS,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """
+    Punto central para enviar alertas por Telegram.
+    No lanza excepción.
+    """
+
+    cfg = get_alert_config()
+    if not cfg.get("enabled"):
         log_event(
-            "system_alert_sent" if sent else "system_alert_failed",
-            code=code,
-            module=module,
+            "alert_skipped_not_enabled",
+            event_name=event,
             tenant_id=tenant_id,
             order_id=order_id,
-            chat_id=chat_id,
         )
-    except Exception:
-        pass
+        return {"ok": False, "reason": "alerts_not_enabled"}
 
-    return {
-        "ok": bool(sent),
-        "sent": bool(sent),
-        "reason": "sent" if sent else "send_failed",
-        "runtime_event": runtime_item,
-    }
+    bot_token = cfg.get("bot_token")
+    chat_id = cfg.get("chat_id")
+
+    if not bot_token or not chat_id:
+        log_event(
+            "alert_skipped_missing_config",
+            event_name=event,
+            tenant_id=tenant_id,
+            order_id=order_id,
+        )
+        return {"ok": False, "reason": "missing_alert_config"}
+
+    key = _build_alert_key(
+        event=event,
+        tenant_id=tenant_id,
+        order_id=order_id,
+        extra_key=extra_key,
+    )
+
+    if not _should_send_alert(key, cooldown_seconds=cooldown_seconds):
+        log_event(
+            "alert_suppressed_cooldown",
+            event_name=event,
+            tenant_id=tenant_id,
+            order_id=order_id,
+            alert_key=key,
+        )
+        return {"ok": False, "reason": "cooldown"}
+
+    try:
+        text = _build_alert_text(
+            title=title,
+            message=message,
+            event=event,
+            tenant_id=tenant_id,
+            order_id=order_id,
+            **kwargs,
+        )
+
+        sent = telegram_send_alert(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text=text,
+        )
+
+        if sent:
+            log_event(
+                "alert_sent",
+                event_name=event,
+                tenant_id=tenant_id,
+                order_id=order_id,
+                alert_key=key,
+            )
+            return {"ok": True, "sent": True}
+
+        log_event(
+            "alert_send_failed",
+            event_name=event,
+            tenant_id=tenant_id,
+            order_id=order_id,
+            alert_key=key,
+        )
+        return {"ok": False, "reason": "telegram_send_failed"}
+
+    except Exception as e:
+        log_event(
+            "alert_send_exception",
+            event_name=event,
+            tenant_id=tenant_id,
+            order_id=order_id,
+            error_type=type(e).__name__,
+            error=_compact_error(e),
+        )
+        return {"ok": False, "reason": "exception", "error": str(e)}
+
+
+# =========================================================
+# ALERTAS DE ALTO NIVEL
+# =========================================================
+
+def alert_order_failed(
+    tenant_id: str,
+    order_id: str = "",
+    chat_id: Optional[int] = None,
+    error: str = "",
+) -> Dict[str, Any]:
+    return send_alert(
+        event="order_failed",
+        title="Error creando pedido",
+        message="Falló la creación o guardado de un pedido.",
+        tenant_id=tenant_id,
+        order_id=order_id,
+        extra_key=str(chat_id or ""),
+        chat_id=chat_id,
+        error=_compact_error(error),
+    )
+
+
+def alert_order_status_failed(
+    tenant_id: str,
+    order_id: str,
+    new_status: str,
+    error: str = "",
+) -> Dict[str, Any]:
+    return send_alert(
+        event="order_status_failed",
+        title="Error actualizando estado de pedido",
+        message="Falló el cambio de estado en ORDERS.",
+        tenant_id=tenant_id,
+        order_id=order_id,
+        new_status=new_status,
+        error=_compact_error(error),
+    )
+
+
+def alert_payment_proof_failed(
+    tenant_id: str,
+    order_id: str = "",
+    chat_id: Optional[int] = None,
+    error: str = "",
+) -> Dict[str, Any]:
+    return send_alert(
+        event="payment_proof_failed",
+        title="Error guardando comprobante",
+        message="Falló la actualización del comprobante de pago.",
+        tenant_id=tenant_id,
+        order_id=order_id,
+        extra_key=str(chat_id or ""),
+        chat_id=chat_id,
+        error=_compact_error(error),
+    )
+
+
+def alert_payment_failed(
+    tenant_id: str,
+    order_id: str = "",
+    error: str = "",
+) -> Dict[str, Any]:
+    return send_alert(
+        event="payment_failed",
+        title="Error procesando pago",
+        message="Hubo un problema en el flujo de pago o confirmación.",
+        tenant_id=tenant_id,
+        order_id=order_id,
+        error=_compact_error(error),
+    )
+
+
+def alert_sheet_error(
+    tenant_id: str,
+    error: str = "",
+    extra_key: str = "",
+) -> Dict[str, Any]:
+    return send_alert(
+        event="sheet_error",
+        title="Error Google Sheets",
+        message="Falló una operación contra Google Sheets.",
+        tenant_id=tenant_id,
+        extra_key=extra_key,
+        error=_compact_error(error),
+    )
+
+
+def alert_menu_error(
+    tenant_id: str,
+    error: str = "",
+    sku: str = "",
+) -> Dict[str, Any]:
+    return send_alert(
+        event="menu_error",
+        title="Error de menú",
+        message="Hubo un problema leyendo o actualizando el menú.",
+        tenant_id=tenant_id,
+        extra_key=sku,
+        sku=sku,
+        error=_compact_error(error),
+    )
+
+
+def alert_photo_upload_failed(
+    tenant_id: str,
+    sku: str = "",
+    error: str = "",
+) -> Dict[str, Any]:
+    return send_alert(
+        event="photo_upload_failed",
+        title="Error subiendo foto de producto",
+        message="Falló la subida o vinculación de una foto de producto.",
+        tenant_id=tenant_id,
+        extra_key=sku,
+        sku=sku,
+        error=_compact_error(error),
+    )
+
+
+def alert_tenant_error(
+    tenant_id: str = "",
+    error: str = "",
+) -> Dict[str, Any]:
+    return send_alert(
+        event="tenant_error",
+        title="Error de tenant/configuración",
+        message="Hubo un problema resolviendo tenant o configuración.",
+        tenant_id=tenant_id,
+        error=_compact_error(error),
+    )
+
+
+def alert_telegram_error(
+    error: str = "",
+    method: str = "",
+    chat_id: Any = "",
+) -> Dict[str, Any]:
+    return send_alert(
+        event="telegram_error",
+        title="Error Telegram API",
+        message="Falló una operación contra Telegram.",
+        extra_key=method,
+        method=method,
+        chat_id=chat_id,
+        error=_compact_error(error),
+    )
+
+
+def alert_webhook_error(
+    tenant_id: str = "",
+    error: str = "",
+    mode: str = "",
+) -> Dict[str, Any]:
+    return send_alert(
+        event="webhook_error",
+        title="Error en webhook",
+        message="El webhook capturó un error no controlado.",
+        tenant_id=tenant_id,
+        extra_key=mode,
+        mode=mode,
+        error=_compact_error(error),
+    )
+
+
+def alert_system_error(
+    error: str = "",
+    module: str = "",
+) -> Dict[str, Any]:
+    return send_alert(
+        event="system_error",
+        title="Error crítico del sistema",
+        message="Se detectó un error general del sistema.",
+        extra_key=module,
+        module=module,
+        error=_compact_error(error),
+    )
+
+
+def send_test_alert(message: str = "Prueba manual de alertas") -> Dict[str, Any]:
+    return send_alert(
+        event="test_alert",
+        title="Prueba de alerta",
+        message=message,
+        cooldown_seconds=1,
+    )
