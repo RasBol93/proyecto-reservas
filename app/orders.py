@@ -5,9 +5,23 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from app.utils import log_event
+from app.alerts import (
+    alert_order_failed,
+    alert_order_status_failed,
+    alert_payment_proof_failed,
+    alert_sheet_error,
+)
 
+
+# ----------------------------------------
+# Helpers: worksheet + safe json
+# ----------------------------------------
 
 def _get_orders_ws(orders_sh):
+    """
+    orders_sh: gspread Spreadsheet
+    Preferimos worksheet 'ORDERS'. Si no existe, usamos la primera.
+    """
     try:
         return orders_sh.worksheet("ORDERS")
     except Exception:
@@ -40,11 +54,17 @@ def _safe_json_loads(s: Any) -> Any:
 
 
 def _get_header(ws) -> List[str]:
+    """
+    Asumimos que fila 1 tiene headers técnicos.
+    """
     hdr = ws.row_values(1)
     return [h.strip() for h in hdr if str(h).strip()]
 
 
 def _find_col_idx(header: List[str], col_name: str) -> Optional[int]:
+    """
+    Devuelve índice 0-based.
+    """
     col_name = (col_name or "").strip()
     for i, h in enumerate(header):
         if h.strip() == col_name:
@@ -53,6 +73,10 @@ def _find_col_idx(header: List[str], col_name: str) -> Optional[int]:
 
 
 def _build_row_by_header(header: List[str], data: Dict[str, Any]) -> List[str]:
+    """
+    Construye una fila alineada al header.
+    Convierte dict/list a JSON string.
+    """
     row: List[str] = [""] * len(header)
     for k, v in (data or {}).items():
         idx = _find_col_idx(header, k)
@@ -67,17 +91,32 @@ def _build_row_by_header(header: List[str], data: Dict[str, Any]) -> List[str]:
     return row
 
 
+# ----------------------------------------
+# ID generator
+# ----------------------------------------
+
 def gen_order_id() -> str:
     import secrets
     return secrets.token_hex(4)
 
 
+# ----------------------------------------
+# Pricing snapshot
+# ----------------------------------------
+
 def build_items_snapshot(items: List[Dict[str, Any]], menu_idx: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    items: [{"sku": "...", "qty": 2}, ...]
+    menu_idx: {sku: {"name":..., "price":...}, ...}
+    output:
+      [{"sku","name","qty","unit_price","line_total"}, ...]
+    """
     snapshot: List[Dict[str, Any]] = []
     for it in items or []:
         sku = str(it.get("sku") or "").strip()
         if not sku:
             continue
+
         try:
             qty = int(it.get("qty") or 1)
         except Exception:
@@ -112,6 +151,10 @@ def build_items_snapshot(items: List[Dict[str, Any]], menu_idx: Dict[str, Any]) 
     return snapshot
 
 
+# ----------------------------------------
+# CREATE
+# ----------------------------------------
+
 def append_order_row(
     orders_sh,
     tenant_id: str,
@@ -129,7 +172,9 @@ def append_order_row(
     pricing_version: str = "v1",
     notes: str = "",
 ) -> Dict[str, Any]:
-
+    """
+    Inserta una fila en ORDERS alineada a headers.
+    """
     try:
         ws = _get_orders_ws(orders_sh)
         header = _get_header(ws)
@@ -181,12 +226,26 @@ def append_order_row(
             error_type=type(e).__name__,
             error=str(e),
         )
+        alert_order_failed(
+            tenant_id=tenant_id,
+            order_id=order_id,
+            error=str(e),
+        )
+        alert_sheet_error(
+            tenant_id=tenant_id,
+            error=str(e),
+            extra_key="append_order_row",
+        )
         return {"ok": False, "error": str(e)}
 
 
 def append_order(*args, **kwargs):
     return append_order_row(*args, **kwargs)
 
+
+# ----------------------------------------
+# READ helpers
+# ----------------------------------------
 
 def _iter_rows_as_dicts(ws) -> List[Dict[str, Any]]:
     header = _get_header(ws)
@@ -217,7 +276,11 @@ def get_order_by_id(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def find_latest_pending_order_for_contact(orders_sh, customer_contact: str, status: str = "PENDING_PAYMENT") -> Optional[str]:
+def find_latest_pending_order_for_contact(
+    orders_sh,
+    customer_contact: str,
+    status: str = "PENDING_PAYMENT",
+) -> Optional[str]:
     ws = _get_orders_ws(orders_sh)
     rows = _iter_rows_as_dicts(ws)
 
@@ -233,10 +296,18 @@ def find_latest_pending_order_for_contact(orders_sh, customer_contact: str, stat
     return None
 
 
+# ----------------------------------------
+# UPDATE helpers
+# ----------------------------------------
+
 def _find_row_index_by_order_id(ws, order_id: str) -> Optional[int]:
+    """
+    Devuelve row index 1-based en la sheet (incluye header en fila 1).
+    """
     header = _get_header(ws)
     if not header:
         return None
+
     oid_col = _find_col_idx(header, "order_id")
     if oid_col is None:
         return None
@@ -251,6 +322,8 @@ def _find_row_index_by_order_id(ws, order_id: str) -> Optional[int]:
 
 
 def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, Any]:
+    tenant_id_for_alert = ""
+
     try:
         ws = _get_orders_ws(orders_sh)
         header = _get_header(ws)
@@ -263,6 +336,10 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
         if status_col is None:
             raise RuntimeError("Missing status column")
 
+        existing = get_order_by_id(orders_sh, order_id)
+        if existing:
+            tenant_id_for_alert = str(existing.get("tenant_id") or "").strip()
+
         ws.update_cell(ridx, status_col + 1, str(new_status).strip())
 
         if str(new_status).strip() == "PAID":
@@ -270,16 +347,33 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
             if paid_col is not None:
                 ws.update_cell(ridx, paid_col + 1, _now_iso_utc())
 
-        log_event("order_status_updated", order_id=order_id, status=new_status)
+        log_event(
+            "order_status_updated",
+            tenant_id=tenant_id_for_alert,
+            order_id=order_id,
+            status=new_status,
+        )
 
         return {"ok": True, "found": True}
 
     except Exception as e:
         log_event(
             "order_status_update_error",
+            tenant_id=tenant_id_for_alert,
             order_id=order_id,
             error_type=type(e).__name__,
             error=str(e),
+        )
+        alert_order_status_failed(
+            tenant_id=tenant_id_for_alert,
+            order_id=order_id,
+            new_status=new_status,
+            error=str(e),
+        )
+        alert_sheet_error(
+            tenant_id=tenant_id_for_alert,
+            error=str(e),
+            extra_key="update_order_status",
         )
         return {"ok": False, "error": str(e)}
 
@@ -291,6 +385,7 @@ def update_order_payment_proof(
     proof_type: str,
     proof_caption: str = "",
 ) -> Dict[str, Any]:
+    tenant_id_for_alert = ""
 
     try:
         ws = _get_orders_ws(orders_sh)
@@ -299,6 +394,10 @@ def update_order_payment_proof(
 
         if ridx is None:
             return {"ok": True, "found": False}
+
+        existing = get_order_by_id(orders_sh, order_id)
+        if existing:
+            tenant_id_for_alert = str(existing.get("tenant_id") or "").strip()
 
         fcol = _find_col_idx(header, "payment_proof_file_id")
         tcol = _find_col_idx(header, "payment_proof_type")
@@ -313,15 +412,31 @@ def update_order_payment_proof(
         if ccol is not None:
             ws.update_cell(ridx, ccol + 1, str(proof_caption or "").strip())
 
-        log_event("order_proof_updated", order_id=order_id, proof_type=proof_type)
+        log_event(
+            "order_proof_updated",
+            tenant_id=tenant_id_for_alert,
+            order_id=order_id,
+            proof_type=proof_type,
+        )
 
         return {"ok": True, "found": True}
 
     except Exception as e:
         log_event(
             "order_proof_update_error",
+            tenant_id=tenant_id_for_alert,
             order_id=order_id,
             error_type=type(e).__name__,
             error=str(e),
+        )
+        alert_payment_proof_failed(
+            tenant_id=tenant_id_for_alert,
+            order_id=order_id,
+            error=str(e),
+        )
+        alert_sheet_error(
+            tenant_id=tenant_id_for_alert,
+            error=str(e),
+            extra_key="update_order_payment_proof",
         )
         return {"ok": False, "error": str(e)}
