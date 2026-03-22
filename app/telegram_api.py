@@ -1,3 +1,5 @@
+# app/telegram_api.py
+
 import json
 import time
 import urllib.request
@@ -168,4 +170,20 @@ def telegram_send_file_bytes(
             return ok
     except Exception as e:
         log_event("telegram_send_file_bytes_exception", error=str(e))
+        return False
+
+
+# =========================================================
+# ALERTAS INTERNAS (NUEVO BOT)
+# =========================================================
+
+def telegram_send_alert(bot_token: str, chat_id: int, text: str) -> bool:
+    """
+    Envía alertas críticas del sistema a tu bot de monitoreo.
+    """
+    try:
+        alert_text = f"🚨 ALERTA SISTEMA\n\n{text}"
+        return telegram_send_text(bot_token, chat_id, alert_text)
+    except Exception as e:
+        log_event("telegram_alert_exception", error=str(e))
         return False
