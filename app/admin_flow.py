@@ -1,4 +1,4 @@
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 from fastapi import HTTPException
 
@@ -10,8 +10,15 @@ from app.menu import (
     set_menu_product_price,
     invalidate_menu_cache,
 )
-from app.orders import get_order_by_id, update_order_status
+from app.orders import (
+    get_order_by_id,
+    update_order_status,
+    append_order_row,
+    gen_order_id,
+    build_items_snapshot,
+)
 from app.telegram_api import telegram_send_text, telegram_get_file_path, telegram_download_file_bytes
+from app.telegram_keyboard import kb
 from app.utils import normalize, log_event
 from app.stats import build_periods, resolve_period, build_stats_report_text
 from app.image_storage import upload_product_photo_for_tenant
@@ -25,6 +32,7 @@ from app.webhook_helpers import (
     fmt_price_short,
     extract_first_number,
     get_business_status_safe,
+    fmt_snapshot_lines,
 )
 from app.admin_hours import (
     DAY_ORDER,
@@ -58,9 +66,12 @@ from app.consumer_db import (
     consumer_filters_inline_kb,
     build_consumers_report_pages,
     resolve_consumer_period,
-    consumer_filter_label,
 )
 
+
+# =========================================================
+# CONSUMER DB HELPERS
+# =========================================================
 
 def _send_consumers_menu(bot_token: str, chat_id: int, tenant_id: str) -> bool:
     return telegram_send_text(
@@ -117,6 +128,203 @@ def _send_consumers_report(
 
     return True
 
+
+# =========================================================
+# ADMIN MANUAL ORDER HELPERS
+# =========================================================
+
+def _admin_order_reset(tmp: Dict[str, Any]) -> None:
+    tmp.pop("admin_order_cart", None)
+    tmp.pop("admin_order_step", None)
+    tmp.pop("admin_order_name", None)
+    tmp.pop("admin_order_contact", None)
+    tmp.pop("admin_order_requested_time", None)
+    tmp.pop("admin_order_categories", None)
+    tmp.pop("admin_order_current_category", None)
+
+
+def _admin_order_get_active_categories(orders_sh) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]], List[str]]:
+    menu_idx = load_menu_admin_index(orders_sh, force=False)
+    cats_raw = group_menu_admin_by_category(menu_idx)
+
+    cats_active: Dict[str, List[Dict[str, Any]]] = {}
+    for cat, items in cats_raw.items():
+        only_active = [it for it in items if bool(it.get("active", False))]
+        if only_active:
+            cats_active[cat] = only_active
+
+    cat_names = sorted(cats_active.keys(), key=lambda x: normalize(x))
+    return menu_idx, cats_active, cat_names
+
+
+def _admin_order_home_kb(tenant_id: str, cat_names: List[str], cats: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    for idx, cat in enumerate(cat_names):
+        total_n = len(cats.get(cat, []))
+        rows.append([(f"📂 {cat} ({total_n})", f"admord|{tenant_id}|cat|{idx}")])
+
+    rows.append([("🛒 Ver carrito", f"admord|{tenant_id}|cart")])
+    rows.append([("❌ Cancelar", f"admord|{tenant_id}|panel")])
+    return kb(rows)
+
+
+def _send_admin_order_home(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sess: Dict[str, Any],
+) -> bool:
+    _, cats, cat_names = _admin_order_get_active_categories(orders_sh)
+    tmp = sess.setdefault("tmp", {})
+    tmp["admin_order_categories"] = cat_names
+    tmp.pop("admin_order_current_category", None)
+
+    msg = (
+        "➕ CREAR PEDIDO MANUAL\n\n"
+        "Elige una categoría para agregar productos al carrito:"
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=_admin_order_home_kb(tenant_id, cat_names, cats),
+    )
+
+
+def _admin_order_category_kb(tenant_id: str, category: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    for it in items[:25]:
+        sku = str(it.get("sku") or "").strip()
+        price_txt = fmt_price_short(it.get("price", 0))
+        rows.append([(f"{it.get('name','')} — Bs {price_txt}", f"admord|{tenant_id}|prd|{sku}")])
+
+    rows.append([("🛒 Ver carrito", f"admord|{tenant_id}|cart")])
+    rows.append([("⬅️ Categorías", f"admord|{tenant_id}|home")])
+    rows.append([("❌ Cancelar", f"admord|{tenant_id}|panel")])
+
+    return kb(rows)
+
+
+def _send_admin_order_category(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sess: Dict[str, Any],
+    category: str,
+) -> bool:
+    _, cats, _ = _admin_order_get_active_categories(orders_sh)
+    items = cats.get(category, [])
+
+    tmp = sess.setdefault("tmp", {})
+    tmp["admin_order_current_category"] = category
+
+    msg = (
+        f"📂 CATEGORÍA: {category}\n\n"
+        "Elige un producto:"
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=_admin_order_category_kb(tenant_id, category, items),
+    )
+
+
+def _admin_order_qty_kb(tenant_id: str, sku: str) -> Dict[str, Any]:
+    return kb([
+        [("1", f"admord|{tenant_id}|qty|{sku}|1"), ("2", f"admord|{tenant_id}|qty|{sku}|2"),
+         ("3", f"admord|{tenant_id}|qty|{sku}|3"), ("4", f"admord|{tenant_id}|qty|{sku}|4")],
+        [("🛒 Ver carrito", f"admord|{tenant_id}|cart")],
+        [("⬅️ Volver", f"admord|{tenant_id}|catback")],
+        [("❌ Cancelar", f"admord|{tenant_id}|panel")],
+    ])
+
+
+def _send_admin_order_product_qty(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sku: str,
+) -> bool:
+    item = get_menu_product_or_404(orders_sh, sku)
+    msg = (
+        "➕ AGREGAR AL PEDIDO\n\n"
+        f"Producto: {item.get('name','')}\n"
+        f"Precio: Bs {fmt_price_short(item.get('price', 0))}\n\n"
+        "Selecciona cantidad:"
+    )
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=_admin_order_qty_kb(tenant_id, sku),
+    )
+
+
+def _admin_order_add_to_cart(tmp: Dict[str, Any], sku: str, qty: int) -> None:
+    cart = tmp.get("admin_order_cart") or []
+    found = False
+    for it in cart:
+        if str(it.get("sku") or "").strip() == sku:
+            it["qty"] = int(it.get("qty") or 0) + qty
+            found = True
+            break
+    if not found:
+        cart.append({"sku": sku, "qty": qty})
+    tmp["admin_order_cart"] = cart
+
+
+def _admin_order_cart_kb(tenant_id: str, has_items: bool) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    if has_items:
+        rows.append([("✅ Confirmar pedido", f"admord|{tenant_id}|confirm")])
+        rows.append([("🧹 Vaciar carrito", f"admord|{tenant_id}|clear")])
+
+    rows.append([("⬅️ Seguir agregando", f"admord|{tenant_id}|home")])
+    rows.append([("❌ Cancelar", f"admord|{tenant_id}|panel")])
+    return kb(rows)
+
+
+def _send_admin_order_cart(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sess: Dict[str, Any],
+) -> bool:
+    tmp = sess.setdefault("tmp", {})
+    cart = tmp.get("admin_order_cart") or []
+
+    menu_idx = load_menu_admin_index(orders_sh, force=False)
+    items_snapshot = build_items_snapshot(cart, menu_idx)
+    lines_txt, total, total_qty = fmt_snapshot_lines(items_snapshot)
+
+    msg = (
+        "🛒 PEDIDO MANUAL\n\n"
+        f"Cantidad total: {total_qty}\n"
+        f"Total: Bs {total:.2f}\n\n"
+        f"Detalle:\n{lines_txt}"
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=_admin_order_cart_kb(tenant_id, total_qty > 0),
+    )
+
+
+# =========================================================
+# ADMIN CALLBACKS
+# =========================================================
 
 def handle_admin_callback(
     tenant: Dict[str, Any],
@@ -214,6 +422,98 @@ def handle_admin_callback(
                 period_key=period_key,
                 filter_key=filter_key,
             )}
+
+        return {"ok": True}
+
+    # =========================================
+    # ADMIN MANUAL ORDER FLOW
+    # =========================================
+    if data.startswith("admord|"):
+        assert_admin_authorized(tenant, chat_id, tenant_id)
+
+        parts = data.split("|")
+        if len(parts) < 3:
+            return {"ok": True}
+
+        cb_tenant_id = parts[1].strip()
+        if cb_tenant_id != tenant_id:
+            raise HTTPException(status_code=400, detail="Tenant mismatch in admin order callback")
+
+        action = parts[2].strip()
+        sess = get_sess(tenant_id, chat_id)
+        tmp = sess.setdefault("tmp", {})
+
+        if action == "start":
+            _admin_order_reset(tmp)
+            tmp["admin_order_cart"] = []
+            return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if action == "panel":
+            _admin_order_reset(tmp)
+            telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
+            return {"ok": True}
+
+        if action == "home":
+            return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if action == "cat" and len(parts) == 4:
+            try:
+                idx = int(parts[3].strip())
+            except Exception:
+                idx = -1
+
+            _, cats, cat_names = _admin_order_get_active_categories(orders_sh)
+            if idx < 0 or idx >= len(cat_names):
+                return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+            category = cat_names[idx]
+            return {"ok": _send_admin_order_category(bot_token, chat_id, tenant_id, orders_sh, sess, category)}
+
+        if action == "catback":
+            current_category = str(tmp.get("admin_order_current_category") or "").strip()
+            if not current_category:
+                return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+            return {"ok": _send_admin_order_category(bot_token, chat_id, tenant_id, orders_sh, sess, current_category)}
+
+        if action == "prd" and len(parts) == 4:
+            sku = parts[3].strip()
+            return {"ok": _send_admin_order_product_qty(bot_token, chat_id, tenant_id, orders_sh, sku)}
+
+        if action == "qty" and len(parts) == 5:
+            sku = parts[3].strip()
+            try:
+                qty = int(parts[4].strip())
+            except Exception:
+                qty = 1
+            qty = max(1, qty)
+
+            item = get_menu_product_or_404(orders_sh, sku)
+            _admin_order_add_to_cart(tmp, sku, qty)
+
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                f"✅ Agregado al pedido: {qty} x {item.get('name','')}",
+            )
+            return {"ok": _send_admin_order_cart(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if action == "cart":
+            return {"ok": _send_admin_order_cart(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if action == "clear":
+            tmp["admin_order_cart"] = []
+            telegram_send_text(bot_token, chat_id, "🧹 Carrito manual vaciado.")
+            return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if action == "confirm":
+            cart = tmp.get("admin_order_cart") or []
+            if not cart:
+                telegram_send_text(bot_token, chat_id, "⚠️ El carrito está vacío.")
+                return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+            tmp["admin_order_step"] = "awaiting_name"
+            telegram_send_text(bot_token, chat_id, "Escribe el nombre del cliente:")
+            return {"ok": True}
 
         return {"ok": True}
 
@@ -591,6 +891,10 @@ def handle_admin_callback(
     return {"ok": True}
 
 
+# =========================================================
+# ADMIN MESSAGES
+# =========================================================
+
 def handle_admin_message(
     tenant: Dict[str, Any],
     tenant_id: str,
@@ -604,6 +908,102 @@ def handle_admin_message(
     txt_norm = normalize(text)
     sess = get_sess(tenant_id, chat_id)
     tmp = sess.setdefault("tmp", {})
+
+    # =========================================
+    # ADMIN MANUAL ORDER FLOW (TEXT STEPS)
+    # =========================================
+    admin_order_step = str(tmp.get("admin_order_step") or "").strip()
+
+    if admin_order_step:
+        assert_admin_authorized(tenant, chat_id, tenant_id)
+
+        if admin_order_step == "awaiting_name":
+            customer_name = text.strip()
+            if not customer_name:
+                telegram_send_text(bot_token, chat_id, "El nombre no puede estar vacío. Escribe el nombre del cliente:")
+                return {"ok": True}
+
+            tmp["admin_order_name"] = customer_name
+            tmp["admin_order_step"] = "awaiting_contact"
+            telegram_send_text(bot_token, chat_id, "Escribe el contacto del cliente (teléfono o referencia):")
+            return {"ok": True}
+
+        if admin_order_step == "awaiting_contact":
+            customer_contact = text.strip()
+            if not customer_contact:
+                telegram_send_text(bot_token, chat_id, "El contacto no puede estar vacío. Escribe el contacto del cliente:")
+                return {"ok": True}
+
+            tmp["admin_order_contact"] = customer_contact
+            tmp["admin_order_step"] = "awaiting_time"
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "Escribe la hora solicitada.\nEjemplos: ahora, 19:30, 20h",
+            )
+            return {"ok": True}
+
+        if admin_order_step == "awaiting_time":
+            requested_time = text.strip()
+            if not requested_time:
+                requested_time = "ahora"
+
+            cart = tmp.get("admin_order_cart") or []
+            customer_name = str(tmp.get("admin_order_name") or "").strip()
+            customer_contact = str(tmp.get("admin_order_contact") or "").strip()
+
+            if not cart or not customer_name or not customer_contact:
+                _admin_order_reset(tmp)
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "⚠️ Faltaban datos del pedido manual. Empecemos de nuevo.",
+                    reply_markup=admin_fixed_kb(),
+                )
+                return {"ok": True}
+
+            menu_idx = load_menu_admin_index(orders_sh, force=False)
+            items_snapshot = build_items_snapshot(cart, menu_idx)
+            _, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
+
+            order_id = gen_order_id()
+
+            append_order_row(
+                orders_sh=orders_sh,
+                tenant_id=tenant_id,
+                order_id=order_id,
+                customer_name=customer_name,
+                customer_contact=customer_contact,
+                items=cart,
+                items_snapshot=items_snapshot,
+                currency="BOB",
+                pricing_version="v1",
+                notes="",
+                delivery_type="pickup",
+                requested_time=requested_time,
+                status="PAID",
+                source="admin_manual",
+                total_amount=total_amount,
+            )
+
+            _admin_order_reset(tmp)
+
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                (
+                    "✅ PEDIDO MANUAL REGISTRADO\n\n"
+                    f"ID: {order_id}\n"
+                    f"Cliente: {customer_name}\n"
+                    f"Contacto: {customer_contact}\n"
+                    f"Hora: {requested_time}\n"
+                    f"Cantidad total: {total_qty}\n"
+                    f"Total: Bs {total_amount:.2f}\n\n"
+                    "Se guardó como PAID y ya cuenta para estadísticas."
+                ),
+                reply_markup=admin_fixed_kb(),
+            )
+            return {"ok": True}
 
     input_mode = str(tmp.get("admin_menu_input_mode") or "").strip()
     input_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
@@ -745,6 +1145,15 @@ def handle_admin_message(
         )
         telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
         return {"ok": True}
+
+    if (
+        txt_norm in ("crear pedido", "crear pedido manual", "pedido manual", "nuevo pedido")
+        or "crear pedido" in txt_norm
+    ):
+        assert_admin_authorized(tenant, chat_id, tenant_id)
+        _admin_order_reset(tmp)
+        tmp["admin_order_cart"] = []
+        return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
     if txt_norm in (
         "base de consumidores",
