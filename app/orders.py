@@ -7,15 +7,7 @@ from typing import Any, Dict, List, Optional
 from app.utils import log_event
 
 
-# ----------------------------------------
-# Helpers: worksheet + safe json
-# ----------------------------------------
-
 def _get_orders_ws(orders_sh):
-    """
-    orders_sh: gspread Spreadsheet
-    Preferimos worksheet 'ORDERS'. Si no existe, usamos la primera.
-    """
     try:
         return orders_sh.worksheet("ORDERS")
     except Exception:
@@ -48,17 +40,11 @@ def _safe_json_loads(s: Any) -> Any:
 
 
 def _get_header(ws) -> List[str]:
-    """
-    Asumimos que fila 1 tiene headers técnicos (como en tu sheet).
-    """
     hdr = ws.row_values(1)
     return [h.strip() for h in hdr if str(h).strip()]
 
 
 def _find_col_idx(header: List[str], col_name: str) -> Optional[int]:
-    """
-    Devuelve índice 0-based.
-    """
     col_name = (col_name or "").strip()
     for i, h in enumerate(header):
         if h.strip() == col_name:
@@ -67,10 +53,6 @@ def _find_col_idx(header: List[str], col_name: str) -> Optional[int]:
 
 
 def _build_row_by_header(header: List[str], data: Dict[str, Any]) -> List[str]:
-    """
-    Construye una fila alineada al header.
-    Convierte dict/list a JSON string.
-    """
     row: List[str] = [""] * len(header)
     for k, v in (data or {}).items():
         idx = _find_col_idx(header, k)
@@ -85,27 +67,12 @@ def _build_row_by_header(header: List[str], data: Dict[str, Any]) -> List[str]:
     return row
 
 
-# ----------------------------------------
-# ID generator (corto, suficiente para demo)
-# ----------------------------------------
-
 def gen_order_id() -> str:
-    # 8 hex chars
     import secrets
     return secrets.token_hex(4)
 
 
-# ----------------------------------------
-# Pricing snapshot (REAL / congelado)
-# ----------------------------------------
-
 def build_items_snapshot(items: List[Dict[str, Any]], menu_idx: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    items: [{"sku": "...", "qty": 2}, ...]
-    menu_idx: {sku: {"name":..., "price":...}, ...}
-    output:
-      [{"sku","name","qty","unit_price","line_total"}, ...]
-    """
     snapshot: List[Dict[str, Any]] = []
     for it in items or []:
         sku = str(it.get("sku") or "").strip()
@@ -118,7 +85,6 @@ def build_items_snapshot(items: List[Dict[str, Any]], menu_idx: Dict[str, Any]) 
         qty = max(1, qty)
 
         if sku not in menu_idx:
-            # si sku no existe, igual lo guardamos para auditoría
             snapshot.append({
                 "sku": sku,
                 "name": sku,
@@ -146,10 +112,6 @@ def build_items_snapshot(items: List[Dict[str, Any]], menu_idx: Dict[str, Any]) 
     return snapshot
 
 
-# ----------------------------------------
-# CREATE: append_order_row (y alias append_order)
-# ----------------------------------------
-
 def append_order_row(
     orders_sh,
     tenant_id: str,
@@ -162,58 +124,69 @@ def append_order_row(
     status: str,
     source: str,
     total_amount: Any,
-    # nuevos / opcionales:
     items_snapshot: Optional[List[Dict[str, Any]]] = None,
     currency: str = "BOB",
     pricing_version: str = "v1",
     notes: str = "",
 ) -> Dict[str, Any]:
-    """
-    Inserta una fila en ORDERS alineada a headers.
-    """
-    ws = _get_orders_ws(orders_sh)
-    header = _get_header(ws)
-    if not header:
-        raise RuntimeError("ORDERS header row missing (row 1)")
 
-    data = {
-        "order_id": order_id,
-        "created_at": _now_iso_utc(),
-        "tenant_id": tenant_id,
-        "customer_name": customer_name,
-        "customer_contact": customer_contact,
-        "items": items,
-        "items_snapshot": items_snapshot or "",
-        "currency": currency,
-        "pricing_version": pricing_version,
-        "notes": notes,
-        "delivery_type": delivery_type,
-        "requested_time": requested_time,
-        "status": status,
-        "source": source,
-        "total_amount": total_amount,
-        # payment fields (vacío al crear)
-        "payment_proof_file_id": "",
-        "payment_confirmed_at": "",
-        "payment_proof_type": "",
-        "payment_proof_caption": "",
-    }
+    try:
+        ws = _get_orders_ws(orders_sh)
+        header = _get_header(ws)
+        if not header:
+            raise RuntimeError("ORDERS header row missing")
 
-    row = _build_row_by_header(header, data)
-    ws.append_row(row, value_input_option="RAW")
+        data = {
+            "order_id": order_id,
+            "created_at": _now_iso_utc(),
+            "tenant_id": tenant_id,
+            "customer_name": customer_name,
+            "customer_contact": customer_contact,
+            "items": items,
+            "items_snapshot": items_snapshot or "",
+            "currency": currency,
+            "pricing_version": pricing_version,
+            "notes": notes,
+            "delivery_type": delivery_type,
+            "requested_time": requested_time,
+            "status": status,
+            "source": source,
+            "total_amount": total_amount,
+            "payment_proof_file_id": "",
+            "payment_confirmed_at": "",
+            "payment_proof_type": "",
+            "payment_proof_caption": "",
+        }
 
-    log_event("order_appended", tenant_id=tenant_id, order_id=order_id, status=status, source=source)
-    return {"ok": True, "order_id": order_id}
+        row = _build_row_by_header(header, data)
+        ws.append_row(row, value_input_option="RAW")
+
+        log_event(
+            "order_appended",
+            tenant_id=tenant_id,
+            order_id=order_id,
+            status=status,
+            source=source,
+            total_amount=total_amount,
+            customer_contact=customer_contact,
+        )
+
+        return {"ok": True, "order_id": order_id}
+
+    except Exception as e:
+        log_event(
+            "order_append_error",
+            tenant_id=tenant_id,
+            order_id=order_id,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        return {"ok": False, "error": str(e)}
 
 
-# ✅ Compatibilidad hacia atrás:
 def append_order(*args, **kwargs):
     return append_order_row(*args, **kwargs)
 
-
-# ----------------------------------------
-# READ helpers
-# ----------------------------------------
 
 def _iter_rows_as_dicts(ws) -> List[Dict[str, Any]]:
     header = _get_header(ws)
@@ -251,7 +224,6 @@ def find_latest_pending_order_for_contact(orders_sh, customer_contact: str, stat
     contact = (customer_contact or "").strip()
     status = (status or "").strip()
 
-    # recorremos de abajo hacia arriba (último primero)
     for r in reversed(rows):
         if (r.get("customer_contact") or "").strip() != contact:
             continue
@@ -261,14 +233,7 @@ def find_latest_pending_order_for_contact(orders_sh, customer_contact: str, stat
     return None
 
 
-# ----------------------------------------
-# UPDATE: status / payment proof
-# ----------------------------------------
-
 def _find_row_index_by_order_id(ws, order_id: str) -> Optional[int]:
-    """
-    Devuelve row index 1-based en la sheet (incluye header en fila 1).
-    """
     header = _get_header(ws)
     if not header:
         return None
@@ -277,36 +242,46 @@ def _find_row_index_by_order_id(ws, order_id: str) -> Optional[int]:
         return None
 
     values = ws.get_all_values()
-    # values[0] = header
     for i in range(1, len(values)):
         row = values[i]
         cell = row[oid_col] if oid_col < len(row) else ""
         if str(cell).strip() == (order_id or "").strip():
-            return i + 1  # 1-based
+            return i + 1
     return None
 
 
 def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, Any]:
-    ws = _get_orders_ws(orders_sh)
-    header = _get_header(ws)
-    ridx = _find_row_index_by_order_id(ws, order_id)
-    if ridx is None:
-        return {"ok": True, "found": False}
+    try:
+        ws = _get_orders_ws(orders_sh)
+        header = _get_header(ws)
+        ridx = _find_row_index_by_order_id(ws, order_id)
 
-    status_col = _find_col_idx(header, "status")
-    if status_col is None:
-        raise RuntimeError("Missing 'status' column in ORDERS header")
+        if ridx is None:
+            return {"ok": True, "found": False}
 
-    ws.update_cell(ridx, status_col + 1, str(new_status).strip())
+        status_col = _find_col_idx(header, "status")
+        if status_col is None:
+            raise RuntimeError("Missing status column")
 
-    # si pasa a PAID, guardamos timestamp
-    if str(new_status).strip() == "PAID":
-        paid_col = _find_col_idx(header, "payment_confirmed_at")
-        if paid_col is not None:
-            ws.update_cell(ridx, paid_col + 1, _now_iso_utc())
+        ws.update_cell(ridx, status_col + 1, str(new_status).strip())
 
-    log_event("order_status_updated", order_id=order_id, status=new_status)
-    return {"ok": True, "found": True}
+        if str(new_status).strip() == "PAID":
+            paid_col = _find_col_idx(header, "payment_confirmed_at")
+            if paid_col is not None:
+                ws.update_cell(ridx, paid_col + 1, _now_iso_utc())
+
+        log_event("order_status_updated", order_id=order_id, status=new_status)
+
+        return {"ok": True, "found": True}
+
+    except Exception as e:
+        log_event(
+            "order_status_update_error",
+            order_id=order_id,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        return {"ok": False, "error": str(e)}
 
 
 def update_order_payment_proof(
@@ -316,23 +291,37 @@ def update_order_payment_proof(
     proof_type: str,
     proof_caption: str = "",
 ) -> Dict[str, Any]:
-    ws = _get_orders_ws(orders_sh)
-    header = _get_header(ws)
-    ridx = _find_row_index_by_order_id(ws, order_id)
-    if ridx is None:
-        return {"ok": True, "found": False}
 
-    fcol = _find_col_idx(header, "payment_proof_file_id")
-    tcol = _find_col_idx(header, "payment_proof_type")
-    ccol = _find_col_idx(header, "payment_proof_caption")
+    try:
+        ws = _get_orders_ws(orders_sh)
+        header = _get_header(ws)
+        ridx = _find_row_index_by_order_id(ws, order_id)
 
-    if fcol is None or tcol is None:
-        raise RuntimeError("Missing payment proof columns in ORDERS header")
+        if ridx is None:
+            return {"ok": True, "found": False}
 
-    ws.update_cell(ridx, fcol + 1, str(proof_file_id or "").strip())
-    ws.update_cell(ridx, tcol + 1, str(proof_type or "").strip())
-    if ccol is not None:
-        ws.update_cell(ridx, ccol + 1, str(proof_caption or "").strip())
+        fcol = _find_col_idx(header, "payment_proof_file_id")
+        tcol = _find_col_idx(header, "payment_proof_type")
+        ccol = _find_col_idx(header, "payment_proof_caption")
 
-    log_event("order_proof_updated", order_id=order_id, proof_type=proof_type)
-    return {"ok": True, "found": True}
+        if fcol is None or tcol is None:
+            raise RuntimeError("Missing payment proof columns")
+
+        ws.update_cell(ridx, fcol + 1, str(proof_file_id or "").strip())
+        ws.update_cell(ridx, tcol + 1, str(proof_type or "").strip())
+
+        if ccol is not None:
+            ws.update_cell(ridx, ccol + 1, str(proof_caption or "").strip())
+
+        log_event("order_proof_updated", order_id=order_id, proof_type=proof_type)
+
+        return {"ok": True, "found": True}
+
+    except Exception as e:
+        log_event(
+            "order_proof_update_error",
+            order_id=order_id,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        return {"ok": False, "error": str(e)}
