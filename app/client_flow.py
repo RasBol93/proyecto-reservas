@@ -111,11 +111,6 @@ def _format_open_days(days: List[str]) -> str:
         "DOM": "Domingo",
     }
 
-    order = [
-        "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN",
-        "LUN", "MAR", "MIE", "MIÉ", "JUE", "VIE", "SAB", "SÁB", "DOM",
-    ]
-
     normalized_days = []
     seen = set()
 
@@ -130,14 +125,77 @@ def _format_open_days(days: List[str]) -> str:
                 normalized_days.append(nice)
 
     if normalized_days:
-        ordered_names = []
         desired_order = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-        for name in desired_order:
-            if name in normalized_days:
-                ordered_names.append(name)
+        ordered_names = [name for name in desired_order if name in normalized_days]
         return ", ".join(ordered_names)
 
     return "No configurado"
+
+
+def _send_category_products(
+    bot_token: str,
+    chat_id: int,
+    real_cat: str,
+    items: List[Dict[str, Any]],
+) -> None:
+    with_photo = []
+    without_photo = []
+
+    for it in items:
+        photo_url = str(it.get("photo_url") or "").strip()
+        photo_file_id = str(it.get("photo_file_id") or "").strip()
+        if photo_url or photo_file_id:
+            with_photo.append(it)
+        else:
+            without_photo.append(it)
+
+    telegram_send_text(bot_token, chat_id, f"🍽 {real_cat}")
+
+    for it in with_photo:
+        photo_url = str(it.get("photo_url") or "").strip()
+        photo_file_id = str(it.get("photo_file_id") or "").strip()
+        price_txt = f"{float(it['price']):.0f}"
+        reply_markup = kb([
+            [(f"⬆️ {it['name']} — Bs {price_txt}", f"prd|{it['sku']}")],
+            [("🛒 Carrito", "cart")],
+            [("⬅️ Categorías", "menu")],
+            [("🏠 Inicio", "home")],
+        ])
+
+        if photo_url:
+            telegram_send_photo(
+                bot_token,
+                chat_id,
+                photo_url,
+                caption=f"{it['name']}\nBs {price_txt}",
+                reply_markup=reply_markup,
+            )
+        elif photo_file_id:
+            telegram_send_photo(
+                bot_token,
+                chat_id,
+                photo_file_id,
+                caption=f"{it['name']}\nBs {price_txt}",
+                reply_markup=reply_markup,
+            )
+
+    if without_photo:
+        rows = []
+        for it in without_photo[:25]:
+            rows.append([(f"{it['name']} — Bs {float(it['price']):.0f}", f"prd|{it['sku']}")])
+        rows.append([("🛒 Carrito", "cart")])
+        rows.append([("⬅️ Categorías", "menu")])
+        rows.append([("🏠 Inicio", "home")])
+
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            "Productos sin foto:",
+            kb(rows),
+        )
+
+    if not with_photo and not without_photo:
+        telegram_send_text(bot_token, chat_id, "No hay productos activos.")
 
 
 def client_orders_allowed_or_notify(bot_token: str, chat_id: int, orders_sh, tenant_tz: str) -> bool:
@@ -286,34 +344,7 @@ def handle_client_callback(
                 telegram_send_text(bot_token, chat_id, "No hay productos activos.")
                 return {"ok": True}
 
-            rows = []
-            for it in items[:25]:
-                rows.append([(f"{it['name']} ({it['price']:.0f})", f"prd|{it['sku']}")])
-            rows.append([("🛒 Carrito", "cart")])
-            rows.append([("⬅️ Categorías", "menu")])
-            rows.append([("🏠 Inicio", "home")])
-
-            telegram_send_text(bot_token, chat_id, f"🍽 {real_cat} — elige un producto:", kb(rows))
-
-            for it in items:
-                photo_url = str(it.get("photo_url") or "").strip()
-                photo_file_id = str(it.get("photo_file_id") or "").strip()
-
-                if photo_url:
-                    telegram_send_photo(
-                        bot_token,
-                        chat_id,
-                        photo_url,
-                        caption=f"{it['name']}\nBs {it['price']}",
-                    )
-                elif photo_file_id:
-                    telegram_send_photo(
-                        bot_token,
-                        chat_id,
-                        photo_file_id,
-                        caption=f"{it['name']}\nBs {it['price']}",
-                    )
-
+            _send_category_products(bot_token, chat_id, real_cat, items)
             return {"ok": True}
 
         if data.startswith("prd|"):
