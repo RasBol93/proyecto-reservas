@@ -52,10 +52,24 @@ def telegram_send_text(
         return False
 
 
-def telegram_send_photo(bot_token: str, chat_id: int, photo: str, caption: str = "") -> bool:
+# ✅ ACTUALIZADA
+def telegram_send_photo(
+    bot_token: str,
+    chat_id: int,
+    photo: str,
+    caption: str = "",
+    reply_markup: Optional[Dict[str, Any]] = None,
+    parse_mode: Optional[str] = None,
+) -> bool:
     payload: Dict[str, Any] = {"chat_id": chat_id, "photo": photo}
+
     if caption:
         payload["caption"] = caption
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
     try:
         res = telegram_api_call(bot_token, "sendPhoto", payload)
         ok = bool(res.get("ok", False))
@@ -100,6 +114,10 @@ def reply_kb(button_rows: List[List[str]], resize: bool = True, one_time: bool =
         "selective": False,
     }
 
+
+# =========================
+# MULTIPART (SIN CAMBIOS)
+# =========================
 
 def _multipart_encode(
     fields: Dict[str, str],
@@ -173,9 +191,9 @@ def telegram_send_file_bytes(
         return False
 
 
-# =========================================================
-# ALERTAS INTERNAS
-# =========================================================
+# =========================
+# ALERTAS
+# =========================
 
 def telegram_send_alert(bot_token: str, chat_id: int, text: str) -> bool:
     try:
