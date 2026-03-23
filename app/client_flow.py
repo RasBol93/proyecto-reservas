@@ -92,7 +92,7 @@ def _format_open_days(days: List[str]) -> str:
     if not days:
         return "No configurado"
 
-    day_map = {
+    alias_map = {
         "MON": "Lunes",
         "TUE": "Martes",
         "WED": "Miércoles",
@@ -100,13 +100,44 @@ def _format_open_days(days: List[str]) -> str:
         "FRI": "Viernes",
         "SAT": "Sábado",
         "SUN": "Domingo",
+        "LUN": "Lunes",
+        "MAR": "Martes",
+        "MIE": "Miércoles",
+        "MIÉ": "Miércoles",
+        "JUE": "Jueves",
+        "VIE": "Viernes",
+        "SAB": "Sábado",
+        "SÁB": "Sábado",
+        "DOM": "Domingo",
     }
 
-    ordered_codes = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
-    days_set = {str(d or "").strip().upper() for d in days}
-    names = [day_map[d] for d in ordered_codes if d in days_set]
+    order = [
+        "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN",
+        "LUN", "MAR", "MIE", "MIÉ", "JUE", "VIE", "SAB", "SÁB", "DOM",
+    ]
 
-    return ", ".join(names) if names else "No configurado"
+    normalized_days = []
+    seen = set()
+
+    for d in days:
+        d_norm = str(d or "").strip().upper()
+        if not d_norm:
+            continue
+        if d_norm in alias_map:
+            nice = alias_map[d_norm]
+            if nice not in seen:
+                seen.add(nice)
+                normalized_days.append(nice)
+
+    if normalized_days:
+        ordered_names = []
+        desired_order = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+        for name in desired_order:
+            if name in normalized_days:
+                ordered_names.append(name)
+        return ", ".join(ordered_names)
+
+    return "No configurado"
 
 
 def client_orders_allowed_or_notify(bot_token: str, chat_id: int, orders_sh, tenant_tz: str) -> bool:
