@@ -88,6 +88,27 @@ def _send_home(bot_token: str, chat_id: int, orders_sh) -> bool:
     )
 
 
+def _format_open_days(days: List[str]) -> str:
+    if not days:
+        return "No configurado"
+
+    day_map = {
+        "MON": "Lunes",
+        "TUE": "Martes",
+        "WED": "Miércoles",
+        "THU": "Jueves",
+        "FRI": "Viernes",
+        "SAT": "Sábado",
+        "SUN": "Domingo",
+    }
+
+    ordered_codes = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+    days_set = {str(d or "").strip().upper() for d in days}
+    names = [day_map[d] for d in ordered_codes if d in days_set]
+
+    return ", ".join(names) if names else "No configurado"
+
+
 def client_orders_allowed_or_notify(bot_token: str, chat_id: int, orders_sh, tenant_tz: str) -> bool:
     try:
         bs = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
@@ -146,12 +167,18 @@ def handle_client_callback(
             open_time = str(bs.get("open_time") or "").strip()
             close_time = str(bs.get("close_time") or "").strip()
             last_order_time = str(bs.get("last_order_time") or "").strip()
+            weekly_open_days = bs.get("weekly_open_days") or []
 
             parts = [open_now]
+
+            if weekly_open_days:
+                parts.append(f"📅 Días regulares: {_format_open_days(weekly_open_days)}")
+
             if open_time and close_time:
-                parts.append(f"Horario de hoy: {open_time} - {close_time}")
+                parts.append(f"🕒 Horario regular: {open_time} - {close_time}")
+
             if last_order_time:
-                parts.append(f"Última hora de pedido: {last_order_time}")
+                parts.append(f"⏳ Última hora de pedido: {last_order_time}")
 
             telegram_send_text(bot_token, chat_id, "\n\n".join(parts))
             return {"ok": True}
@@ -324,7 +351,7 @@ def handle_client_callback(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                f"✅ Agregado al carrito: {qty} x {name}\n\nCantidad: {total_qty}\nTotal: {total:.2f} BOB",
+                f"✅ Agregado al carrito: {qty} x {name}\n\nCantidad: {total_qty}\nTotal: {total:.2f} Bs",
                 reply_markup=kb([
                     [("🛒 Ver carrito", "cart")],
                     [("⬅️ Seguir comprando", "menu")],
@@ -355,7 +382,7 @@ def handle_client_callback(
             msg = (
                 f"🛒 *Tu carrito*\n"
                 f"Cantidad: *{total_qty}*\n"
-                f"Total: *{total:.2f}* BOB\n\n"
+                f"Total: *{total:.2f}* Bs\n\n"
                 f"{lines_txt}"
             )
             telegram_send_text(bot_token, chat_id, msg, reply_markup=cart_kb(has_items), parse_mode="Markdown")
