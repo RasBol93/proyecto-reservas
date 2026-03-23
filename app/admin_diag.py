@@ -16,6 +16,7 @@ from app.admin_settings import (
 )
 from app.menu import load_menu_admin_index, group_menu_admin_by_category
 from app.orders import get_order_by_id
+from app.alerts import send_test_alert
 
 router = APIRouter(prefix="/admin/diag", tags=["admin"])
 
@@ -643,6 +644,16 @@ def runtime_diag(
         "business_status": business,
         "menu_runtime": menu_runtime,
         "orders_runtime": orders_runtime,
+    }
+
+
+@router.get("/test_alert")
+def test_alert(token: str = Query(...), message: str = Query(default="Prueba manual desde /admin/diag/test_alert")) -> Dict[str, Any]:
+    _require_admin_token(token)
+    result = send_test_alert(message=message)
+    return {
+        "ok": bool(result.get("ok")),
+        "result": result,
     }
 
 
