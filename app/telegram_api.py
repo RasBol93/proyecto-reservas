@@ -7,15 +7,10 @@ from typing import Any, Dict, Optional, List, Tuple
 
 from app.config import TELEGRAM_API_BASE
 from app.utils import log_event
-from app.alerts import alert_telegram_error, alert_system_error
 
 
 def telegram_api_call(bot_token: str, method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not bot_token:
-        alert_system_error(
-            error="bot_token missing",
-            module="telegram_api.call",
-        )
         raise RuntimeError("bot_token missing")
 
     url = f"{TELEGRAM_API_BASE}/bot{bot_token}/{method}"
@@ -28,18 +23,9 @@ def telegram_api_call(bot_token: str, method: str, payload: Dict[str, Any]) -> D
         method="POST",
     )
 
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw)
-
-    except Exception as e:
-        log_event("telegram_api_call_exception", method=method, error=str(e))
-        alert_telegram_error(
-            error=str(e),
-            method=method,
-        )
-        raise
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw)
 
 
 def telegram_send_text(
@@ -58,28 +44,11 @@ def telegram_send_text(
     try:
         res = telegram_api_call(bot_token, "sendMessage", payload)
         ok = bool(res.get("ok", False))
-
         if not ok:
-            error_msg = res.get("description") or str(res)
-            log_event("telegram_send_failed", chat_id=chat_id, error=error_msg)
-
-            alert_telegram_error(
-                error=error_msg,
-                method="sendMessage",
-                chat_id=chat_id,
-            )
-
+            log_event("telegram_send_failed", chat_id=chat_id, error=res.get("description") or res)
         return ok
-
     except Exception as e:
         log_event("telegram_send_exception", chat_id=chat_id, error=str(e))
-
-        alert_telegram_error(
-            error=str(e),
-            method="sendMessage",
-            chat_id=chat_id,
-        )
-
         return False
 
 
@@ -87,32 +56,14 @@ def telegram_send_photo(bot_token: str, chat_id: int, photo: str, caption: str =
     payload: Dict[str, Any] = {"chat_id": chat_id, "photo": photo}
     if caption:
         payload["caption"] = caption
-
     try:
         res = telegram_api_call(bot_token, "sendPhoto", payload)
         ok = bool(res.get("ok", False))
-
         if not ok:
-            error_msg = res.get("description") or str(res)
-            log_event("telegram_send_photo_failed", chat_id=chat_id, error=error_msg)
-
-            alert_telegram_error(
-                error=error_msg,
-                method="sendPhoto",
-                chat_id=chat_id,
-            )
-
+            log_event("telegram_send_photo_failed", chat_id=chat_id, error=res.get("description") or res)
         return ok
-
     except Exception as e:
         log_event("telegram_send_photo_exception", chat_id=chat_id, error=str(e))
-
-        alert_telegram_error(
-            error=str(e),
-            method="sendPhoto",
-            chat_id=chat_id,
-        )
-
         return False
 
 
@@ -120,58 +71,24 @@ def telegram_send_document(bot_token: str, chat_id: int, document: str, caption:
     payload: Dict[str, Any] = {"chat_id": chat_id, "document": document}
     if caption:
         payload["caption"] = caption
-
     try:
         res = telegram_api_call(bot_token, "sendDocument", payload)
         ok = bool(res.get("ok", False))
-
         if not ok:
-            error_msg = res.get("description") or str(res)
-            log_event("telegram_send_document_failed", chat_id=chat_id, error=error_msg)
-
-            alert_telegram_error(
-                error=error_msg,
-                method="sendDocument",
-                chat_id=chat_id,
-            )
-
+            log_event("telegram_send_document_failed", chat_id=chat_id, error=res.get("description") or res)
         return ok
-
     except Exception as e:
         log_event("telegram_send_document_exception", chat_id=chat_id, error=str(e))
-
-        alert_telegram_error(
-            error=str(e),
-            method="sendDocument",
-            chat_id=chat_id,
-        )
-
         return False
 
 
 def telegram_answer_callback(bot_token: str, callback_query_id: str, text: str = "OK") -> None:
     try:
-        res = telegram_api_call(
-            bot_token,
-            "answerCallbackQuery",
-            {"callback_query_id": callback_query_id, "text": text},
-        )
+        res = telegram_api_call(bot_token, "answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
         if not res.get("ok", True):
-            error_msg = res.get("description") or str(res)
-            log_event("telegram_ack_failed", error=error_msg)
-
-            alert_telegram_error(
-                error=error_msg,
-                method="answerCallbackQuery",
-            )
-
+            log_event("telegram_ack_failed", error=res.get("description") or res)
     except Exception as e:
         log_event("telegram_ack_exception", error=str(e))
-
-        alert_telegram_error(
-            error=str(e),
-            method="answerCallbackQuery",
-        )
 
 
 def reply_kb(button_rows: List[List[str]], resize: bool = True, one_time: bool = False) -> Dict[str, Any]:
@@ -213,42 +130,16 @@ def _multipart_encode(
 
 
 def telegram_get_file_path(bot_token: str, file_id: str) -> str:
-    try:
-        res = telegram_api_call(bot_token, "getFile", {"file_id": file_id})
-
-        if not res.get("ok"):
-            error_msg = res.get("description") or str(res)
-
-            alert_telegram_error(
-                error=error_msg,
-                method="getFile",
-            )
-
-            raise RuntimeError(f"getFile failed: {res}")
-
-        return res["result"]["file_path"]
-
-    except Exception as e:
-        alert_telegram_error(
-            error=str(e),
-            method="getFile",
-        )
-        raise
+    res = telegram_api_call(bot_token, "getFile", {"file_id": file_id})
+    if not res.get("ok"):
+        raise RuntimeError(f"getFile failed: {res}")
+    return res["result"]["file_path"]
 
 
 def telegram_download_file_bytes(bot_token: str, file_path: str) -> bytes:
     url = f"{TELEGRAM_API_BASE}/file/bot{bot_token}/{file_path}"
-
-    try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
-            return resp.read()
-
-    except Exception as e:
-        alert_telegram_error(
-            error=str(e),
-            method="download_file",
-        )
-        raise
+    with urllib.request.urlopen(url, timeout=30) as resp:
+        return resp.read()
 
 
 def telegram_send_file_bytes(
@@ -263,7 +154,6 @@ def telegram_send_file_bytes(
 ) -> bool:
     url = f"{TELEGRAM_API_BASE}/bot{bot_token}/{method}"
     fields = {"chat_id": str(chat_id)}
-
     if caption:
         fields["caption"] = caption
 
@@ -274,50 +164,23 @@ def telegram_send_file_bytes(
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8")
             data = json.loads(raw)
-
             ok = bool(data.get("ok", False))
-
             if not ok:
-                error_msg = data.get("description") or str(data)
-
-                log_event("telegram_send_file_bytes_failed", error=error_msg)
-
-                alert_telegram_error(
-                    error=error_msg,
-                    method=method,
-                    chat_id=chat_id,
-                )
-
+                log_event("telegram_send_file_bytes_failed", error=data.get("description") or data)
             return ok
-
     except Exception as e:
         log_event("telegram_send_file_bytes_exception", error=str(e))
-
-        alert_telegram_error(
-            error=str(e),
-            method=method,
-            chat_id=chat_id,
-        )
-
         return False
 
 
 # =========================================================
-# ALERTAS DIRECTAS
+# ALERTAS INTERNAS
 # =========================================================
 
 def telegram_send_alert(bot_token: str, chat_id: int, text: str) -> bool:
     try:
         alert_text = f"🚨 ALERTA SISTEMA\n\n{text}"
         return telegram_send_text(bot_token, chat_id, alert_text)
-
     except Exception as e:
         log_event("telegram_alert_exception", error=str(e))
-
-        alert_telegram_error(
-            error=str(e),
-            method="send_alert",
-            chat_id=chat_id,
-        )
-
         return False
