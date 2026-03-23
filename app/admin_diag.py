@@ -7,11 +7,7 @@ from typing import Any, Dict, Optional, List, Tuple
 from fastapi import APIRouter, HTTPException, Query
 
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
-from app.tenants import (
-    get_tenant_or_404,
-    tenants_cache_info,
-    validate_tenant_config,
-)
+from app.tenants import get_tenant_or_404, tenants_cache_info
 from app.utils import normalize
 from app.admin_settings import (
     ADMIN_SETTINGS_SHEET_NAME,
@@ -147,6 +143,74 @@ def _is_token_shape_ok(tok: str) -> bool:
     if not tok:
         return False
     return (":" in tok) and (len(tok) >= 20)
+
+
+def _local_validate_tenant_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
+    errors: List[str] = []
+    warnings: List[str] = []
+
+    tid = tenant.get("tenant_id") or "?"
+    orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
+
+    if not orders_sheet_id:
+        errors.append("orders_sheet_id missing")
+
+    admin_bot_token = (tenant.get("admin_bot_token") or "").strip()
+    client_bot_token = (tenant.get("client_bot_token") or "").strip()
+    secret_admin = (tenant.get("webhook_secret_admin") or "").strip()
+    secret_client = (tenant.get("webhook_secret_client") or "").strip()
+
+    if not admin_bot_token:
+        warnings.append("admin_bot_token missing (admin bot no funcionará)")
+    if not client_bot_token:
+        warnings.append("client_bot_token missing (client bot no funcionará)")
+
+    if admin_bot_token and ":" not in admin_bot_token:
+        warnings.append("admin_bot_token shape looks wrong (expected ':')")
+    if client_bot_token and ":" not in client_bot_token:
+        warnings.append("client_bot_token shape looks wrong (expected ':')")
+
+    if not secret_admin:
+        warnings.append("webhook_secret_admin missing")
+    if not secret_client:
+        warnings.append("webhook_secret_client missing")
+
+    if secret_admin and len(secret_admin) < 8:
+        warnings.append("webhook_secret_admin too short (recommend >= 8)")
+    if secret_client and len(secret_client) < 8:
+        warnings.append("webhook_secret_client too short (recommend >= 8)")
+
+    orders_enabled = bool(tenant.get("orders_enabled"))
+    qr_file_id = (tenant.get("payment_qr_file_id") or "").strip()
+    qr_url = (tenant.get("payment_qr_url") or tenant.get("payment_qr_link") or "").strip()
+
+    if orders_enabled and not (qr_file_id or qr_url):
+        errors.append("QR missing: set payment_qr_file_id or payment_qr_url/payment_qr_link")
+
+    admin_chat_id = (tenant.get("admin_chat_id") or "").strip()
+    if orders_enabled and not admin_chat_id:
+        warnings.append("admin_chat_id missing (no podrás recibir notificaciones/confirmar pagos)")
+
+    folder_id = (tenant.get("product_photos_drive_folder_id") or "").strip()
+    if not folder_id:
+        warnings.append("product_photos_drive_folder_id missing (no podrás subir fotos de productos a Drive)")
+
+    return {
+        "tenant_id": tid,
+        "orders_enabled": orders_enabled,
+        "has_orders_sheet_id": bool(orders_sheet_id),
+        "has_admin_bot_token": bool(admin_bot_token),
+        "has_client_bot_token": bool(client_bot_token),
+        "has_webhook_secret_admin": bool(secret_admin),
+        "has_webhook_secret_client": bool(secret_client),
+        "has_admin_chat_id": bool(admin_chat_id),
+        "has_qr_file_id": bool(qr_file_id),
+        "has_qr_url": bool(qr_url),
+        "has_product_photos_drive_folder_id": bool(folder_id),
+        "errors": errors,
+        "warnings": warnings,
+        "ok": len(errors) == 0,
+    }
 
 
 def _safe_order_ws(sh):
@@ -515,9 +579,6 @@ def tenant_full(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[st
 
 @router.get("/business_status")
 def business_status(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[str, Any]:
-    """
-    Diagnóstico operativo de negocio usando AdminSettings.
-    """
     _require_admin_token(token)
 
     gc = get_gspread_client()
@@ -546,20 +607,11 @@ def runtime_diag(
     token: str = Query(...),
     order_id: str = Query(default=""),
 ) -> Dict[str, Any]:
-    """
-    Diagnóstico runtime:
-    - cache tenants
-    - config validada
-    - apertura real de sheet
-    - estado actual del negocio
-    - estado del menú
-    - lookup opcional de pedido
-    """
     _require_admin_token(token)
 
     gc = get_gspread_client()
     tenant = get_tenant_or_404(tenant_id, gc=gc)
-    cfg = validate_tenant_config(tenant)
+    cfg = _local_validate_tenant_config(tenant)
 
     orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
     if not orders_sheet_id:
