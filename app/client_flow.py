@@ -155,11 +155,9 @@ def _send_category_products(
         photo_url = str(it.get("photo_url") or "").strip()
         photo_file_id = str(it.get("photo_file_id") or "").strip()
         price_txt = f"{float(it['price']):.0f}"
+
         reply_markup = kb([
             [(f"⬆️ {it['name']} — Bs {price_txt}", f"prd|{it['sku']}")],
-            [("🛒 Carrito", "cart")],
-            [("⬅️ Categorías", "menu")],
-            [("🏠 Inicio", "home")],
         ])
 
         if photo_url:
@@ -183,9 +181,6 @@ def _send_category_products(
         rows = []
         for it in without_photo[:25]:
             rows.append([(f"{it['name']} — Bs {float(it['price']):.0f}", f"prd|{it['sku']}")])
-        rows.append([("🛒 Carrito", "cart")])
-        rows.append([("⬅️ Categorías", "menu")])
-        rows.append([("🏠 Inicio", "home")])
 
         telegram_send_text(
             bot_token,
@@ -194,8 +189,16 @@ def _send_category_products(
             kb(rows),
         )
 
-    if not with_photo and not without_photo:
-        telegram_send_text(bot_token, chat_id, "No hay productos activos.")
+    telegram_send_text(
+        bot_token,
+        chat_id,
+        "Elige una opción:",
+        kb([
+            [("🛒 Carrito", "cart")],
+            [("⬅️ Categorías", "menu")],
+            [("🏠 Inicio", "home")],
+        ]),
+    )
 
 
 def client_orders_allowed_or_notify(bot_token: str, chat_id: int, orders_sh, tenant_tz: str) -> bool:
