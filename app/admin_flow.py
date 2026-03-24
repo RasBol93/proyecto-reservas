@@ -79,6 +79,18 @@ from app.alerts import (
 )
 
 
+def _safe_client_chat_id_from_order(order: Dict[str, Any]) -> str:
+    chat_id = str(order.get("customer_telegram_chat_id") or "").strip()
+    if chat_id and chat_id.isdigit():
+        return chat_id
+
+    fallback = str(order.get("customer_contact") or "").strip()
+    if fallback and fallback.isdigit():
+        return fallback
+
+    return ""
+
+
 # =========================================================
 # CONSUMER DB HELPERS
 # =========================================================
@@ -379,12 +391,30 @@ def handle_admin_callback(
             order = get_order_by_id(orders_sh, order_id)
             if order:
                 client_token = get_client_bot_token(tenant)
-                client_chat = (order.get("customer_contact") or "").strip()
+                client_chat = _safe_client_chat_id_from_order(order)
+
                 if client_token and client_chat:
                     try:
-                        telegram_send_text(client_token, int(client_chat), f"✅ Pago validado. Tu pedido {order_id} fue confirmado. ¡Gracias!")
+                        telegram_send_text(
+                            client_token,
+                            int(client_chat),
+                            f"✅ Pago validado. Tu pedido {order_id} fue confirmado. ¡Gracias!"
+                        )
                     except Exception as e:
-                        log_event("notify_client_paid_failed", tenant_id=tenant_id, order_id=order_id, error=str(e))
+                        log_event(
+                            "notify_client_paid_failed",
+                            tenant_id=tenant_id,
+                            order_id=order_id,
+                            client_chat=client_chat,
+                            error=str(e),
+                        )
+                else:
+                    log_event(
+                        "notify_client_paid_skipped",
+                        tenant_id=tenant_id,
+                        order_id=order_id,
+                        reason="missing_client_token_or_chat_id",
+                    )
 
             return {"ok": True}
 
@@ -944,9 +974,6 @@ def handle_admin_message(
         sess = get_sess(tenant_id, chat_id)
         tmp = sess.setdefault("tmp", {})
 
-        # =========================================
-        # ADMIN MANUAL ORDER FLOW (TEXT STEPS)
-        # =========================================
         admin_order_step = str(tmp.get("admin_order_step") or "").strip()
 
         if admin_order_step:
@@ -1009,6 +1036,7 @@ def handle_admin_message(
                     order_id=order_id,
                     customer_name=customer_name,
                     customer_contact=customer_contact,
+                    customer_telegram_chat_id="",
                     items=cart,
                     items_snapshot=items_snapshot,
                     currency="BOB",
