@@ -31,7 +31,6 @@ from app.webhook_helpers import (
     get_business_status_safe,
     send_business_blocked_text,
     contact_link_for_admin,
-    client_home_kb,
     cart_kb,
     i_paid_kb,
     paid_actions_kb,
@@ -132,6 +131,31 @@ def _format_open_days(days: List[str]) -> str:
     return "No configurado"
 
 
+def _format_cart_detail_lines(cart: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str, Any]]) -> str:
+    lines: List[str] = []
+
+    for it in cart:
+        sku = str(it.get("sku") or "").strip()
+        if not sku or sku not in menu_idx:
+            continue
+
+        try:
+            qty = int(it.get("qty") or 0)
+        except Exception:
+            qty = 0
+
+        if qty <= 0:
+            continue
+
+        name = str(menu_idx[sku].get("name") or sku).strip()
+        unit_price = float(menu_idx[sku].get("price") or 0)
+        line_total = unit_price * qty
+
+        lines.append(f"• {qty} x {name} — Bs {line_total:.2f}")
+
+    return "\n".join(lines) if lines else "Tu carrito está vacío."
+
+
 def _send_category_products(
     bot_token: str,
     chat_id: int,
@@ -165,7 +189,7 @@ def _send_category_products(
                 bot_token,
                 chat_id,
                 photo_url,
-                caption=f"{it['name']}\nBs {price_txt}",
+                caption="",
                 reply_markup=reply_markup,
             )
         elif photo_file_id:
@@ -173,7 +197,7 @@ def _send_category_products(
                 bot_token,
                 chat_id,
                 photo_file_id,
-                caption=f"{it['name']}\nBs {price_txt}",
+                caption="",
                 reply_markup=reply_markup,
             )
 
@@ -192,7 +216,7 @@ def _send_category_products(
     telegram_send_text(
         bot_token,
         chat_id,
-        "Elige una opción:",
+        "Otras opciones",
         kb([
             [("🛒 Carrito", "cart")],
             [("⬅️ Categorías", "menu")],
@@ -410,13 +434,14 @@ def handle_client_callback(
                 cart.append({"sku": sku, "qty": qty})
             sess["cart"] = cart
 
-            _, total, total_qty = fmt_cart_lines(cart, menu_idx)
             name = menu_idx[sku]["name"]
+            unit_price = float(menu_idx[sku]["price"])
+            added_subtotal = unit_price * qty
 
             telegram_send_text(
                 bot_token,
                 chat_id,
-                f"✅ Agregado al carrito: {qty} x {name}\n\nCantidad: {total_qty}\nTotal: {total:.2f} Bs",
+                f"✅ Agregado: {qty} x {name}\nSubtotal de este agregado: {added_subtotal:.2f} Bs",
                 reply_markup=kb([
                     [("🛒 Ver carrito", "cart")],
                     [("⬅️ Seguir comprando", "menu")],
@@ -441,14 +466,14 @@ def handle_client_callback(
                 return {"ok": True}
 
             cart = sess.get("cart") or []
-            lines_txt, total, total_qty = fmt_cart_lines(cart, menu_idx)
+            lines_txt, total, _ = fmt_cart_lines(cart, menu_idx)
+            detail_lines = _format_cart_detail_lines(cart, menu_idx)
 
-            has_items = total_qty > 0
+            has_items = bool(cart)
             msg = (
-                f"🛒 *Tu carrito*\n"
-                f"Cantidad: *{total_qty}*\n"
-                f"Total: *{total:.2f}* Bs\n\n"
-                f"{lines_txt}"
+                f"🛒 *Tu carrito*\n\n"
+                f"{detail_lines}\n\n"
+                f"*Total: Bs {total:.2f}*"
             )
             telegram_send_text(bot_token, chat_id, msg, reply_markup=cart_kb(has_items), parse_mode="Markdown")
             return {"ok": True}
