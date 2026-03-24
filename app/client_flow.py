@@ -58,7 +58,6 @@ from app.content import (
 from app.pickup import (
     generate_pickup_slots,
     build_pickup_slots_kb,
-    build_pickup_offer_text,
     validate_pickup_hhmm,
     parse_manual_time_text,
 )
@@ -1023,6 +1022,7 @@ def handle_client_message(
                 order_id=order_id,
                 customer_name=customer_name,
                 customer_contact=customer_phone,
+                customer_telegram_chat_id=str(chat_id),
                 items=items_list,
                 items_snapshot=items_snapshot,
                 currency="BOB",
