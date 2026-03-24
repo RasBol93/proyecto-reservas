@@ -232,6 +232,28 @@ def _send_category_products(
     )
 
 
+def _build_pickup_offer_text_clean(pickup_data: Dict[str, Any]) -> str:
+    if not pickup_data.get("ok"):
+        return pickup_data.get("message") or "No hay horarios disponibles."
+
+    parts = [
+        "🕒 Hora de recojo",
+        pickup_data.get("message") or "Elige una hora de recojo:",
+    ]
+
+    open_time = str(pickup_data.get("open_time") or "").strip()
+    close_time = str(pickup_data.get("close_time") or "").strip()
+    last_order_time = str(pickup_data.get("last_order_time") or "").strip()
+
+    if open_time and close_time:
+        parts.append(f"Horario regular: {open_time} - {close_time}")
+    if last_order_time:
+        parts.append(f"Última hora de pedido: {last_order_time}")
+
+    parts.append("También puedes tocar “Más tarde” y escribir otra hora manualmente.")
+    return "\n\n".join(parts)
+
+
 def client_orders_allowed_or_notify(bot_token: str, chat_id: int, orders_sh, tenant_tz: str) -> bool:
     try:
         bs = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
@@ -517,7 +539,7 @@ def handle_client_callback(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                build_pickup_offer_text(pickup_data),
+                _build_pickup_offer_text_clean(pickup_data),
                 reply_markup=build_pickup_slots_kb(tenant_id, pickup_data["slots"]),
             )
             return {"ok": True}
@@ -824,8 +846,9 @@ def handle_client_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "✅ Comprobante recibido.\nAhora presiona “✅ Ya pagué” para avisar al administrador.",
+                "✅ Comprobante recibido.\n\n*Puede tardar unos segundos en aparecer la opción “✅ Ya pagué” después de que subas el comprobante.*",
                 reply_markup=i_paid_kb(tenant_id, order_id),
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -886,21 +909,44 @@ def handle_client_message(
             return {"ok": True}
 
         if sess.get("stage") == "awaiting_name":
-            if not client_orders_allowed_or_notify(bot_token, chat_id, orders_sh, tenant_tz):
-                sess["stage"] = "idle"
-                return {"ok": True}
-
             customer_name = text.strip()
             if not customer_name:
                 telegram_send_text(bot_token, chat_id, "Dime tu nombre, por favor.")
                 return {"ok": True}
 
+            sess["tmp"]["customer_name"] = customer_name
+            sess["stage"] = "awaiting_phone"
+
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "Perfecto. Ahora dime tu *número de teléfono*.",
+                parse_mode="Markdown",
+            )
+            return {"ok": True}
+
+        if sess.get("stage") == "awaiting_phone":
+            if not client_orders_allowed_or_notify(bot_token, chat_id, orders_sh, tenant_tz):
+                sess["stage"] = "idle"
+                return {"ok": True}
+
+            customer_phone = text.strip()
+            if not customer_phone:
+                telegram_send_text(bot_token, chat_id, "Dime tu número de teléfono, por favor.")
+                return {"ok": True}
+
             pickup_time_hhmm = str((sess.get("tmp") or {}).get("pickup_time_hhmm") or "").strip()
             pickup_time_label = str((sess.get("tmp") or {}).get("pickup_time_label") or "").strip()
+            customer_name = str((sess.get("tmp") or {}).get("customer_name") or "").strip()
 
             if not pickup_time_hhmm:
                 telegram_send_text(bot_token, chat_id, "Primero elige la hora de recojo.")
                 sess["stage"] = "awaiting_pickup_time"
+                return {"ok": True}
+
+            if not customer_name:
+                sess["stage"] = "awaiting_name"
+                telegram_send_text(bot_token, chat_id, "Primero dime tu nombre.")
                 return {"ok": True}
 
             validation = validate_pickup_hhmm(
@@ -925,7 +971,7 @@ def handle_client_message(
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        build_pickup_offer_text(pickup_data),
+                        _build_pickup_offer_text_clean(pickup_data),
                         reply_markup=build_pickup_slots_kb(tenant_id, pickup_data["slots"]),
                     )
                 return {"ok": True}
@@ -934,7 +980,7 @@ def handle_client_message(
                 menu_idx = load_menu_index(orders_sh)
             except Exception as e:
                 log_event(
-                    "client_awaiting_name_menu_load_error",
+                    "client_awaiting_phone_menu_load_error",
                     tenant_id=tenant_id,
                     chat_id=chat_id,
                     error_type=type(e).__name__,
@@ -976,7 +1022,7 @@ def handle_client_message(
                 tenant_id=tenant_id,
                 order_id=order_id,
                 customer_name=customer_name,
-                customer_contact=str(chat_id),
+                customer_contact=customer_phone,
                 items=items_list,
                 items_snapshot=items_snapshot,
                 currency="BOB",
@@ -1002,16 +1048,20 @@ def handle_client_message(
             sess["tmp"] = sess.get("tmp") or {}
             sess["tmp"]["pending_order_id"] = order_id
             sess["tmp"]["customer_name"] = customer_name
+            sess["tmp"]["customer_phone"] = customer_phone
 
             recap = build_order_recap_text(
                 order_id=order_id,
                 customer_name=customer_name,
-                customer_contact=str(chat_id),
+                customer_contact=customer_phone,
                 requested_time=requested_time,
                 detail_lines=lines_real,
                 total_qty=total_qty_real,
                 total=total_real,
             )
+
+            recap = recap.replace("BOB", "Bs")
+            recap = recap.replace("Cantidad:", "Resumen:")
 
             telegram_send_text(
                 bot_token,
@@ -1035,8 +1085,7 @@ def handle_client_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "📎 Cuando pagues, envía aquí tu *comprobante* (foto o PDF).\n"
-                "Después de enviarlo, podrás presionar “✅ Ya pagué”.",
+                "*📎 Cuando pagues, envía aquí tu comprobante (foto o PDF).\n\nPuede tardar unos segundos en aparecer la opción “✅ Ya pagué” después de que subas el comprobante.*",
                 parse_mode="Markdown",
             )
             return {"ok": True}
