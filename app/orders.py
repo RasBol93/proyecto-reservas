@@ -171,6 +171,7 @@ def append_order_row(
     currency: str = "BOB",
     pricing_version: str = "v1",
     notes: str = "",
+    customer_telegram_chat_id: str = "",
 ) -> Dict[str, Any]:
     """
     Inserta una fila en ORDERS alineada a headers.
@@ -187,6 +188,7 @@ def append_order_row(
             "tenant_id": tenant_id,
             "customer_name": customer_name,
             "customer_contact": customer_contact,
+            "customer_telegram_chat_id": customer_telegram_chat_id,
             "items": items,
             "items_snapshot": items_snapshot or "",
             "currency": currency,
@@ -214,6 +216,7 @@ def append_order_row(
             source=source,
             total_amount=total_amount,
             customer_contact=customer_contact,
+            customer_telegram_chat_id=customer_telegram_chat_id,
         )
 
         return {"ok": True, "order_id": order_id}
