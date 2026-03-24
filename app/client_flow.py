@@ -55,6 +55,13 @@ from app.content import (
     has_faq,
     has_survey,
 )
+from app.pickup import (
+    generate_pickup_slots,
+    build_pickup_slots_kb,
+    build_pickup_offer_text,
+    validate_pickup_hhmm,
+    parse_manual_time_text,
+)
 
 
 def build_dynamic_home_kb(content_map: Dict[str, str]):
@@ -466,7 +473,7 @@ def handle_client_callback(
                 return {"ok": True}
 
             cart = sess.get("cart") or []
-            lines_txt, total, _ = fmt_cart_lines(cart, menu_idx)
+            _, total, _ = fmt_cart_lines(cart, menu_idx)
             detail_lines = _format_cart_detail_lines(cart, menu_idx)
 
             has_items = bool(cart)
@@ -496,8 +503,88 @@ def handle_client_callback(
                 telegram_send_text(bot_token, chat_id, "Tu carrito está vacío.")
                 return {"ok": True}
 
+            pickup_data = generate_pickup_slots(
+                orders_sh=orders_sh,
+                tenant_tz=tenant_tz,
+            )
+
+            if not pickup_data.get("ok"):
+                telegram_send_text(bot_token, chat_id, pickup_data.get("message") or "No hay horarios disponibles.")
+                return {"ok": True}
+
+            sess["stage"] = "awaiting_pickup_time"
+
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                build_pickup_offer_text(pickup_data),
+                reply_markup=build_pickup_slots_kb(tenant_id, pickup_data["slots"]),
+            )
+            return {"ok": True}
+
+        if data == "pickup|asap":
+            if sess.get("stage") != "awaiting_pickup_time":
+                telegram_send_text(bot_token, chat_id, "Primero confirma tu carrito.")
+                return {"ok": True}
+
+            pickup_data = generate_pickup_slots(orders_sh=orders_sh, tenant_tz=tenant_tz)
+            if not pickup_data.get("ok") or not pickup_data.get("slots"):
+                telegram_send_text(bot_token, chat_id, pickup_data.get("message") or "No hay horarios disponibles.")
+                return {"ok": True}
+
+            chosen_hhmm = pickup_data["slots"][0]["hhmm"]
+            sess["tmp"]["pickup_time_hhmm"] = chosen_hhmm
+            sess["tmp"]["pickup_time_label"] = f"Lo antes posible ({chosen_hhmm})"
             sess["stage"] = "awaiting_name"
-            telegram_send_text(bot_token, chat_id, "Perfecto. ¿Cuál es tu *nombre* para el pedido?", parse_mode="Markdown")
+
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                f"Perfecto. Hora de recojo elegida: *Lo antes posible ({chosen_hhmm})*\n\nAhora dime tu *nombre* para el pedido.",
+                parse_mode="Markdown",
+            )
+            return {"ok": True}
+
+        if data.startswith("pickup|slot|"):
+            if sess.get("stage") != "awaiting_pickup_time":
+                telegram_send_text(bot_token, chat_id, "Primero confirma tu carrito.")
+                return {"ok": True}
+
+            compact = data.split("|", 2)[2].strip()
+            if len(compact) != 4 or not compact.isdigit():
+                telegram_send_text(bot_token, chat_id, "Horario inválido.")
+                return {"ok": True}
+
+            hhmm = f"{compact[:2]}:{compact[2:]}"
+            validation = validate_pickup_hhmm(orders_sh=orders_sh, tenant_tz=tenant_tz, hhmm=hhmm)
+
+            if not validation.get("ok"):
+                telegram_send_text(bot_token, chat_id, validation.get("message") or "Ese horario ya no está disponible.")
+                return {"ok": True}
+
+            sess["tmp"]["pickup_time_hhmm"] = hhmm
+            sess["tmp"]["pickup_time_label"] = hhmm
+            sess["stage"] = "awaiting_name"
+
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                f"Perfecto. Hora de recojo elegida: *{hhmm}*\n\nAhora dime tu *nombre* para el pedido.",
+                parse_mode="Markdown",
+            )
+            return {"ok": True}
+
+        if data == "pickup|custom":
+            if sess.get("stage") != "awaiting_pickup_time":
+                telegram_send_text(bot_token, chat_id, "Primero confirma tu carrito.")
+                return {"ok": True}
+
+            sess["stage"] = "awaiting_pickup_custom_time"
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "Escribe la hora de recojo que prefieres.\n\nEjemplos: 20:15, 8:15 pm, 2015, 8 pm",
+            )
             return {"ok": True}
 
         if data.startswith("i_paid|"):
@@ -765,6 +852,39 @@ def handle_client_message(
             _send_home(bot_token, chat_id, orders_sh)
             return {"ok": True}
 
+        if sess.get("stage") == "awaiting_pickup_custom_time":
+            parsed_hhmm = parse_manual_time_text(text)
+
+            if not parsed_hhmm:
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "No entendí esa hora. Escríbela así: 20:15, 8:15 pm, 2015 o 8 pm.",
+                )
+                return {"ok": True}
+
+            validation = validate_pickup_hhmm(
+                orders_sh=orders_sh,
+                tenant_tz=tenant_tz,
+                hhmm=parsed_hhmm,
+            )
+
+            if not validation.get("ok"):
+                telegram_send_text(bot_token, chat_id, validation.get("message") or "Ese horario no está disponible.")
+                return {"ok": True}
+
+            sess["tmp"]["pickup_time_hhmm"] = parsed_hhmm
+            sess["tmp"]["pickup_time_label"] = parsed_hhmm
+            sess["stage"] = "awaiting_name"
+
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                f"Perfecto. Hora de recojo elegida: *{parsed_hhmm}*\n\nAhora dime tu *nombre* para el pedido.",
+                parse_mode="Markdown",
+            )
+            return {"ok": True}
+
         if sess.get("stage") == "awaiting_name":
             if not client_orders_allowed_or_notify(bot_token, chat_id, orders_sh, tenant_tz):
                 sess["stage"] = "idle"
@@ -773,6 +893,41 @@ def handle_client_message(
             customer_name = text.strip()
             if not customer_name:
                 telegram_send_text(bot_token, chat_id, "Dime tu nombre, por favor.")
+                return {"ok": True}
+
+            pickup_time_hhmm = str((sess.get("tmp") or {}).get("pickup_time_hhmm") or "").strip()
+            pickup_time_label = str((sess.get("tmp") or {}).get("pickup_time_label") or "").strip()
+
+            if not pickup_time_hhmm:
+                telegram_send_text(bot_token, chat_id, "Primero elige la hora de recojo.")
+                sess["stage"] = "awaiting_pickup_time"
+                return {"ok": True}
+
+            validation = validate_pickup_hhmm(
+                orders_sh=orders_sh,
+                tenant_tz=tenant_tz,
+                hhmm=pickup_time_hhmm,
+            )
+
+            if not validation.get("ok"):
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    (validation.get("message") or "Ese horario ya no está disponible.") + "\n\nPor favor elige otro horario.",
+                )
+                sess["stage"] = "awaiting_pickup_time"
+
+                pickup_data = generate_pickup_slots(
+                    orders_sh=orders_sh,
+                    tenant_tz=tenant_tz,
+                )
+                if pickup_data.get("ok"):
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        build_pickup_offer_text(pickup_data),
+                        reply_markup=build_pickup_slots_kb(tenant_id, pickup_data["slots"]),
+                    )
                 return {"ok": True}
 
             try:
@@ -814,7 +969,7 @@ def handle_client_message(
             lines_real, total_real, total_qty_real = fmt_snapshot_lines(items_snapshot)
 
             order_id = gen_order_id()
-            requested_time = "pendiente"
+            requested_time = pickup_time_label or pickup_time_hhmm
 
             result = append_order_row(
                 orders_sh=orders_sh,
