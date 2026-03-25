@@ -1,4 +1,4 @@
-# app/admin_messages.py — admin por texto "panel", sin teclado persistente inferior
+# app/admin_messages.py — admin por texto "panel", pedido manual mejorado y sin teclado persistente inferior
 
 from typing import Any, Dict
 
@@ -25,6 +25,7 @@ from app.webhook_helpers import (
     fmt_price_short,
     extract_first_number,
     fmt_snapshot_lines,
+    build_order_recap_text,
 )
 from app.admin_hours import send_admin_hours_menu
 from app.admin_menu import (
@@ -41,10 +42,97 @@ from app.admin_consumers import _send_consumers_menu
 from app.admin_manual_order import (
     _admin_order_reset,
     _send_admin_order_home,
+    _admin_order_time_choice_kb,
 )
 from app.admin_nav import (
     admin_panel_kb,
 )
+
+
+def _finalize_admin_manual_order(
+    tenant_id: str,
+    bot_token: str,
+    chat_id: int,
+    orders_sh,
+    tmp: Dict[str, Any],
+) -> Dict[str, Any]:
+    requested_time = str(tmp.get("admin_order_requested_time") or "").strip() or "ahora"
+    cart = tmp.get("admin_order_cart") or []
+    customer_name = str(tmp.get("admin_order_name") or "").strip()
+    customer_contact = str(tmp.get("admin_order_contact") or "").strip()
+
+    if not cart or not customer_name or not customer_contact:
+        _admin_order_reset(tmp)
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            "⚠️ Faltaban datos del pedido manual. Empecemos de nuevo.",
+        )
+        return {"ok": True}
+
+    menu_idx = load_menu_admin_index(orders_sh, force=False)
+    items_snapshot = build_items_snapshot(cart, menu_idx)
+    lines_txt, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
+
+    order_id = gen_order_id()
+
+    result = append_order_row(
+        orders_sh=orders_sh,
+        tenant_id=tenant_id,
+        order_id=order_id,
+        customer_name=customer_name,
+        customer_contact=customer_contact,
+        customer_telegram_chat_id="",
+        items=cart,
+        items_snapshot=items_snapshot,
+        currency="BOB",
+        pricing_version="v1",
+        notes="",
+        delivery_type="pickup",
+        requested_time=requested_time,
+        status="PAID",
+        source="admin_manual",
+        total_amount=total_amount,
+    )
+
+    if not result.get("ok"):
+        alert_order_failed(
+            tenant_id=tenant_id,
+            order_id=order_id,
+            error=result.get("error") or "append_order_row failed",
+        )
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            "⚠️ Error guardando el pedido manual.",
+        )
+        return {"ok": True}
+
+    _admin_order_reset(tmp)
+
+    recap = build_order_recap_text(
+        order_id=order_id,
+        customer_name=customer_name,
+        customer_contact=customer_contact,
+        requested_time=requested_time,
+        detail_lines=lines_txt,
+        total_qty=total_qty,
+        total=total_amount,
+    )
+
+    telegram_send_text(
+        bot_token,
+        chat_id,
+        recap,
+        parse_mode="Markdown",
+    )
+    telegram_send_text(
+        bot_token,
+        chat_id,
+        "✅ *Pedido manual registrado como pagado.*\nYa cuenta para estadísticas y base de consumidores.",
+        parse_mode="Markdown",
+    )
+    return {"ok": True}
 
 
 def handle_admin_message_impl(
@@ -107,86 +195,43 @@ def handle_admin_message_impl(
                     return {"ok": True}
 
                 tmp["admin_order_contact"] = customer_contact
-                tmp["admin_order_step"] = "awaiting_time"
+                tmp["admin_order_step"] = "awaiting_time_choice"
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "Escribe la hora solicitada.\nEjemplos: ahora, 19:30, 20h",
+                    "Elige cuándo se preparará el pedido:",
+                    reply_markup=_admin_order_time_choice_kb(tenant_id),
                 )
                 return {"ok": True}
 
-            if admin_order_step == "awaiting_time":
+            if admin_order_step == "awaiting_time_manual":
                 requested_time = text.strip()
                 if not requested_time:
-                    requested_time = "ahora"
-
-                cart = tmp.get("admin_order_cart") or []
-                customer_name = str(tmp.get("admin_order_name") or "").strip()
-                customer_contact = str(tmp.get("admin_order_contact") or "").strip()
-
-                if not cart or not customer_name or not customer_contact:
-                    _admin_order_reset(tmp)
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        "⚠️ Faltaban datos del pedido manual. Empecemos de nuevo.",
+                        "Escribe una hora válida.\nEjemplos: 19:30, 20h",
                     )
                     return {"ok": True}
 
-                menu_idx = load_menu_admin_index(orders_sh, force=False)
-                items_snapshot = build_items_snapshot(cart, menu_idx)
-                _, total_amount, _total_qty = fmt_snapshot_lines(items_snapshot)
-
-                order_id = gen_order_id()
-
-                result = append_order_row(
-                    orders_sh=orders_sh,
+                tmp["admin_order_requested_time"] = requested_time
+                tmp["admin_order_step"] = "finalize_manual_order"
+                return _finalize_admin_manual_order(
                     tenant_id=tenant_id,
-                    order_id=order_id,
-                    customer_name=customer_name,
-                    customer_contact=customer_contact,
-                    customer_telegram_chat_id="",
-                    items=cart,
-                    items_snapshot=items_snapshot,
-                    currency="BOB",
-                    pricing_version="v1",
-                    notes="",
-                    delivery_type="pickup",
-                    requested_time=requested_time,
-                    status="PAID",
-                    source="admin_manual",
-                    total_amount=total_amount,
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    orders_sh=orders_sh,
+                    tmp=tmp,
                 )
 
-                if not result.get("ok"):
-                    alert_order_failed(
-                        tenant_id=tenant_id,
-                        order_id=order_id,
-                        error=result.get("error") or "append_order_row failed",
-                    )
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        "⚠️ Error guardando el pedido manual.",
-                    )
-                    return {"ok": True}
-
-                _admin_order_reset(tmp)
-
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    (
-                        "✅ PEDIDO MANUAL REGISTRADO\n\n"
-                        f"Código de pedido: {order_id}\n"
-                        f"Cliente: {customer_name}\n"
-                        f"Teléfono: {customer_contact}\n"
-                        f"Hora: {requested_time}\n"
-                        f"Total: Bs {total_amount:.2f}\n\n"
-                        "Se guardó como confirmado y ya cuenta para estadísticas."
-                    ),
+            if admin_order_step == "finalize_manual_order":
+                return _finalize_admin_manual_order(
+                    tenant_id=tenant_id,
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    orders_sh=orders_sh,
+                    tmp=tmp,
                 )
-                return {"ok": True}
 
         input_mode = str(tmp.get("admin_menu_input_mode") or "").strip()
         input_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
