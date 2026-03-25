@@ -58,7 +58,11 @@ from app.admin_manual_order import (
     _send_admin_order_category,
     _send_admin_order_product_qty,
     _admin_order_add_to_cart,
+    _admin_order_inc_item,
+    _admin_order_dec_item,
+    _admin_order_remove_item,
     _send_admin_order_cart,
+    _admin_order_time_choice_kb,
 )
 from app.admin_nav import (
     admin_panel_kb,
@@ -311,6 +315,9 @@ def handle_admin_callback_impl(
             sess = get_sess(tenant_id, chat_id)
             tmp = sess.setdefault("tmp", {})
 
+            if action == "noop":
+                return {"ok": True}
+
             if action == "start":
                 _admin_order_reset(tmp)
                 tmp["admin_order_cart"] = []
@@ -370,6 +377,21 @@ def handle_admin_callback_impl(
                 )
                 return {"ok": _send_admin_order_cart(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
+            if action == "inc" and len(parts) == 4:
+                sku = parts[3].strip()
+                _admin_order_inc_item(tmp, sku)
+                return {"ok": _send_admin_order_cart(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+            if action == "dec" and len(parts) == 4:
+                sku = parts[3].strip()
+                _admin_order_dec_item(tmp, sku)
+                return {"ok": _send_admin_order_cart(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+            if action == "rem" and len(parts) == 4:
+                sku = parts[3].strip()
+                _admin_order_remove_item(tmp, sku)
+                return {"ok": _send_admin_order_cart(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
             if action == "cart":
                 return {"ok": _send_admin_order_cart(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
@@ -397,6 +419,25 @@ def handle_admin_callback_impl(
                     bot_token,
                     chat_id,
                     "Escribe el nombre del cliente:",
+                )
+                return {"ok": True}
+
+            if action == "timenow":
+                tmp["admin_order_requested_time"] = "ahora"
+                tmp["admin_order_step"] = "finalize_manual_order"
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Perfecto. El pedido se preparará ahora.",
+                )
+                return {"ok": True}
+
+            if action == "timelater":
+                tmp["admin_order_step"] = "awaiting_time_manual"
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Escribe la hora solicitada.\nEjemplos: 19:30, 20h",
                 )
                 return {"ok": True}
 
