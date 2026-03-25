@@ -402,26 +402,28 @@ def handle_admin_callback(
             order_after = get_order_by_id(orders_sh, order_id)
 
             if order_after:
+                customer_name = _safe_str(order_after.get("customer_name"))
                 final_hhmm = _extract_slot_hhmm(order_after.get("requested_time"))
+
                 if final_hhmm:
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        f"✅ Pedido {order_id} marcado como PAID.\nHora de recojo: {final_hhmm}.",
+                        f"✅ El pedido de {customer_name}, con código de pedido {order_id}, ha sido confirmado.\nHora de recojo: {final_hhmm}.",
                         reply_markup=admin_fixed_kb(),
                     )
                 else:
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        f"✅ Pedido {order_id} marcado como PAID.",
+                        f"✅ El pedido de {customer_name}, con código de pedido {order_id}, ha sido confirmado.",
                         reply_markup=admin_fixed_kb(),
                     )
             else:
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    f"✅ Pedido {order_id} marcado como PAID.",
+                    f"✅ El pedido con código de pedido {order_id} ha sido confirmado.",
                     reply_markup=admin_fixed_kb(),
                 )
 
@@ -434,11 +436,16 @@ def handle_admin_callback(
                         final_slot_for_msg = _safe_str(_extract_slot_hhmm(order_after.get("requested_time")))
                         if final_slot_for_msg:
                             msg_client = (
-                                f"✅ Pago validado. Tu pedido {order_id} fue confirmado.\n\n"
+                                f"✅ Tu pedido ha sido confirmado.\n"
+                                f"Código de pedido: {order_id}\n\n"
                                 f"Hora de recojo: *{final_slot_for_msg}*."
                             )
                         else:
-                            msg_client = f"✅ Pago validado. Tu pedido {order_id} fue confirmado. ¡Gracias!"
+                            msg_client = (
+                                f"✅ Tu pedido ha sido confirmado.\n"
+                                f"Código de pedido: {order_id}\n\n"
+                                "¡Gracias!"
+                            )
 
                         telegram_send_text(
                             client_token,
@@ -1113,13 +1120,12 @@ def handle_admin_message(
                     chat_id,
                     (
                         "✅ PEDIDO MANUAL REGISTRADO\n\n"
-                        f"ID: {order_id}\n"
+                        f"Código de pedido: {order_id}\n"
                         f"Cliente: {customer_name}\n"
-                        f"Contacto: {customer_contact}\n"
+                        f"Teléfono: {customer_contact}\n"
                         f"Hora: {requested_time}\n"
-                        f"Cantidad total: {total_qty}\n"
                         f"Total: Bs {total_amount:.2f}\n\n"
-                        "Se guardó como PAID y ya cuenta para estadísticas."
+                        "Se guardó como confirmado y ya cuenta para estadísticas."
                     ),
                     reply_markup=admin_fixed_kb(),
                 )
