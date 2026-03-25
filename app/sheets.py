@@ -1,7 +1,7 @@
-# app/sheets.py
+# app/sheets.py — versión optimizada con caché simple de client, spreadsheet y worksheet
 
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import gspread
 
@@ -10,11 +10,29 @@ from app.utils import normalize, log_event
 from app.alerts import alert_system_error, alert_sheet_error
 
 
+# ----------------------------------------
+# Caches simples en memoria
+# ----------------------------------------
+
+_GSPREAD_CLIENT_CACHE: gspread.Client | None = None
+_SPREADSHEET_CACHE: Dict[str, gspread.Spreadsheet] = {}
+_WORKSHEET_CACHE: Dict[Tuple[str, str], gspread.Worksheet] = {}
+
+
+# ----------------------------------------
+# Client
+# ----------------------------------------
+
 def get_gspread_client() -> gspread.Client:
     """
-    Crea un cliente de gspread usando el JSON de service account guardado en env.
+    Crea (o reutiliza) un cliente de gspread usando el JSON de service account guardado en env.
     Env esperado: GCP_CREDENTIALS_JSON (string JSON completo)
     """
+    global _GSPREAD_CLIENT_CACHE
+
+    if _GSPREAD_CLIENT_CACHE is not None:
+        return _GSPREAD_CLIENT_CACHE
+
     try:
         creds_json = env_required(ENV_GCP_CREDS_JSON)
         info = json.loads(creds_json)
@@ -23,7 +41,8 @@ def get_gspread_client() -> gspread.Client:
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
-        return gspread.service_account_from_dict(info, scopes=scopes)
+        _GSPREAD_CLIENT_CACHE = gspread.service_account_from_dict(info, scopes=scopes)
+        return _GSPREAD_CLIENT_CACHE
 
     except Exception as e:
         log_event(
@@ -38,15 +57,25 @@ def get_gspread_client() -> gspread.Client:
         raise
 
 
+# ----------------------------------------
+# Spreadsheet
+# ----------------------------------------
+
 def open_spreadsheet_by_key(gc: gspread.Client, spreadsheet_id: str) -> gspread.Spreadsheet:
     """
-    Abre cualquier spreadsheet por ID (key).
+    Abre cualquier spreadsheet por ID (key), con caché simple en memoria.
     """
     try:
         sid = (spreadsheet_id or "").strip()
         if not sid:
             raise RuntimeError("Missing spreadsheet_id")
-        return gc.open_by_key(sid)
+
+        if sid in _SPREADSHEET_CACHE:
+            return _SPREADSHEET_CACHE[sid]
+
+        sh = gc.open_by_key(sid)
+        _SPREADSHEET_CACHE[sid] = sh
+        return sh
 
     except Exception as e:
         log_event(
@@ -69,8 +98,16 @@ def open_config_spreadsheet(gc: gspread.Client) -> gspread.Spreadsheet:
     Env esperado: RESERVACIONES_CONFIG (spreadsheet id)
     """
     try:
-        config_id = env_required(ENV_CONFIG_SPREADSHEET_ID)
-        return gc.open_by_key(config_id)
+        config_id = env_required(ENV_CONFIG_SPREADSHEET_ID).strip()
+        if not config_id:
+            raise RuntimeError("Missing config spreadsheet id")
+
+        if config_id in _SPREADSHEET_CACHE:
+            return _SPREADSHEET_CACHE[config_id]
+
+        sh = gc.open_by_key(config_id)
+        _SPREADSHEET_CACHE[config_id] = sh
+        return sh
 
     except Exception as e:
         log_event(
@@ -85,12 +122,39 @@ def open_config_spreadsheet(gc: gspread.Client) -> gspread.Spreadsheet:
         raise
 
 
+# ----------------------------------------
+# Worksheet
+# ----------------------------------------
+
+def _spreadsheet_cache_key(spreadsheet: gspread.Spreadsheet) -> str:
+    try:
+        sid = getattr(spreadsheet, "id", None)
+        if sid:
+            return str(sid)
+    except Exception:
+        pass
+    return str(id(spreadsheet))
+
+
 def get_ws(spreadsheet: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
     """
-    Obtiene una worksheet por título.
+    Obtiene una worksheet por título, con caché simple por spreadsheet+title.
     """
     try:
-        return spreadsheet.worksheet(title)
+        t = (title or "").strip()
+        if not t:
+            raise RuntimeError("Missing worksheet title")
+
+        s_key = _spreadsheet_cache_key(spreadsheet)
+        cache_key = (s_key, t)
+
+        if cache_key in _WORKSHEET_CACHE:
+            return _WORKSHEET_CACHE[cache_key]
+
+        ws = spreadsheet.worksheet(t)
+        _WORKSHEET_CACHE[cache_key] = ws
+        return ws
+
     except Exception as e:
         log_event(
             "get_ws_error",
@@ -105,6 +169,34 @@ def get_ws(spreadsheet: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
         )
         raise
 
+
+def invalidate_sheet_caches(spreadsheet_id: str | None = None) -> None:
+    """
+    Limpia cachés.
+    - Si no recibe spreadsheet_id: limpia todo.
+    - Si recibe spreadsheet_id: limpia spreadsheet + worksheets asociadas.
+    """
+    global _GSPREAD_CLIENT_CACHE
+
+    if spreadsheet_id is None:
+        _SPREADSHEET_CACHE.clear()
+        _WORKSHEET_CACHE.clear()
+        return
+
+    sid = str(spreadsheet_id).strip()
+    if not sid:
+        return
+
+    _SPREADSHEET_CACHE.pop(sid, None)
+
+    keys_to_delete = [k for k in _WORKSHEET_CACHE.keys() if k[0] == sid]
+    for k in keys_to_delete:
+        _WORKSHEET_CACHE.pop(k, None)
+
+
+# ----------------------------------------
+# Header helpers
+# ----------------------------------------
 
 def detect_header_row(values: List[List[Any]], required_headers: List[str], max_scan: int = 10) -> int:
     """
@@ -136,6 +228,10 @@ def detect_header_row(values: List[List[Any]], required_headers: List[str], max_
         )
         return 1
 
+
+# ----------------------------------------
+# Record readers
+# ----------------------------------------
 
 def read_records_manual(ws: gspread.Worksheet, required_headers: List[str]) -> List[Dict[str, Any]]:
     """
