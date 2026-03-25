@@ -155,17 +155,15 @@ def notify_admin_payment_reported(
 
         confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{order_id}")]])
 
-        title = "🔔 RECORDATORIO — PAGO REPORTADO" if is_reminder else "💳 PAGO REPORTADO"
+        title = "🔔 RECORDATORIO — NUEVO PEDIDO" if is_reminder else "🆕 NUEVO PEDIDO"
         txt = (
             f"{title}\n\n"
-            f"Tenant: {tenant_id}\n"
-            f"ID: {order_id}\n"
-            f"Cliente: {order.get('customer_name','')}\n"
-            f"Contacto(chat_id): {order.get('customer_contact','')}\n"
-            f"Hora recogida: {order.get('requested_time','pendiente')}\n"
-            f"Cantidad total: {total_qty}\n"
-            f"Total: {total:.2f} BOB\n\n"
+            f"Código de pedido: {order_id}\n\n"
+            f"Cliente: {order.get('customer_name', '')}\n"
+            f"Teléfono: {order.get('customer_contact', '')}\n\n"
+            f"Hora de recojo: {order.get('requested_time', 'pendiente')}\n\n"
             f"Detalle:\n{lines_txt}\n\n"
+            f"Total: Bs {total:.2f}\n\n"
             "Presiona ✅ Confirmar pago cuando verifiques."
         )
 
