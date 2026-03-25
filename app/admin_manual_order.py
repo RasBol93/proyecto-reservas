@@ -1,4 +1,4 @@
-# app/admin_manual_order.py — optimizado (menos lecturas, más simple)
+# app/admin_manual_order.py — versión completa compatible y optimizada
 
 from typing import Any, Dict, List, Tuple
 
@@ -15,23 +15,24 @@ from app.webhook_helpers import fmt_price_short, fmt_snapshot_lines
 
 
 # -------------------------
-# CACHE
+# Cache simple por sesión
 # -------------------------
 
-def _get_menu_cached(sess, orders_sh):
+def _get_menu_cached(sess: Dict[str, Any], orders_sh):
     tmp = sess.setdefault("tmp", {})
 
-    if "admin_order_menu_cache" in tmp:
-        return tmp["admin_order_menu_cache"]
+    cached = tmp.get("admin_order_menu_cache")
+    if cached is not None:
+        return cached
 
     menu_idx = load_menu_admin_index(orders_sh, force=False)
     cats_raw = group_menu_admin_by_category(menu_idx)
 
-    cats_active = {
-        cat: [it for it in items if it.get("active")]
-        for cat, items in cats_raw.items()
-        if any(it.get("active") for it in items)
-    }
+    cats_active: Dict[str, List[Dict[str, Any]]] = {}
+    for cat, items in cats_raw.items():
+        only_active = [it for it in items if bool(it.get("active", False))]
+        if only_active:
+            cats_active[cat] = only_active
 
     cat_names = sorted(cats_active.keys(), key=lambda x: normalize(x))
 
@@ -39,137 +40,222 @@ def _get_menu_cached(sess, orders_sh):
     return tmp["admin_order_menu_cache"]
 
 
-def _clear_menu_cache(sess):
+def _clear_menu_cache(sess: Dict[str, Any]) -> None:
     sess.setdefault("tmp", {}).pop("admin_order_menu_cache", None)
 
 
 # -------------------------
-# RESET
+# Compat helpers esperados por otros módulos
 # -------------------------
 
-def _admin_order_reset(tmp):
-    for k in [
-        "admin_order_cart",
-        "admin_order_step",
-        "admin_order_name",
-        "admin_order_contact",
-        "admin_order_requested_time",
-        "admin_order_categories",
-        "admin_order_current_category",
-        "admin_order_menu_cache",
-    ]:
-        tmp.pop(k, None)
+def _admin_order_reset(tmp: Dict[str, Any]) -> None:
+    tmp.pop("admin_order_cart", None)
+    tmp.pop("admin_order_step", None)
+    tmp.pop("admin_order_name", None)
+    tmp.pop("admin_order_contact", None)
+    tmp.pop("admin_order_requested_time", None)
+    tmp.pop("admin_order_categories", None)
+    tmp.pop("admin_order_current_category", None)
+    tmp.pop("admin_order_menu_cache", None)
+
+
+def _admin_order_get_active_categories(orders_sh) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]], List[str]]:
+    """
+    Mantiene compatibilidad con imports existentes.
+    """
+    menu_idx = load_menu_admin_index(orders_sh, force=False)
+    cats_raw = group_menu_admin_by_category(menu_idx)
+
+    cats_active: Dict[str, List[Dict[str, Any]]] = {}
+    for cat, items in cats_raw.items():
+        only_active = [it for it in items if bool(it.get("active", False))]
+        if only_active:
+            cats_active[cat] = only_active
+
+    cat_names = sorted(cats_active.keys(), key=lambda x: normalize(x))
+    return menu_idx, cats_active, cat_names
 
 
 # -------------------------
-# HOME
+# Home
 # -------------------------
 
-def _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess):
-    _, cats, cat_names = _get_menu_cached(sess, orders_sh)
+def _admin_order_home_kb(tenant_id: str, cat_names: List[str], cats: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    for idx, cat in enumerate(cat_names):
+        total_n = len(cats.get(cat, []))
+        rows.append([(f"📂 {cat} ({total_n})", f"admord|{tenant_id}|cat|{idx}")])
+
+    rows.append([("🛒 Ver carrito", f"admord|{tenant_id}|cart")])
+    rows.append([("❌ Cancelar", f"admord|{tenant_id}|panel")])
+    return kb(rows)
+
+
+def _send_admin_order_home(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sess: Dict[str, Any],
+) -> bool:
+    menu_idx, cats, cat_names = _get_menu_cached(sess, orders_sh)
 
     tmp = sess.setdefault("tmp", {})
     tmp["admin_order_categories"] = cat_names
-
-    msg = "➕ CREAR PEDIDO MANUAL\n\nElige una categoría:"
-
-    rows = [[(f"📂 {c} ({len(cats[c])})", f"admord|{tenant_id}|cat|{i}")]
-            for i, c in enumerate(cat_names)]
-
-    rows += [
-        [("🛒 Ver carrito", f"admord|{tenant_id}|cart")],
-        [("❌ Cancelar", f"admord|{tenant_id}|panel")]
-    ]
-
-    return telegram_send_text(bot_token, chat_id, msg, reply_markup=kb(rows))
-
-
-# -------------------------
-# CATEGORY
-# -------------------------
-
-def _send_admin_order_category(bot_token, chat_id, tenant_id, orders_sh, sess, category):
-    _, cats, _ = _get_menu_cached(sess, orders_sh)
-    items = cats.get(category, [])
-
-    msg = f"📂 {category}\n\nElige producto:"
-
-    rows = [[(f"{it['name']} — Bs {fmt_price_short(it['price'])}",
-              f"admord|{tenant_id}|prd|{it['sku']}")]
-            for it in items[:25]]
-
-    rows += [
-        [("🛒 Ver carrito", f"admord|{tenant_id}|cart")],
-        [("⬅️ Categorías", f"admord|{tenant_id}|home")]
-    ]
-
-    return telegram_send_text(bot_token, chat_id, msg, reply_markup=kb(rows))
-
-
-# -------------------------
-# PRODUCT QTY
-# -------------------------
-
-def _send_admin_order_product_qty(bot_token, chat_id, tenant_id, orders_sh, sku):
-    item = get_menu_product_or_404(orders_sh, sku)
+    tmp.pop("admin_order_current_category", None)
 
     msg = (
-        f"{item['name']}\n"
-        f"Bs {fmt_price_short(item['price'])}\n\n"
-        "Cantidad:"
+        "➕ CREAR PEDIDO MANUAL\n\n"
+        "Elige una categoría para agregar productos al carrito:"
     )
 
     return telegram_send_text(
         bot_token,
         chat_id,
         msg,
-        reply_markup=kb([
-            [("1", f"admord|{tenant_id}|qty|{sku}|1"),
-             ("2", f"admord|{tenant_id}|qty|{sku}|2"),
-             ("3", f"admord|{tenant_id}|qty|{sku}|3")],
-            [("🛒 Carrito", f"admord|{tenant_id}|cart")]
-        ])
+        reply_markup=_admin_order_home_kb(tenant_id, cat_names, cats),
     )
 
 
 # -------------------------
-# CART
+# Categoría
 # -------------------------
 
-def _admin_order_add_to_cart(tmp, sku, qty):
+def _admin_order_category_kb(tenant_id: str, category: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    for it in items[:25]:
+        sku = str(it.get("sku") or "").strip()
+        price_txt = fmt_price_short(it.get("price", 0))
+        rows.append([(f"{it.get('name','')} — Bs {price_txt}", f"admord|{tenant_id}|prd|{sku}")])
+
+    rows.append([("🛒 Ver carrito", f"admord|{tenant_id}|cart")])
+    rows.append([("⬅️ Categorías", f"admord|{tenant_id}|home")])
+    rows.append([("❌ Cancelar", f"admord|{tenant_id}|panel")])
+
+    return kb(rows)
+
+
+def _send_admin_order_category(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sess: Dict[str, Any],
+    category: str,
+) -> bool:
+    _, cats, _ = _get_menu_cached(sess, orders_sh)
+    items = cats.get(category, [])
+
+    tmp = sess.setdefault("tmp", {})
+    tmp["admin_order_current_category"] = category
+
+    msg = (
+        f"📂 CATEGORÍA: {category}\n\n"
+        "Elige un producto:"
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=_admin_order_category_kb(tenant_id, category, items),
+    )
+
+
+# -------------------------
+# Cantidad
+# -------------------------
+
+def _admin_order_qty_kb(tenant_id: str, sku: str) -> Dict[str, Any]:
+    return kb([
+        [("1", f"admord|{tenant_id}|qty|{sku}|1"), ("2", f"admord|{tenant_id}|qty|{sku}|2"),
+         ("3", f"admord|{tenant_id}|qty|{sku}|3"), ("4", f"admord|{tenant_id}|qty|{sku}|4")],
+        [("🛒 Ver carrito", f"admord|{tenant_id}|cart")],
+        [("⬅️ Volver", f"admord|{tenant_id}|catback")],
+        [("❌ Cancelar", f"admord|{tenant_id}|panel")],
+    ])
+
+
+def _send_admin_order_product_qty(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sku: str,
+) -> bool:
+    item = get_menu_product_or_404(orders_sh, sku)
+    msg = (
+        "➕ AGREGAR AL PEDIDO\n\n"
+        f"Producto: {item.get('name','')}\n"
+        f"Precio: Bs {fmt_price_short(item.get('price', 0))}\n\n"
+        "Selecciona cantidad:"
+    )
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=_admin_order_qty_kb(tenant_id, sku),
+    )
+
+
+# -------------------------
+# Carrito
+# -------------------------
+
+def _admin_order_add_to_cart(tmp: Dict[str, Any], sku: str, qty: int) -> None:
     cart = tmp.get("admin_order_cart") or []
+    found = False
 
     for it in cart:
-        if it["sku"] == sku:
-            it["qty"] += qty
+        if str(it.get("sku") or "").strip() == sku:
+            it["qty"] = int(it.get("qty") or 0) + qty
+            found = True
             break
-    else:
+
+    if not found:
         cart.append({"sku": sku, "qty": qty})
 
     tmp["admin_order_cart"] = cart
 
 
-def _send_admin_order_cart(bot_token, chat_id, tenant_id, orders_sh, sess):
+def _admin_order_cart_kb(tenant_id: str, has_items: bool) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    if has_items:
+        rows.append([("✅ Confirmar pedido", f"admord|{tenant_id}|confirm")])
+        rows.append([("🧹 Vaciar carrito", f"admord|{tenant_id}|clear")])
+
+    rows.append([("⬅️ Seguir agregando", f"admord|{tenant_id}|home")])
+    rows.append([("❌ Cancelar", f"admord|{tenant_id}|panel")])
+    return kb(rows)
+
+
+def _send_admin_order_cart(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sess: Dict[str, Any],
+) -> bool:
     tmp = sess.setdefault("tmp", {})
     cart = tmp.get("admin_order_cart") or []
 
     menu_idx, _, _ = _get_menu_cached(sess, orders_sh)
-
-    snapshot = build_items_snapshot(cart, menu_idx)
-    lines_txt, total, total_qty = fmt_snapshot_lines(snapshot)
+    items_snapshot = build_items_snapshot(cart, menu_idx)
+    lines_txt, total, total_qty = fmt_snapshot_lines(items_snapshot)
 
     msg = (
-        f"🛒 PEDIDO\n\n"
-        f"{lines_txt}\n\n"
-        f"Total: Bs {total:.2f}"
+        "🛒 PEDIDO MANUAL\n\n"
+        f"Cantidad total: {total_qty}\n"
+        f"Total: Bs {total:.2f}\n\n"
+        f"Detalle:\n{lines_txt}"
     )
 
     return telegram_send_text(
         bot_token,
         chat_id,
         msg,
-        reply_markup=kb([
-            [("✅ Confirmar", f"admord|{tenant_id}|confirm")],
-            [("⬅️ Seguir", f"admord|{tenant_id}|home")]
-        ])
+        reply_markup=_admin_order_cart_kb(tenant_id, total_qty > 0),
     )
