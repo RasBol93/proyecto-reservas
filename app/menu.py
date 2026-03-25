@@ -216,53 +216,6 @@ def _looks_like_headerish_menu_row(sku: str, name: str, price_raw: str, active_r
     return matches >= 3
 
 
-def _validate_product_name(name: str) -> str:
-    value = str(name or "").strip()
-    if not value:
-        raise HTTPException(status_code=422, detail="Product name is required")
-    return value
-
-
-def _validate_category_name(category: str) -> str:
-    value = str(category or "").strip()
-    if not value:
-        raise HTTPException(status_code=422, detail="Category is required")
-    return value
-
-
-def _set_menu_cell_by_colname(orders_sh, sku: str, col_name: str, new_value: str) -> Dict[str, Any]:
-    item = get_menu_product_or_404(orders_sh, sku)
-    ctx = _get_menu_context(orders_sh)
-    ws = ctx["ws"]
-    idx_map = ctx["idx_map"]
-
-    col_idx0 = idx_map.get(normalize(col_name))
-    if col_idx0 is None:
-        raise HTTPException(status_code=500, detail=f"Missing '{col_name}' column in Menu")
-
-    row_index = int(item["row_index"])
-    ws.update_cell(row_index, col_idx0 + 1, new_value)
-
-    invalidate_menu_cache(orders_sh)
-    return get_menu_product_or_404(orders_sh, sku)
-
-
-def _generate_simple_product_sku(orders_sh) -> str:
-    idx = load_menu_admin_index(orders_sh, force=True)
-    existing = set(idx.keys())
-
-    base = f"p_{int(time.time())}"
-    if base not in existing:
-        return base
-
-    for i in range(1, 1000):
-        candidate = f"{base}_{i}"
-        if candidate not in existing:
-            return candidate
-
-    raise HTTPException(status_code=500, detail="Could not generate unique SKU")
-
-
 # -------------------------
 # Public API (cliente)
 # -------------------------
@@ -545,22 +498,6 @@ def group_menu_admin_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[st
     return cats
 
 
-def get_menu_categories(orders_sh, include_empty: bool = False) -> List[str]:
-    idx = load_menu_admin_index(orders_sh, force=False)
-    categories: List[str] = []
-    seen = set()
-
-    for item in idx.values():
-        category = str(item.get("category") or "").strip()
-        if not category and not include_empty:
-            continue
-        if category not in seen:
-            seen.add(category)
-            categories.append(category)
-
-    return sorted(categories, key=lambda x: normalize(x))
-
-
 def get_menu_product_or_404(orders_sh, sku: str) -> Dict[str, Any]:
     sku = str(sku or "").strip()
     if not sku:
@@ -628,46 +565,91 @@ def set_menu_product_price(orders_sh, sku: str, new_price: float) -> Dict[str, A
     return {"ok": True, "sku": sku, "price": float(updated.get("price", 0.0))}
 
 
-def set_menu_product_name(orders_sh, sku: str, new_name: str) -> Dict[str, Any]:
-    clean_name = _validate_product_name(new_name)
-    updated = _set_menu_cell_by_colname(orders_sh, sku, "name", clean_name)
+# -------------------------
+# Nuevas funciones admin
+# -------------------------
 
-    try:
-        log_event(
-            "menu_product_name_updated",
-            sku=sku,
-            name=clean_name,
-            row_index=updated.get("row_index"),
-        )
-    except Exception:
-        pass
+def get_menu_categories(orders_sh) -> List[str]:
+    idx = load_menu_admin_index(orders_sh, force=False)
+    categories: List[str] = []
+    seen = set()
 
+    for item in idx.values():
+        category = str(item.get("category") or "").strip()
+        if not category:
+            continue
+        key = normalize(category)
+        if key in seen:
+            continue
+        seen.add(key)
+        categories.append(category)
+
+    return sorted(categories, key=lambda x: normalize(x))
+
+
+def _set_menu_product_text_field(orders_sh, sku: str, field_name: str, new_value: str) -> Dict[str, Any]:
+    item = get_menu_product_or_404(orders_sh, sku)
+    ctx = _get_menu_context(orders_sh)
+    ws = ctx["ws"]
+    idx_map = ctx["idx_map"]
+
+    field_col_idx0 = idx_map.get(normalize(field_name))
+    if field_col_idx0 is None:
+        raise HTTPException(status_code=500, detail=f"Missing '{field_name}' column in Menu")
+
+    clean_value = str(new_value or "").strip()
+    if not clean_value:
+        raise HTTPException(status_code=422, detail=f"{field_name} cannot be empty")
+
+    row_index = int(item["row_index"])
+    ws.update_cell(row_index, field_col_idx0 + 1, clean_value)
+
+    invalidate_menu_cache(orders_sh)
+
+    updated = get_menu_product_or_404(orders_sh, sku)
     return {
         "ok": True,
         "sku": sku,
-        "name": str(updated.get("name") or "").strip(),
+        field_name: str(updated.get(field_name, "") or "").strip(),
     }
+
+
+def set_menu_product_name(orders_sh, sku: str, new_name: str) -> Dict[str, Any]:
+    result = _set_menu_product_text_field(orders_sh, sku, "name", new_name)
+
+    try:
+        log_event("menu_product_name_updated", sku=sku, name=result.get("name", ""))
+    except Exception:
+        pass
+
+    return result
 
 
 def set_menu_product_category(orders_sh, sku: str, new_category: str) -> Dict[str, Any]:
-    clean_category = _validate_category_name(new_category)
-    updated = _set_menu_cell_by_colname(orders_sh, sku, "category", clean_category)
+    result = _set_menu_product_text_field(orders_sh, sku, "category", new_category)
 
     try:
-        log_event(
-            "menu_product_category_updated",
-            sku=sku,
-            category=clean_category,
-            row_index=updated.get("row_index"),
-        )
+        log_event("menu_product_category_updated", sku=sku, category=result.get("category", ""))
     except Exception:
         pass
 
-    return {
-        "ok": True,
-        "sku": sku,
-        "category": str(updated.get("category") or "").strip(),
-    }
+    return result
+
+
+def _generate_menu_product_sku(orders_sh) -> str:
+    idx = load_menu_admin_index(orders_sh, force=True)
+    existing_skus = set(idx.keys())
+
+    base = f"p_{int(time.time())}"
+    if base not in existing_skus:
+        return base
+
+    for i in range(1, 1000):
+        candidate = f"{base}_{i}"
+        if candidate not in existing_skus:
+            return candidate
+
+    raise HTTPException(status_code=500, detail="Could not generate unique sku")
 
 
 def create_menu_product(
@@ -678,19 +660,24 @@ def create_menu_product(
     active: bool = True,
     photo_url: str = "",
 ) -> Dict[str, Any]:
-    clean_name = _validate_product_name(name)
-    clean_category = _validate_category_name(category)
+    clean_name = str(name or "").strip()
+    clean_category = str(category or "").strip()
+
+    if not clean_name:
+        raise HTTPException(status_code=422, detail="name cannot be empty")
+
+    if not clean_category:
+        raise HTTPException(status_code=422, detail="category cannot be empty")
+
     price_str = _format_price_for_sheet(price)
+    sku = _generate_menu_product_sku(orders_sh)
 
     ctx = _get_menu_context(orders_sh)
     ws = ctx["ws"]
-    idx_map = ctx["idx_map"]
     headers_raw = ctx["headers_raw"]
+    idx_map = ctx["idx_map"]
 
-    sku = _generate_simple_product_sku(orders_sh)
-
-    row_len = max(len(headers_raw), max(idx_map.values()) + 1 if idx_map else 5)
-    row_values = [""] * row_len
+    row_values = [""] * len(headers_raw)
 
     def put(col_name: str, value: str) -> None:
         idx0 = idx_map.get(normalize(col_name))
@@ -706,7 +693,6 @@ def create_menu_product(
     if normalize("photo_url") in idx_map:
         put("photo_url", str(photo_url or "").strip())
 
-    # No tocamos photo_file_id al crear; se mantiene vacío por defecto
     if normalize("photo_file_id") in idx_map:
         put("photo_file_id", "")
 
@@ -717,6 +703,7 @@ def create_menu_product(
         raise HTTPException(status_code=500, detail=f"Could not create product: {e}")
 
     invalidate_menu_cache(orders_sh)
+
     created = get_menu_product_or_404(orders_sh, sku)
 
     try:
@@ -727,8 +714,6 @@ def create_menu_product(
             category=clean_category,
             price=price_str,
             active=bool(active),
-            has_photo=bool(str(photo_url or "").strip()),
-            row_index=created.get("row_index"),
         )
     except Exception:
         pass
@@ -736,9 +721,9 @@ def create_menu_product(
     return {
         "ok": True,
         "sku": sku,
-        "name": str(created.get("name") or "").strip(),
-        "category": str(created.get("category") or "").strip(),
+        "name": str(created.get("name", "") or "").strip(),
+        "category": str(created.get("category", "") or "").strip(),
         "price": float(created.get("price", 0.0)),
         "active": bool(created.get("active", False)),
-        "photo_url": str(created.get("photo_url") or "").strip(),
+        "photo_url": str(created.get("photo_url", "") or "").strip(),
     }
