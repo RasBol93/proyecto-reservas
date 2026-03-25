@@ -18,13 +18,14 @@ from app.orders import (
 )
 from app.telegram_api import telegram_send_text
 from app.utils import normalize, log_event
-from app.stats import resolve_period, build_stats_report_text, build_periods
+from app.stats import resolve_period, build_stats_report_text
 from app.webhook_helpers import (
     get_sess,
     get_client_bot_token,
     assert_admin_authorized,
     fmt_price_short,
     get_business_status_safe,
+    admin_periods_inline_kb,
 )
 from app.admin_hours import (
     DAY_ORDER,
@@ -103,23 +104,11 @@ def handle_admin_callback_impl(
 
         if data == "admin_stats":
             assert_admin_authorized(tenant, chat_id, tenant_id)
-            periods = build_periods(tenant_tz)
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "📊 ESTADÍSTICAS\n\nElige el período:",
-                reply_markup=admin_panel_kb(),
-            )
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                "Selecciona el período:",
-                reply_markup={
-                    "inline_keyboard": [
-                        [{"text": p.label, "callback_data": f"admin_stats_period|{tenant_id}|{p.key}"}]
-                        for p in periods
-                    ]
-                },
+                "📊 ESTADÍSTICAS\n\nSelecciona el período:",
+                reply_markup=admin_periods_inline_kb(tenant_id),
             )
             return {"ok": True}
 
@@ -258,6 +247,7 @@ def handle_admin_callback_impl(
             parts = data.split("|")
             if len(parts) != 3:
                 return {"ok": True}
+
             _, cb_tenant_id, period_key = parts
             cb_tenant_id = cb_tenant_id.strip()
             period_key = period_key.strip()
@@ -270,7 +260,12 @@ def handle_admin_callback_impl(
             period = resolve_period(tenant_tz, period_key)
             txt = build_stats_report_text(orders_sh, tenant_id=tenant_id, tenant_tz=tenant_tz, period=period)
 
-            telegram_send_text(bot_token, chat_id, txt, reply_markup=admin_root_kb())
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                txt,
+                reply_markup=admin_root_kb(),
+            )
             return {"ok": True}
 
         if data.startswith("admcons|"):
