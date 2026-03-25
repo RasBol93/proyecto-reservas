@@ -59,7 +59,6 @@ from app.pickup import (
     generate_pickup_slots,
     build_pickup_slots_kb,
     build_pickup_offer_text,
-    parse_manual_time_text,
 )
 
 
