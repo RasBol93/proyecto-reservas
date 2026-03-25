@@ -1,8 +1,7 @@
-# app/payment_flow.py
+# app/payment_flow.py — optimizado (menos lecturas, más simple)
 
 from typing import Any, Dict
 
-from app.menu import load_menu_index
 from app.orders import get_order_by_id
 from app.telegram_api import (
     telegram_send_text,
@@ -40,16 +39,10 @@ def forward_proof_to_admin(
     admin_chat_id = get_admin_chat_id(tenant)
 
     if not client_token or not admin_token or not admin_chat_id:
-        log_event(
-            "forward_proof_missing_config",
-            tenant_id=tenant_id,
-            has_client=bool(client_token),
-            has_admin=bool(admin_token),
-            has_admin_chat=bool(admin_chat_id),
-        )
+        log_event("forward_proof_missing_config", tenant_id=tenant_id)
         alert_tenant_error(
             tenant_id=tenant_id,
-            error="Missing client/admin token or admin_chat_id in forward_proof_to_admin",
+            error="Missing client/admin token or admin_chat_id",
         )
         return False
 
@@ -57,44 +50,33 @@ def forward_proof_to_admin(
         file_path = telegram_get_file_path(client_token, proof_file_id)
         file_bytes = telegram_download_file_bytes(client_token, file_path)
         filename = file_path.split("/")[-1] if file_path else "proof"
-        caption = proof_caption or ("Comprobante (foto)" if proof_type == "photo" else "Comprobante (archivo)")
 
-        if proof_type == "photo":
-            ok = telegram_send_file_bytes(
-                bot_token=admin_token,
-                method="sendPhoto",
-                chat_id=admin_chat_id,
-                file_field="photo",
-                filename=filename or "proof.jpg",
-                content_type="image/jpeg",
-                file_bytes=file_bytes,
-                caption=caption,
-            )
-        else:
-            ok = telegram_send_file_bytes(
-                bot_token=admin_token,
-                method="sendDocument",
-                chat_id=admin_chat_id,
-                file_field="document",
-                filename=filename or "proof.pdf",
-                content_type="application/octet-stream",
-                file_bytes=file_bytes,
-                caption=caption,
-            )
+        caption = proof_caption or (
+            "Comprobante (foto)" if proof_type == "photo" else "Comprobante (archivo)"
+        )
+
+        method = "sendPhoto" if proof_type == "photo" else "sendDocument"
+        field = "photo" if proof_type == "photo" else "document"
+
+        ok = telegram_send_file_bytes(
+            bot_token=admin_token,
+            method=method,
+            chat_id=admin_chat_id,
+            file_field=field,
+            filename=filename,
+            content_type="application/octet-stream",
+            file_bytes=file_bytes,
+            caption=caption,
+        )
 
         if not ok:
-            alert_payment_failed(
-                tenant_id=tenant_id,
-                error="telegram_send_file_bytes returned False in forward_proof_to_admin",
-            )
+            alert_payment_failed(tenant_id=tenant_id, error="Error enviando comprobante")
+
         return ok
 
     except Exception as e:
         log_event("forward_proof_failed", tenant_id=tenant_id, error=str(e))
-        alert_payment_failed(
-            tenant_id=tenant_id,
-            error=f"forward_proof_to_admin failed: {e}",
-        )
+        alert_payment_failed(tenant_id=tenant_id, error=str(e))
         return False
 
 
@@ -105,45 +87,32 @@ def notify_admin_payment_reported(
     order_id: str,
     is_reminder: bool = False,
 ) -> bool:
+
     try:
         admin_token = get_admin_bot_token(tenant)
         admin_chat_id = get_admin_chat_id(tenant)
 
         if not admin_token or not admin_chat_id:
-            log_event("admin_notify_failed", tenant_id=tenant_id, reason="missing_admin_token_or_chat")
-            alert_tenant_error(
-                tenant_id=tenant_id,
-                error="Missing admin bot token or admin_chat_id in notify_admin_payment_reported",
-            )
+            alert_tenant_error(tenant_id=tenant_id, error="Missing admin config")
             return False
 
         order = get_order_by_id(orders_sh, order_id)
         if not order:
-            telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.")
-            alert_payment_failed(
-                tenant_id=tenant_id,
-                order_id=order_id,
-                error="Order not found in notify_admin_payment_reported",
-            )
+            telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {order_id} no encontrado.")
             return False
 
+        # -------------------------
+        # PRIORIDAD: snapshot
+        # -------------------------
         items_snapshot = parse_items_field(order.get("items_snapshot"))
-        if items_snapshot:
-            lines_txt, snapshot_total, total_qty = fmt_snapshot_lines(items_snapshot)
-            total = snapshot_total
-        else:
-            try:
-                menu_idx = load_menu_index(orders_sh)
-            except Exception as e:
-                log_event("admin_menu_load_error", tenant_id=tenant_id, error=str(e))
-                alert_system_error(
-                    error=str(e),
-                    module="payment_flow.load_menu_index",
-                )
-                menu_idx = {}
 
+        if items_snapshot:
+            lines_txt, total, total_qty = fmt_snapshot_lines(items_snapshot)
+
+        else:
+            # fallback SOLO si no hay snapshot
             cart = parse_items_field(order.get("items"))
-            lines_txt, _, total_qty = fmt_cart_lines(cart, menu_idx)
+            lines_txt, _, total_qty = fmt_cart_lines(cart, {})
             try:
                 total = float(order.get("total_amount") or 0)
             except Exception:
@@ -156,6 +125,7 @@ def notify_admin_payment_reported(
         confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{order_id}")]])
 
         title = "🔔 RECORDATORIO — NUEVO PEDIDO" if is_reminder else "🆕 NUEVO PEDIDO"
+
         txt = (
             f"{title}\n\n"
             f"Código de pedido: {order_id}\n\n"
@@ -169,48 +139,15 @@ def notify_admin_payment_reported(
 
         ok_txt = telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn)
 
-        if not ok_txt:
-            alert_telegram_error(
-                error="telegram_send_text returned False in notify_admin_payment_reported",
-                method="sendMessage",
-                chat_id=admin_chat_id,
-            )
-
         ok_proof = False
         if proof_file_id and proof_type:
-            ok_proof = forward_proof_to_admin(tenant, tenant_id, proof_file_id, proof_type, proof_caption)
-        else:
-            log_event("admin_missing_proof", tenant_id=tenant_id, order_id=order_id)
-
-        log_event(
-            "admin_notify_result",
-            tenant_id=tenant_id,
-            order_id=order_id,
-            ok_txt=bool(ok_txt),
-            ok_proof=bool(ok_proof),
-            is_reminder=bool(is_reminder),
-        )
-
-        if not ok_txt:
-            alert_payment_failed(
-                tenant_id=tenant_id,
-                order_id=order_id,
-                error="Failed to send admin payment notification text",
+            ok_proof = forward_proof_to_admin(
+                tenant, tenant_id, proof_file_id, proof_type, proof_caption
             )
 
         return bool(ok_txt)
 
     except Exception as e:
-        log_event(
-            "notify_admin_payment_reported_error",
-            tenant_id=tenant_id,
-            order_id=order_id,
-            is_reminder=bool(is_reminder),
-            error=str(e),
-        )
-        alert_payment_failed(
-            tenant_id=tenant_id,
-            order_id=order_id,
-            error=str(e),
-        )
+        log_event("notify_admin_payment_reported_error", tenant_id=tenant_id, error=str(e))
+        alert_payment_failed(tenant_id=tenant_id, error=str(e))
         return False
