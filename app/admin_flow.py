@@ -1,6 +1,6 @@
 # app/admin_flow.py
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict
 
 from fastapi import HTTPException
 
@@ -20,7 +20,6 @@ from app.orders import (
     build_items_snapshot,
 )
 from app.telegram_api import telegram_send_text, telegram_get_file_path, telegram_download_file_bytes
-from app.telegram_keyboard import kb
 from app.utils import normalize, log_event
 from app.stats import build_periods, resolve_period, build_stats_report_text
 from app.image_storage import upload_product_photo_for_tenant
@@ -63,12 +62,6 @@ from app.admin_menu import (
     send_admin_menu_price_editor,
     apply_price_delta,
 )
-from app.consumer_db import (
-    consumer_periods_inline_kb,
-    consumer_filters_inline_kb,
-    build_consumers_report_pages,
-    resolve_consumer_period,
-)
 from app.alerts import (
     alert_order_status_failed,
     alert_order_failed,
@@ -77,289 +70,26 @@ from app.alerts import (
     alert_tenant_error,
     alert_system_error,
 )
+from app.admin_helpers import (
+    _safe_str,
+    _safe_client_chat_id_from_order,
+    _extract_slot_hhmm,
+)
+from app.admin_consumers import (
+    _send_consumers_menu,
+    _send_consumers_filters,
+    _send_consumers_report,
+)
+from app.admin_manual_order import (
+    _admin_order_reset,
+    _admin_order_get_active_categories,
+    _send_admin_order_home,
+    _send_admin_order_category,
+    _send_admin_order_product_qty,
+    _admin_order_add_to_cart,
+    _send_admin_order_cart,
+)
 
-
-def _safe_str(v: Any) -> str:
-    return str(v or "").strip()
-
-
-def _safe_client_chat_id_from_order(order: Dict[str, Any]) -> str:
-    chat_id = str(order.get("customer_telegram_chat_id") or "").strip()
-    if chat_id and chat_id.isdigit():
-        return chat_id
-
-    fallback = str(order.get("customer_contact") or "").strip()
-    if fallback and fallback.isdigit():
-        return fallback
-
-    return ""
-
-
-def _extract_slot_hhmm(requested_time: str) -> str:
-    s = _safe_str(requested_time)
-    if not s:
-        return ""
-    import re
-    m = re.search(r"(\d{1,2}:\d{2})", s)
-    return m.group(1) if m else ""
-
-
-# =========================================================
-# CONSUMER DB HELPERS
-# =========================================================
-
-def _send_consumers_menu(bot_token: str, chat_id: int, tenant_id: str) -> bool:
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        "👥 BASE DE CONSUMIDORES\n\nElige un período:",
-        reply_markup=consumer_periods_inline_kb(tenant_id),
-    )
-
-
-def _send_consumers_filters(bot_token: str, chat_id: int, tenant_id: str, period_key: str, tenant_tz: str) -> bool:
-    period = resolve_consumer_period(period_key, tenant_tz)
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        (
-            "👥 BASE DE CONSUMIDORES\n\n"
-            f"Período elegido: {period.label}\n\n"
-            "Ahora elige qué lista quieres ver:"
-        ),
-        reply_markup=consumer_filters_inline_kb(tenant_id, period_key),
-    )
-
-
-def _send_consumers_report(
-    bot_token: str,
-    chat_id: int,
-    tenant_id: str,
-    orders_sh,
-    tenant_tz: str,
-    period_key: str,
-    filter_key: str,
-) -> bool:
-    pages = build_consumers_report_pages(
-        orders_sh=orders_sh,
-        tenant_tz=tenant_tz,
-        period_key=period_key,
-        filter_key=filter_key,
-    )
-
-    if not pages:
-        pages = ["No encontré resultados."]
-
-    for idx, page in enumerate(pages):
-        if idx == len(pages) - 1:
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                page,
-                reply_markup=consumer_filters_inline_kb(tenant_id, period_key),
-            )
-        else:
-            telegram_send_text(bot_token, chat_id, page)
-
-    return True
-
-
-# =========================================================
-# ADMIN MANUAL ORDER HELPERS
-# =========================================================
-
-def _admin_order_reset(tmp: Dict[str, Any]) -> None:
-    tmp.pop("admin_order_cart", None)
-    tmp.pop("admin_order_step", None)
-    tmp.pop("admin_order_name", None)
-    tmp.pop("admin_order_contact", None)
-    tmp.pop("admin_order_requested_time", None)
-    tmp.pop("admin_order_categories", None)
-    tmp.pop("admin_order_current_category", None)
-
-
-def _admin_order_get_active_categories(orders_sh) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]], List[str]]:
-    menu_idx = load_menu_admin_index(orders_sh, force=False)
-    cats_raw = group_menu_admin_by_category(menu_idx)
-
-    cats_active: Dict[str, List[Dict[str, Any]]] = {}
-    for cat, items in cats_raw.items():
-        only_active = [it for it in items if bool(it.get("active", False))]
-        if only_active:
-            cats_active[cat] = only_active
-
-    cat_names = sorted(cats_active.keys(), key=lambda x: normalize(x))
-    return menu_idx, cats_active, cat_names
-
-
-def _admin_order_home_kb(tenant_id: str, cat_names: List[str], cats: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
-    rows: List[List[Tuple[str, str]]] = []
-
-    for idx, cat in enumerate(cat_names):
-        total_n = len(cats.get(cat, []))
-        rows.append([(f"📂 {cat} ({total_n})", f"admord|{tenant_id}|cat|{idx}")])
-
-    rows.append([("🛒 Ver carrito", f"admord|{tenant_id}|cart")])
-    rows.append([("❌ Cancelar", f"admord|{tenant_id}|panel")])
-    return kb(rows)
-
-
-def _send_admin_order_home(
-    bot_token: str,
-    chat_id: int,
-    tenant_id: str,
-    orders_sh,
-    sess: Dict[str, Any],
-) -> bool:
-    _, cats, cat_names = _admin_order_get_active_categories(orders_sh)
-    tmp = sess.setdefault("tmp", {})
-    tmp["admin_order_categories"] = cat_names
-    tmp.pop("admin_order_current_category", None)
-
-    msg = (
-        "➕ CREAR PEDIDO MANUAL\n\n"
-        "Elige una categoría para agregar productos al carrito:"
-    )
-
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        msg,
-        reply_markup=_admin_order_home_kb(tenant_id, cat_names, cats),
-    )
-
-
-def _admin_order_category_kb(tenant_id: str, category: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    rows: List[List[Tuple[str, str]]] = []
-
-    for it in items[:25]:
-        sku = str(it.get("sku") or "").strip()
-        price_txt = fmt_price_short(it.get("price", 0))
-        rows.append([(f"{it.get('name','')} — Bs {price_txt}", f"admord|{tenant_id}|prd|{sku}")])
-
-    rows.append([("🛒 Ver carrito", f"admord|{tenant_id}|cart")])
-    rows.append([("⬅️ Categorías", f"admord|{tenant_id}|home")])
-    rows.append([("❌ Cancelar", f"admord|{tenant_id}|panel")])
-
-    return kb(rows)
-
-
-def _send_admin_order_category(
-    bot_token: str,
-    chat_id: int,
-    tenant_id: str,
-    orders_sh,
-    sess: Dict[str, Any],
-    category: str,
-) -> bool:
-    _, cats, _ = _admin_order_get_active_categories(orders_sh)
-    items = cats.get(category, [])
-
-    tmp = sess.setdefault("tmp", {})
-    tmp["admin_order_current_category"] = category
-
-    msg = (
-        f"📂 CATEGORÍA: {category}\n\n"
-        "Elige un producto:"
-    )
-
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        msg,
-        reply_markup=_admin_order_category_kb(tenant_id, category, items),
-    )
-
-
-def _admin_order_qty_kb(tenant_id: str, sku: str) -> Dict[str, Any]:
-    return kb([
-        [("1", f"admord|{tenant_id}|qty|{sku}|1"), ("2", f"admord|{tenant_id}|qty|{sku}|2"),
-         ("3", f"admord|{tenant_id}|qty|{sku}|3"), ("4", f"admord|{tenant_id}|qty|{sku}|4")],
-        [("🛒 Ver carrito", f"admord|{tenant_id}|cart")],
-        [("⬅️ Volver", f"admord|{tenant_id}|catback")],
-        [("❌ Cancelar", f"admord|{tenant_id}|panel")],
-    ])
-
-
-def _send_admin_order_product_qty(
-    bot_token: str,
-    chat_id: int,
-    tenant_id: str,
-    orders_sh,
-    sku: str,
-) -> bool:
-    item = get_menu_product_or_404(orders_sh, sku)
-    msg = (
-        "➕ AGREGAR AL PEDIDO\n\n"
-        f"Producto: {item.get('name','')}\n"
-        f"Precio: Bs {fmt_price_short(item.get('price', 0))}\n\n"
-        "Selecciona cantidad:"
-    )
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        msg,
-        reply_markup=_admin_order_qty_kb(tenant_id, sku),
-    )
-
-
-def _admin_order_add_to_cart(tmp: Dict[str, Any], sku: str, qty: int) -> None:
-    cart = tmp.get("admin_order_cart") or []
-    found = False
-    for it in cart:
-        if str(it.get("sku") or "").strip() == sku:
-            it["qty"] = int(it.get("qty") or 0) + qty
-            found = True
-            break
-    if not found:
-        cart.append({"sku": sku, "qty": qty})
-    tmp["admin_order_cart"] = cart
-
-
-def _admin_order_cart_kb(tenant_id: str, has_items: bool) -> Dict[str, Any]:
-    rows: List[List[Tuple[str, str]]] = []
-
-    if has_items:
-        rows.append([("✅ Confirmar pedido", f"admord|{tenant_id}|confirm")])
-        rows.append([("🧹 Vaciar carrito", f"admord|{tenant_id}|clear")])
-
-    rows.append([("⬅️ Seguir agregando", f"admord|{tenant_id}|home")])
-    rows.append([("❌ Cancelar", f"admord|{tenant_id}|panel")])
-    return kb(rows)
-
-
-def _send_admin_order_cart(
-    bot_token: str,
-    chat_id: int,
-    tenant_id: str,
-    orders_sh,
-    sess: Dict[str, Any],
-) -> bool:
-    tmp = sess.setdefault("tmp", {})
-    cart = tmp.get("admin_order_cart") or []
-
-    menu_idx = load_menu_admin_index(orders_sh, force=False)
-    items_snapshot = build_items_snapshot(cart, menu_idx)
-    lines_txt, total, total_qty = fmt_snapshot_lines(items_snapshot)
-
-    msg = (
-        "🛒 PEDIDO MANUAL\n\n"
-        f"Cantidad total: {total_qty}\n"
-        f"Total: Bs {total:.2f}\n\n"
-        f"Detalle:\n{lines_txt}"
-    )
-
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        msg,
-        reply_markup=_admin_order_cart_kb(tenant_id, total_qty > 0),
-    )
-
-
-# =========================================================
-# ADMIN CALLBACKS
-# =========================================================
 
 def handle_admin_callback(
     tenant: Dict[str, Any],
@@ -1004,10 +734,6 @@ def handle_admin_callback(
         telegram_send_text(bot_token, chat_id, "⚠️ Ocurrió un error en el panel admin.", reply_markup=admin_fixed_kb())
         return {"ok": True}
 
-
-# =========================================================
-# ADMIN MESSAGES
-# =========================================================
 
 def handle_admin_message(
     tenant: Dict[str, Any],
