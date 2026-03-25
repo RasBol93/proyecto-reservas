@@ -10,6 +10,7 @@ from app.menu import (
     set_menu_product_name,
     set_menu_product_category,
     create_menu_product,
+    get_menu_categories,
 )
 from app.orders import (
     append_order_row,
@@ -17,6 +18,7 @@ from app.orders import (
     build_items_snapshot,
 )
 from app.telegram_api import telegram_send_text, telegram_get_file_path, telegram_download_file_bytes
+from app.telegram_keyboard import kb
 from app.utils import normalize, log_event
 from app.stats import build_periods
 from app.image_storage import upload_product_photo_for_tenant
@@ -255,14 +257,53 @@ def handle_admin_message_impl(
                     return {"ok": True}
 
                 tmp["admin_menu_create_name"] = product_name
-                tmp["admin_menu_create_step"] = "category"
+                tmp["admin_menu_create_step"] = "awaiting_category_selection"
+
+                categories = get_menu_categories(orders_sh)
+                tmp["admin_menu_category_options"] = categories
+
+                rows = []
+                for i, cat in enumerate(categories[:20]):
+                    rows.append([(f"📂 {cat}", f"admmenu|{tenant_id}|create_setcat|{i}")])
+
+                rows.append([("➕ Nueva categoría", f"admmenu|{tenant_id}|create_newcat")])
+
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "Escribe la categoría del producto:",
+                    "Elige una categoría para el producto:",
+                    reply_markup=kb(rows),
                 )
                 return {"ok": True}
 
+            if create_step == "awaiting_category_selection":
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Selecciona una categoría usando los botones o toca 'Nueva categoría'.",
+                )
+                return {"ok": True}
+
+            if create_step == "new_category_for_create":
+                category = text.strip()
+                if not category:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "La categoría no puede estar vacía. Escríbela:",
+                    )
+                    return {"ok": True}
+
+                tmp["admin_menu_create_category"] = category
+                tmp["admin_menu_create_step"] = "price"
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Escribe el precio del producto.\nEjemplos: 25, 25 bs",
+                )
+                return {"ok": True}
+
+            # Se deja por compatibilidad hacia atrás si algún flujo viejo todavía lo dispara
             if create_step == "category":
                 category = text.strip()
                 if not category:
@@ -315,6 +356,7 @@ def handle_admin_message_impl(
                 tmp.pop("admin_menu_create_name", None)
                 tmp.pop("admin_menu_create_category", None)
                 tmp.pop("admin_menu_create_price", None)
+                tmp.pop("admin_menu_category_options", None)
 
                 tmp["admin_menu_input_mode"] = "awaiting_photo"
                 tmp["admin_menu_price_sku"] = created_sku
