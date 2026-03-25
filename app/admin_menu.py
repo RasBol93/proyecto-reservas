@@ -1,4 +1,4 @@
-# app/admin_menu.py — versión completa compatible y optimizada
+# app/admin_menu.py
 
 from typing import Any, Dict, List, Tuple
 
@@ -60,6 +60,9 @@ def admin_menu_home_kb(tenant_id: str, cats: Dict[str, List[Dict[str, Any]]]) ->
         active_n = sum(1 for it in items if bool(it.get("active", False)))
         rows.append([(f"📂 {cat} ({active_n}/{total_n})", f"admmenu|{tenant_id}|cat|{idx}")])
 
+    # NUEVO
+    rows.append([("➕ Crear producto", f"admmenu|{tenant_id}|create_product")])
+
     rows.append([("🔄 Refrescar menú", f"admmenu|{tenant_id}|refresh")])
     rows.append([("⬅️ Volver al panel", f"admmenu|{tenant_id}|panel")])
     return kb(rows)
@@ -71,8 +74,7 @@ def send_admin_menu_home(bot_token: str, chat_id: int, tenant_id: str, orders_sh
     tmp = sess.setdefault("tmp", {})
     tmp["admin_menu_categories"] = cat_names
     tmp.pop("admin_menu_current_category", None)
-    tmp.pop("admin_menu_price_sku", None)
-    tmp.pop("admin_menu_price_work", None)
+    tmp.pop("admin_menu_target_sku", None)
     tmp.pop("admin_menu_input_mode", None)
 
     total_products = len(menu_idx)
@@ -127,8 +129,7 @@ def send_admin_menu_category(
 
     tmp = sess.setdefault("tmp", {})
     tmp["admin_menu_current_category"] = category
-    tmp.pop("admin_menu_price_sku", None)
-    tmp.pop("admin_menu_price_work", None)
+    tmp.pop("admin_menu_target_sku", None)
     tmp.pop("admin_menu_input_mode", None)
 
     total_n = len(items)
@@ -159,10 +160,14 @@ def admin_menu_product_kb(tenant_id: str, sku: str, active: bool) -> Dict[str, A
 
     return kb([
         [(toggle_label, f"admmenu|{tenant_id}|toggle|{sku}")],
-        [("💲 Ajustar precio", f"admmenu|{tenant_id}|price|{sku}")],
-        [("✍️ Escribir precio final", f"admmenu|{tenant_id}|pricewrite|{sku}")],
-        [("🏷️ Aplicar descuento %", f"admmenu|{tenant_id}|discount|{sku}")],
+
+        # NUEVO BLOQUE LIMPIO
+        [("💲 Modificar precio", f"admmenu|{tenant_id}|price|{sku}")],
+        [("✏️ Editar nombre", f"admmenu|{tenant_id}|edit_name|{sku}")],
+        [("📂 Cambiar categoría", f"admmenu|{tenant_id}|edit_category|{sku}")],
+
         [("🖼 Subir foto producto", f"admmenu|{tenant_id}|photo|{sku}")],
+
         [("⬅️ Volver a categoría", f"admmenu|{tenant_id}|catback")],
         [("🏠 Categorías", f"admmenu|{tenant_id}|home")],
     ])
@@ -179,25 +184,24 @@ def send_admin_menu_product_detail(
     item = get_menu_product_or_404(orders_sh, sku)
 
     tmp = sess.setdefault("tmp", {})
-    tmp["admin_menu_last_sku"] = sku
-    tmp.pop("admin_menu_price_sku", None)
-    tmp.pop("admin_menu_price_work", None)
+    tmp["admin_menu_target_sku"] = sku
     tmp.pop("admin_menu_input_mode", None)
 
     active_txt = "Sí" if bool(item.get("active", False)) else "No"
     price_txt = fmt_price_short(item.get("price", 0))
+
     photo_url = str(item.get("photo_url") or "").strip()
     photo_file_id = str(item.get("photo_file_id") or "").strip()
 
+    has_photo = bool(photo_url or photo_file_id)
+
     msg = (
         "🧾 DETALLE DE PRODUCTO\n\n"
-        f"SKU: {item.get('sku','')}\n"
         f"Nombre: {item.get('name','')}\n"
         f"Categoría: {item.get('category','')}\n"
         f"Activo: {active_txt}\n"
-        f"Precio actual: Bs {price_txt}\n"
-        f"photo_url: {'Sí' if photo_url else 'No'}\n"
-        f"photo_file_id: {'Sí' if photo_file_id else 'No'}\n"
+        f"Precio: Bs {price_txt}\n"
+        f"Foto de producto: {'Sí' if has_photo else 'No'}\n"
     )
 
     return telegram_send_text(
@@ -227,7 +231,8 @@ def admin_menu_price_kb(tenant_id: str, sku: str) -> Dict[str, Any]:
     return kb([
         row1,
         row2,
-        [("💾 Guardar precio", f"admmenu|{tenant_id}|psave|{sku}")],
+        [("✍️ Escribir precio", f"admmenu|{tenant_id}|pricewrite|{sku}")],
+        [("💾 Guardar", f"admmenu|{tenant_id}|psave|{sku}")],
         [("↩️ Cancelar", f"admmenu|{tenant_id}|pback|{sku}")],
     ])
 
@@ -243,21 +248,19 @@ def send_admin_menu_price_editor(
     item = get_menu_product_or_404(orders_sh, sku)
     tmp = sess.setdefault("tmp", {})
 
-    current_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
+    current_sku = str(tmp.get("admin_menu_target_sku") or "").strip()
     if current_sku != sku:
-        tmp["admin_menu_price_sku"] = sku
+        tmp["admin_menu_target_sku"] = sku
         tmp["admin_menu_price_work"] = float(item.get("price", 0.0))
 
     work_price = float(tmp.get("admin_menu_price_work") or 0.0)
 
     msg = (
-        "💲 AJUSTAR PRECIO\n\n"
+        "💲 MODIFICAR PRECIO\n\n"
         f"Producto: {item.get('name','')}\n"
-        f"SKU: {item.get('sku','')}\n"
-        f"Precio guardado: Bs {fmt_price_short(item.get('price', 0))}\n"
-        f"Precio en edición: Bs {fmt_price_short(work_price)}\n\n"
-        "Usa los botones para subir o bajar el precio.\n"
-        "Luego presiona “Guardar precio”."
+        f"Precio actual: Bs {fmt_price_short(item.get('price', 0))}\n"
+        f"Nuevo precio: Bs {fmt_price_short(work_price)}\n\n"
+        "Usa los botones o escribe un precio."
     )
 
     return telegram_send_text(
