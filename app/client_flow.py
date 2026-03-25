@@ -29,8 +29,9 @@ from app.webhook_helpers import (
     fmt_snapshot_lines,
     build_order_recap_text,
     get_business_status_safe,
+    send_business_blocked_text,
     contact_link_for_admin,
-    cart_kb,
+    build_client_cart_manage_kb,
     i_paid_kb,
     paid_actions_kb,
     contact_admin_kb,
@@ -45,9 +46,14 @@ from app.alerts import (
     alert_system_error,
 )
 from app.content import (
+    build_start_text,
     build_location_text,
     build_faq_text,
     build_survey_text,
+    load_content_map,
+    has_location,
+    has_faq,
+    has_survey,
 )
 from app.pickup import (
     generate_pickup_slots,
@@ -55,12 +61,234 @@ from app.pickup import (
     build_pickup_offer_text,
 )
 from app.client_time import parse_manual_time_text
-from app.client_ui import _send_home, _send_category_products
-from app.client_helpers import (
-    _format_open_days,
-    _format_cart_detail_lines,
-    client_orders_allowed_or_notify,
-)
+
+
+def build_dynamic_home_kb(content_map: Dict[str, str]):
+    rows = [
+        [("📋 Ver menú", "menu")],
+        [("🛒 Ver carrito", "cart")],
+    ]
+
+    if has_location(content_map):
+        rows.append([("📍 Ubicación", "location")])
+
+    rows.append([("⏰ Horarios", "hours")])
+
+    if has_faq(content_map):
+        rows.append([("❓ FAQ", "faq")])
+
+    if has_survey(content_map):
+        rows.append([("📝 Encuesta", "survey")])
+
+    return kb(rows)
+
+
+def _send_home(bot_token: str, chat_id: int, orders_sh) -> bool:
+    content_map = load_content_map(orders_sh)
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        build_start_text(orders_sh),
+        build_dynamic_home_kb(content_map),
+    )
+
+
+def _format_open_days(days: List[str]) -> str:
+    if not days:
+        return "No configurado"
+
+    alias_map = {
+        "MON": "Lunes",
+        "TUE": "Martes",
+        "WED": "Miércoles",
+        "THU": "Jueves",
+        "FRI": "Viernes",
+        "SAT": "Sábado",
+        "SUN": "Domingo",
+        "LUN": "Lunes",
+        "MAR": "Martes",
+        "MIE": "Miércoles",
+        "MIÉ": "Miércoles",
+        "JUE": "Jueves",
+        "VIE": "Viernes",
+        "SAB": "Sábado",
+        "SÁB": "Sábado",
+        "DOM": "Domingo",
+    }
+
+    normalized_days = []
+    seen = set()
+
+    for d in days:
+        d_norm = str(d or "").strip().upper()
+        if not d_norm:
+            continue
+        if d_norm in alias_map:
+            nice = alias_map[d_norm]
+            if nice not in seen:
+                seen.add(nice)
+                normalized_days.append(nice)
+
+    if normalized_days:
+        desired_order = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+        ordered_names = [name for name in desired_order if name in normalized_days]
+        return ", ".join(ordered_names)
+
+    return "No configurado"
+
+
+def _format_cart_detail_lines(cart: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str, Any]]) -> str:
+    lines: List[str] = []
+
+    for it in cart:
+        sku = str(it.get("sku") or "").strip()
+        if not sku or sku not in menu_idx:
+            continue
+
+        try:
+            qty = int(it.get("qty") or 0)
+        except Exception:
+            qty = 0
+
+        if qty <= 0:
+            continue
+
+        name = str(menu_idx[sku].get("name") or sku).strip()
+        unit_price = float(menu_idx[sku].get("price") or 0)
+        line_total = unit_price * qty
+
+        lines.append(f"• {qty} x {name} — Bs {line_total:.2f}")
+
+    return "\n".join(lines) if lines else "Tu carrito está vacío."
+
+
+def _send_category_products(
+    bot_token: str,
+    chat_id: int,
+    real_cat: str,
+    items: List[Dict[str, Any]],
+) -> None:
+    with_photo = []
+    without_photo = []
+
+    for it in items:
+        photo_url = str(it.get("photo_url") or "").strip()
+        photo_file_id = str(it.get("photo_file_id") or "").strip()
+        if photo_url or photo_file_id:
+            with_photo.append(it)
+        else:
+            without_photo.append(it)
+
+    telegram_send_text(bot_token, chat_id, f"🍽 {real_cat}")
+
+    for it in with_photo:
+        photo_url = str(it.get("photo_url") or "").strip()
+        photo_file_id = str(it.get("photo_file_id") or "").strip()
+        price_txt = f"{float(it['price']):.0f}"
+
+        reply_markup = kb([
+            [(f"⬆️ {it['name']} — Bs {price_txt}", f"prd|{it['sku']}")],
+        ])
+
+        if photo_url:
+            telegram_send_photo(
+                bot_token,
+                chat_id,
+                photo_url,
+                caption="",
+                reply_markup=reply_markup,
+            )
+        elif photo_file_id:
+            telegram_send_photo(
+                bot_token,
+                chat_id,
+                photo_file_id,
+                caption="",
+                reply_markup=reply_markup,
+            )
+
+    if without_photo:
+        rows = []
+        for it in without_photo[:25]:
+            rows.append([(f"{it['name']} — Bs {float(it['price']):.0f}", f"prd|{it['sku']}")])
+
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            "Productos sin foto:",
+            kb(rows),
+        )
+
+    telegram_send_text(
+        bot_token,
+        chat_id,
+        "Otras opciones",
+        kb([
+            [("🛒 Carrito", "cart")],
+            [("⬅️ Categorías", "menu")],
+            [("🏠 Inicio", "home")],
+        ]),
+    )
+
+
+def client_orders_allowed_or_notify(bot_token: str, chat_id: int, orders_sh, tenant_tz: str) -> bool:
+    try:
+        bs = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
+        if bool(bs.get("accepts_orders_now")):
+            return True
+        telegram_send_text(bot_token, chat_id, send_business_blocked_text(bs))
+        return False
+    except Exception as e:
+        log_event(
+            "client_orders_allowed_check_error",
+            chat_id=chat_id,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        alert_system_error(error=str(e), module="client_orders_allowed_or_notify")
+        telegram_send_text(bot_token, chat_id, "⚠️ Ocurrió un error verificando el horario del negocio.")
+        return False
+
+
+def _cart_add(sess: Dict[str, Any], sku: str, qty: int) -> None:
+    cart = sess.get("cart") or []
+    found = False
+    for it in cart:
+        if it.get("sku") == sku:
+            it["qty"] = int(it.get("qty") or 0) + qty
+            found = True
+            break
+    if not found:
+        cart.append({"sku": sku, "qty": qty})
+    sess["cart"] = cart
+
+
+def _cart_inc(sess: Dict[str, Any], sku: str) -> None:
+    cart = sess.get("cart") or []
+    for it in cart:
+        if it.get("sku") == sku:
+            it["qty"] = max(1, int(it.get("qty") or 1) + 1)
+            break
+    sess["cart"] = cart
+
+
+def _cart_dec(sess: Dict[str, Any], sku: str) -> None:
+    cart = sess.get("cart") or []
+    new_cart = []
+    for it in cart:
+        if it.get("sku") == sku:
+            new_qty = int(it.get("qty") or 1) - 1
+            if new_qty > 0:
+                it["qty"] = new_qty
+                new_cart.append(it)
+        else:
+            new_cart.append(it)
+    sess["cart"] = new_cart
+
+
+def _cart_remove(sess: Dict[str, Any], sku: str) -> None:
+    cart = sess.get("cart") or []
+    sess["cart"] = [it for it in cart if str(it.get("sku") or "").strip() != sku]
 
 
 def handle_client_callback(
@@ -242,16 +470,7 @@ def handle_client_callback(
                 telegram_send_text(bot_token, chat_id, "Producto no disponible.")
                 return {"ok": True}
 
-            cart = sess.get("cart") or []
-            found = False
-            for it in cart:
-                if it.get("sku") == sku:
-                    it["qty"] = int(it.get("qty") or 0) + qty
-                    found = True
-                    break
-            if not found:
-                cart.append({"sku": sku, "qty": qty})
-            sess["cart"] = cart
+            _cart_add(sess, sku, qty)
 
             name = menu_idx[sku]["name"]
             unit_price = float(menu_idx[sku]["price"])
@@ -268,6 +487,21 @@ def handle_client_callback(
                 ]),
             )
             return {"ok": True}
+
+        if data.startswith("cinc|"):
+            sku = data.split("|", 1)[1].strip()
+            _cart_inc(sess, sku)
+            data = "cart"
+
+        if data.startswith("cdec|"):
+            sku = data.split("|", 1)[1].strip()
+            _cart_dec(sess, sku)
+            data = "cart"
+
+        if data.startswith("crem|"):
+            sku = data.split("|", 1)[1].strip()
+            _cart_remove(sess, sku)
+            data = "cart"
 
         if data == "cart":
             try:
@@ -294,7 +528,13 @@ def handle_client_callback(
                 f"{detail_lines}\n\n"
                 f"*Total: Bs {total:.2f}*"
             )
-            telegram_send_text(bot_token, chat_id, msg, reply_markup=cart_kb(has_items), parse_mode="Markdown")
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                msg,
+                reply_markup=build_client_cart_manage_kb(cart, menu_idx),
+                parse_mode="Markdown",
+            )
             return {"ok": True}
 
         if data == "cart_clear":
@@ -440,8 +680,7 @@ def handle_client_callback(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "✅ Recibido. Espera unos minutos mientras verificamos tu pago.\n"
-                "Si no hay respuesta, podrás enviar un recordatorio.",
+                "✅ Recibido. Espera unos minutos mientras verificamos tu pago.\nSi no hay respuesta, podrás enviar un recordatorio.",
                 reply_markup=paid_actions_kb(tenant_id, order_id),
             )
             return {"ok": True}
@@ -499,8 +738,7 @@ def handle_client_callback(
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "🔔 Listo. Enviamos un *recordatorio* al administrador.\n"
-                    "Si no responde, en unos minutos podrás contactarlo directamente.",
+                    "🔔 Listo. Enviamos un *recordatorio* al administrador.\nSi no responde, en unos minutos podrás contactarlo directamente.",
                     reply_markup=contact_admin_kb(tenant_id, order_id),
                     parse_mode="Markdown",
                 )
@@ -810,13 +1048,10 @@ def handle_client_message(
                 total=total_real,
             )
 
-            recap = recap.replace("BOB", "Bs")
-            recap = recap.replace("Cantidad:", "Resumen:")
-
             telegram_send_text(
                 bot_token,
                 chat_id,
-                recap + "\n💳 *Ahora realiza el pago.*\nTe enviamos el QR a continuación.",
+                recap + "\n\n💳 *Ahora realiza el pago.*\nTe enviamos el QR a continuación.",
                 parse_mode="Markdown",
             )
 
