@@ -23,6 +23,7 @@ from app.orders import (
     build_items_snapshot,
 )
 from app.telegram_api import telegram_send_text
+from app.telegram_keyboard import kb
 from app.utils import normalize, log_event
 from app.stats import resolve_period, build_stats_report_text, build_periods
 from app.webhook_helpers import (
@@ -652,7 +653,27 @@ def handle_admin_callback_impl(
 
             if action == "price" and len(parts) == 4:
                 sku = parts[3].strip()
-                return {"ok": send_admin_menu_price_editor(bot_token, chat_id, tenant_id, orders_sh, sess, sku)}
+                item = get_menu_product_or_404(orders_sh, sku)
+
+                tmp["admin_menu_input_mode"] = "price_final"
+                tmp["admin_menu_price_sku"] = sku
+                tmp["admin_menu_price_work"] = float(item.get("price", 0.0))
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    (
+                        "💲 MODIFICAR PRECIO\n\n"
+                        f"Producto: {item.get('name', '')}\n"
+                        f"Precio actual: Bs {fmt_price_short(item.get('price', 0))}\n\n"
+                        "Escribe el nuevo precio final.\n"
+                        "Ejemplos válidos:\n"
+                        "- 25\n"
+                        "- 25 bs\n"
+                        "- 25 bolivianos"
+                    ),
+                )
+                return {"ok": True}
 
             if action == "padj" and len(parts) == 5:
                 sku = parts[3].strip()
@@ -760,7 +781,6 @@ def handle_admin_callback_impl(
                 )
                 return {"ok": True}
 
-            # ===== NUEVO: editar nombre =====
             if action == "edit_name" and len(parts) == 4:
                 sku = parts[3].strip()
                 item = get_menu_product_or_404(orders_sh, sku)
@@ -779,7 +799,6 @@ def handle_admin_callback_impl(
                 )
                 return {"ok": True}
 
-            # ===== NUEVO: cambiar categoría =====
             if action == "edit_category" and len(parts) == 4:
                 sku = parts[3].strip()
                 item = get_menu_product_or_404(orders_sh, sku)
@@ -803,7 +822,7 @@ def handle_admin_callback_impl(
                         f"Categoría actual: {item.get('category', '')}\n\n"
                         "Elige una categoría o crea una nueva:"
                     ),
-                    reply_markup={"inline_keyboard": rows},
+                    reply_markup=kb(rows),
                 )
                 return {"ok": True}
 
@@ -850,7 +869,6 @@ def handle_admin_callback_impl(
                 )
                 return {"ok": True}
 
-            # ===== NUEVO: crear producto =====
             if action == "create_product":
                 tmp.pop("admin_menu_input_mode", None)
                 tmp.pop("admin_menu_price_sku", None)
@@ -866,6 +884,50 @@ def handle_admin_callback_impl(
                     bot_token,
                     chat_id,
                     "➕ CREAR PRODUCTO\n\nEscribe el nombre del nuevo producto:",
+                )
+                return {"ok": True}
+
+            if action == "create_setcat" and len(parts) == 4:
+                try:
+                    idx = int(parts[3].strip())
+                except Exception:
+                    idx = -1
+
+                categories = tmp.get("admin_menu_category_options") or []
+                if idx < 0 or idx >= len(categories):
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No pude identificar esa categoría. Intenta otra vez.",
+                    )
+                    return {"ok": True}
+
+                selected_category = str(categories[idx]).strip()
+                tmp["admin_menu_create_category"] = selected_category
+                tmp["admin_menu_create_step"] = "price"
+                tmp.pop("admin_menu_category_options", None)
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    (
+                        "💲 PRECIO DEL NUEVO PRODUCTO\n\n"
+                        f"Categoría elegida: {selected_category}\n\n"
+                        "Escribe el precio del producto.\n"
+                        "Ejemplos válidos:\n"
+                        "- 25\n"
+                        "- 25 bs\n"
+                        "- 25 bolivianos"
+                    ),
+                )
+                return {"ok": True}
+
+            if action == "create_newcat":
+                tmp["admin_menu_create_step"] = "new_category_for_create"
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Escribe la nueva categoría para el producto:",
                 )
                 return {"ok": True}
 
