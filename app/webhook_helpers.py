@@ -1,3 +1,5 @@
+# app/webhook_helpers.py
+
 import json
 import re
 import urllib.parse
@@ -50,7 +52,7 @@ def get_admin_chat_id(tenant: Dict[str, Any]) -> Optional[int]:
 
 
 def get_admin_username(tenant: Dict[str, Any]) -> str:
-    return (tenant.get("admin_username") or "").strip().lstrip("@")
+    return (tenant.get("admin_username") or "").strip().lstrip("@") 
 
 
 def get_payment_qr_file_id(tenant: Dict[str, Any]) -> str:
@@ -113,9 +115,10 @@ def fmt_cart_lines(cart: List[Dict[str, Any]], menu_idx: Dict[str, Any]) -> Tupl
             continue
 
         total_qty += qty
-        name = menu_idx[sku]["name"]
+        name = str(menu_idx[sku]["name"] or "").strip()
         price = float(menu_idx[sku]["price"])
-        lines.append(f"- {qty} x {name} ({price:.0f})")
+        line_total = price * qty
+        lines.append(f"• {qty} x {name} — Bs {line_total:.2f}")
         items_for_total.append({"sku": sku, "qty": qty})
 
     total = calc_total_amount(items_for_total, menu_idx) if items_for_total else 0.0
@@ -147,7 +150,7 @@ def fmt_snapshot_lines(items_snapshot: List[Dict[str, Any]]) -> Tuple[str, float
 
         total_qty += qty
         total += line_total
-        lines.append(f"- {qty} x {name} ({unit_price:.0f}) = {line_total:.0f}")
+        lines.append(f"• {qty} x {name} — Bs {line_total:.2f}")
 
     return ("\n".join(lines) if lines else "(vacío)"), float(total), int(total_qty)
 
@@ -162,14 +165,14 @@ def build_order_recap_text(
     total: float,
 ) -> str:
     return (
-        f"🧾 *Resumen de tu pedido*\n"
-        f"ID: `{order_id}`\n"
+        "🧾 *Resumen de tu pedido*\n"
+        f"Código de pedido: `{order_id}`\n"
         f"Cliente: *{customer_name}*\n"
         f"Contacto: `{customer_contact}`\n"
-        f"Hora recogida: *{requested_time}*\n"
-        f"Cantidad total: *{total_qty}*\n"
-        f"Total: *{total:.2f}* BOB\n\n"
-        f"*Detalle:*\n{detail_lines}\n"
+        f"Hora de recojo: *{requested_time}*\n"
+        f"Resumen: *{total_qty}*\n"
+        f"Total: *Bs {total:.2f}*\n\n"
+        f"*Detalle:*\n{detail_lines}"
     )
 
 
@@ -323,6 +326,38 @@ def cart_kb(has_items: bool) -> Dict[str, Any]:
     if has_items:
         rows.append([("✅ Confirmar pedido", "cart_confirm")])
         rows.append([("🧹 Vaciar carrito", "cart_clear")])
+    rows.append([("⬅️ Seguir comprando", "menu")])
+    rows.append([("🏠 Inicio", "home")])
+    return kb(rows)
+
+
+def build_client_cart_manage_kb(cart: List[Dict[str, Any]], menu_idx: Dict[str, Any]) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    for it in cart:
+        sku = str(it.get("sku") or "").strip()
+        if not sku or sku not in menu_idx:
+            continue
+
+        name = str(menu_idx[sku].get("name") or sku).strip()
+        try:
+            qty = int(it.get("qty") or 1)
+        except Exception:
+            qty = 1
+        qty = max(1, qty)
+
+        rows.append([(f"{name} x{qty}", "home")])
+        rows.append([
+            ("➖", f"cdec|{sku}"),
+            ("➕", f"cinc|{sku}"),
+            ("🗑", f"crem|{sku}"),
+        ])
+
+    has_items = bool(cart)
+    if has_items:
+        rows.append([("✅ Confirmar pedido", "cart_confirm")])
+        rows.append([("🧹 Vaciar carrito", "cart_clear")])
+
     rows.append([("⬅️ Seguir comprando", "menu")])
     rows.append([("🏠 Inicio", "home")])
     return kb(rows)
