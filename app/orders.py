@@ -1,4 +1,4 @@
-# app/orders.py
+# app/orders.py — versión optimizada simple y escalable para ORDERS
 
 import json
 from datetime import datetime, timezone
@@ -89,6 +89,50 @@ def _build_row_by_header(header: List[str], data: Dict[str, Any]) -> List[str]:
         else:
             row[idx] = str(v)
     return row
+
+
+def _col_to_a1(col_1based: int) -> str:
+    """
+    1 -> A, 27 -> AA
+    """
+    result = ""
+    n = int(col_1based)
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def _cell_a1(row_1based: int, col_1based: int) -> str:
+    return f"{_col_to_a1(col_1based)}{row_1based}"
+
+
+def _batch_write_cells(ws, updates: List[Dict[str, str]]) -> None:
+    """
+    updates: [{"row":2,"col":3,"value":"x"}, ...]
+    Hace un solo batch_update si hay varias celdas.
+    """
+    if not updates:
+        return
+
+    data = []
+    for u in updates:
+        row = int(u["row"])
+        col = int(u["col"])
+        value = str(u.get("value", ""))
+        data.append({
+            "range": _cell_a1(row, col),
+            "values": [[value]],
+        })
+
+    ws.batch_update(data, value_input_option="RAW")
+
+
+def _row_to_dict(header: List[str], row: List[Any]) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    for i, h in enumerate(header):
+        d[h] = row[i] if i < len(row) else ""
+    return d
 
 
 # ----------------------------------------
@@ -250,62 +294,10 @@ def append_order(*args, **kwargs):
 # READ helpers
 # ----------------------------------------
 
-def _iter_rows_as_dicts(ws) -> List[Dict[str, Any]]:
-    header = _get_header(ws)
-    if not header:
-        return []
-    values = ws.get_all_values()
-    if len(values) <= 1:
-        return []
-
-    out: List[Dict[str, Any]] = []
-    for r in values[1:]:
-        if not any(str(x).strip() for x in r):
-            continue
-        d: Dict[str, Any] = {}
-        for i, h in enumerate(header):
-            d[h] = r[i] if i < len(r) else ""
-        out.append(d)
-    return out
-
-
-def get_order_by_id(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
-    ws = _get_orders_ws(orders_sh)
-    rows = _iter_rows_as_dicts(ws)
-    oid = (order_id or "").strip()
-    for r in rows:
-        if (r.get("order_id") or "").strip() == oid:
-            return r
-    return None
-
-
-def find_latest_pending_order_for_contact(
-    orders_sh,
-    customer_contact: str,
-    status: str = "PENDING_PAYMENT",
-) -> Optional[str]:
-    ws = _get_orders_ws(orders_sh)
-    rows = _iter_rows_as_dicts(ws)
-
-    contact = (customer_contact or "").strip()
-    status = (status or "").strip()
-
-    for r in reversed(rows):
-        if (r.get("customer_contact") or "").strip() != contact:
-            continue
-        if (r.get("status") or "").strip() != status:
-            continue
-        return (r.get("order_id") or "").strip()
-    return None
-
-
-# ----------------------------------------
-# UPDATE helpers
-# ----------------------------------------
-
 def _find_row_index_by_order_id(ws, order_id: str) -> Optional[int]:
     """
     Devuelve row index 1-based en la sheet (incluye header en fila 1).
+    Lee solo la columna order_id.
     """
     header = _get_header(ws)
     if not header:
@@ -315,14 +307,80 @@ def _find_row_index_by_order_id(ws, order_id: str) -> Optional[int]:
     if oid_col is None:
         return None
 
-    values = ws.get_all_values()
-    for i in range(1, len(values)):
-        row = values[i]
-        cell = row[oid_col] if oid_col < len(row) else ""
-        if str(cell).strip() == (order_id or "").strip():
+    col_values = ws.col_values(oid_col + 1)
+    target = (order_id or "").strip()
+
+    # fila 1 = header
+    for i in range(1, len(col_values)):
+        if str(col_values[i]).strip() == target:
             return i + 1
+
     return None
 
+
+def get_order_by_id(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
+    ws = _get_orders_ws(orders_sh)
+    header = _get_header(ws)
+    if not header:
+        return None
+
+    ridx = _find_row_index_by_order_id(ws, order_id)
+    if ridx is None:
+        return None
+
+    row = ws.row_values(ridx)
+    return _row_to_dict(header, row)
+
+
+def find_latest_pending_order_for_contact(
+    orders_sh,
+    customer_contact: str,
+    status: str = "PENDING_PAYMENT",
+) -> Optional[str]:
+    """
+    Lee solo las columnas necesarias: customer_contact, status, order_id.
+    """
+    ws = _get_orders_ws(orders_sh)
+    header = _get_header(ws)
+    if not header:
+        return None
+
+    i_contact = _find_col_idx(header, "customer_contact")
+    i_status = _find_col_idx(header, "status")
+    i_order_id = _find_col_idx(header, "order_id")
+
+    if i_contact is None or i_status is None or i_order_id is None:
+        return None
+
+    contact_vals = ws.col_values(i_contact + 1)
+    status_vals = ws.col_values(i_status + 1)
+    order_vals = ws.col_values(i_order_id + 1)
+
+    contact = (customer_contact or "").strip()
+    wanted_status = (status or "").strip()
+
+    max_len = max(len(contact_vals), len(status_vals), len(order_vals))
+
+    for row_idx in range(max_len - 1, 1, -1):
+        cv = contact_vals[row_idx - 1] if row_idx - 1 < len(contact_vals) else ""
+        sv = status_vals[row_idx - 1] if row_idx - 1 < len(status_vals) else ""
+        ov = order_vals[row_idx - 1] if row_idx - 1 < len(order_vals) else ""
+
+        if str(cv).strip() != contact:
+            continue
+        if str(sv).strip() != wanted_status:
+            continue
+
+        oid = str(ov).strip()
+        if oid:
+            return oid
+
+    return None
+
+
+# ----------------------------------------
+# UPDATE helpers
+# ----------------------------------------
 
 def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, Any]:
     tenant_id_for_alert = ""
@@ -339,16 +397,26 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
         if status_col is None:
             raise RuntimeError("Missing status column")
 
-        existing = get_order_by_id(orders_sh, order_id)
-        if existing:
-            tenant_id_for_alert = str(existing.get("tenant_id") or "").strip()
+        tenant_col = _find_col_idx(header, "tenant_id")
+        if tenant_col is not None:
+            row = ws.row_values(ridx)
+            if tenant_col < len(row):
+                tenant_id_for_alert = str(row[tenant_col] or "").strip()
 
-        ws.update_cell(ridx, status_col + 1, str(new_status).strip())
+        updates = [
+            {"row": ridx, "col": status_col + 1, "value": str(new_status).strip()},
+        ]
 
         if str(new_status).strip() == "PAID":
             paid_col = _find_col_idx(header, "payment_confirmed_at")
             if paid_col is not None:
-                ws.update_cell(ridx, paid_col + 1, _now_iso_utc())
+                updates.append({
+                    "row": ridx,
+                    "col": paid_col + 1,
+                    "value": _now_iso_utc(),
+                })
+
+        _batch_write_cells(ws, updates)
 
         log_event(
             "order_status_updated",
@@ -398,9 +466,11 @@ def update_order_payment_proof(
         if ridx is None:
             return {"ok": True, "found": False}
 
-        existing = get_order_by_id(orders_sh, order_id)
-        if existing:
-            tenant_id_for_alert = str(existing.get("tenant_id") or "").strip()
+        tenant_col = _find_col_idx(header, "tenant_id")
+        if tenant_col is not None:
+            row = ws.row_values(ridx)
+            if tenant_col < len(row):
+                tenant_id_for_alert = str(row[tenant_col] or "").strip()
 
         fcol = _find_col_idx(header, "payment_proof_file_id")
         tcol = _find_col_idx(header, "payment_proof_type")
@@ -409,11 +479,19 @@ def update_order_payment_proof(
         if fcol is None or tcol is None:
             raise RuntimeError("Missing payment proof columns")
 
-        ws.update_cell(ridx, fcol + 1, str(proof_file_id or "").strip())
-        ws.update_cell(ridx, tcol + 1, str(proof_type or "").strip())
+        updates = [
+            {"row": ridx, "col": fcol + 1, "value": str(proof_file_id or "").strip()},
+            {"row": ridx, "col": tcol + 1, "value": str(proof_type or "").strip()},
+        ]
 
         if ccol is not None:
-            ws.update_cell(ridx, ccol + 1, str(proof_caption or "").strip())
+            updates.append({
+                "row": ridx,
+                "col": ccol + 1,
+                "value": str(proof_caption or "").strip(),
+            })
+
+        _batch_write_cells(ws, updates)
 
         log_event(
             "order_proof_updated",
