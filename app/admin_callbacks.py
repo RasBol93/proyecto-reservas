@@ -18,7 +18,7 @@ from app.orders import (
 )
 from app.telegram_api import telegram_send_text
 from app.utils import normalize, log_event
-from app.stats import resolve_period, build_stats_report_text
+from app.stats import resolve_period, build_stats_report_text, build_periods
 from app.webhook_helpers import (
     get_sess,
     get_client_bot_token,
@@ -104,11 +104,12 @@ def handle_admin_callback_impl(
 
         if data == "admin_stats":
             assert_admin_authorized(tenant, chat_id, tenant_id)
+            periods = build_periods(tenant_tz)
             telegram_send_text(
                 bot_token,
                 chat_id,
                 "📊 ESTADÍSTICAS\n\nSelecciona el período:",
-                reply_markup=admin_periods_inline_kb(tenant_id),
+                reply_markup=admin_periods_inline_kb(tenant_id, periods),
             )
             return {"ok": True}
 
@@ -605,7 +606,8 @@ def handle_admin_callback_impl(
                 return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
             if action == "openforce":
-                admin_set_today_open_force(orders_sh=orders_sh, enabled=True, updated_by=updated_by)
+                admin_set_today_openForce = admin_set_today_open_force
+                admin_set_today_openForce(orders_sh=orders_sh, enabled=True, updated_by=updated_by)
                 admin_set_today_closed(orders_sh=orders_sh, enabled=False, updated_by=updated_by)
                 admin_set_today_open_override(orders_sh=orders_sh, open_time="", updated_by=updated_by)
                 admin_set_today_close_override(orders_sh=orders_sh, close_time="", updated_by=updated_by)
