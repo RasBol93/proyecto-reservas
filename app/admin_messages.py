@@ -21,7 +21,6 @@ from app.webhook_helpers import (
     get_sess,
     assert_admin_authorized,
     set_menu_photo_url,
-    admin_fixed_kb,
     admin_periods_inline_kb,
     fmt_price_short,
     extract_first_number,
@@ -42,6 +41,9 @@ from app.admin_consumers import _send_consumers_menu
 from app.admin_manual_order import (
     _admin_order_reset,
     _send_admin_order_home,
+)
+from app.admin_nav import (
+    admin_root_kb,
 )
 
 
@@ -68,18 +70,33 @@ def handle_admin_message_impl(
             if admin_order_step == "awaiting_name":
                 customer_name = text.strip()
                 if not customer_name:
-                    telegram_send_text(bot_token, chat_id, "El nombre no puede estar vacío. Escribe el nombre del cliente:")
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "El nombre no puede estar vacío. Escribe el nombre del cliente:",
+                        reply_markup=admin_root_kb(),
+                    )
                     return {"ok": True}
 
                 tmp["admin_order_name"] = customer_name
                 tmp["admin_order_step"] = "awaiting_contact"
-                telegram_send_text(bot_token, chat_id, "Escribe el contacto del cliente (teléfono o referencia):")
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Escribe el contacto del cliente (teléfono o referencia):",
+                    reply_markup=admin_root_kb(),
+                )
                 return {"ok": True}
 
             if admin_order_step == "awaiting_contact":
                 customer_contact = text.strip()
                 if not customer_contact:
-                    telegram_send_text(bot_token, chat_id, "El contacto no puede estar vacío. Escribe el contacto del cliente:")
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "El contacto no puede estar vacío. Escribe el contacto del cliente:",
+                        reply_markup=admin_root_kb(),
+                    )
                     return {"ok": True}
 
                 tmp["admin_order_contact"] = customer_contact
@@ -88,6 +105,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "Escribe la hora solicitada.\nEjemplos: ahora, 19:30, 20h",
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": True}
 
@@ -106,7 +124,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "⚠️ Faltaban datos del pedido manual. Empecemos de nuevo.",
-                        reply_markup=admin_fixed_kb(),
+                        reply_markup=admin_root_kb(),
                     )
                     return {"ok": True}
 
@@ -145,7 +163,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "⚠️ Error guardando el pedido manual.",
-                        reply_markup=admin_fixed_kb(),
+                        reply_markup=admin_root_kb(),
                     )
                     return {"ok": True}
 
@@ -163,7 +181,7 @@ def handle_admin_message_impl(
                         f"Total: Bs {total_amount:.2f}\n\n"
                         "Se guardó como confirmado y ya cuenta para estadísticas."
                     ),
-                    reply_markup=admin_fixed_kb(),
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": True}
 
@@ -195,7 +213,12 @@ def handle_admin_message_impl(
                         mime_type=content_type,
                     )
                 except Exception as e:
-                    telegram_send_text(bot_token, chat_id, "No pude subir la foto al storage configurado.")
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "No pude subir la foto al storage configurado.",
+                        reply_markup=admin_root_kb(),
+                    )
                     log_event("admin_product_photo_storage_upload_failed", tenant_id=tenant_id, sku=input_sku, error=str(e))
                     alert_photo_upload_failed(tenant_id=tenant_id, sku=input_sku, error=str(e))
                     return {"ok": True}
@@ -204,7 +227,12 @@ def handle_admin_message_impl(
 
                 if not found:
                     alert_menu_error(tenant_id=tenant_id, sku=input_sku, error="SKU not found in Menu for photo update")
-                    telegram_send_text(bot_token, chat_id, f"No encontré el producto SKU {input_sku} en la hoja Menu.")
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"No encontré el producto SKU {input_sku} en la hoja Menu.",
+                        reply_markup=admin_root_kb(),
+                    )
                     return {"ok": True}
 
                 invalidate_menu_cache(orders_sh)
@@ -216,6 +244,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "✅ Foto guardada correctamente y vinculada al producto.",
+                    reply_markup=admin_root_kb(),
                 )
 
                 return {
@@ -228,6 +257,7 @@ def handle_admin_message_impl(
                 bot_token,
                 chat_id,
                 "📷 Estoy esperando una foto del producto. Envíala como imagen de Telegram.",
+                reply_markup=admin_root_kb(),
             )
             return {"ok": True}
 
@@ -244,18 +274,25 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "No pude leer un número válido.\nEscribe solo el precio o algo como: 25 bs",
+                        reply_markup=admin_root_kb(),
                     )
                 elif input_mode == "discount_pct":
                     telegram_send_text(
                         bot_token,
                         chat_id,
                         "No pude leer un porcentaje válido.\nEscribe algo como: 10 o 15%",
+                        reply_markup=admin_root_kb(),
                     )
                 return {"ok": True}
 
             if input_mode == "price_final":
                 if n < 0:
-                    telegram_send_text(bot_token, chat_id, "El precio no puede ser negativo. Intenta otra vez.")
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "El precio no puede ser negativo. Intenta otra vez.",
+                        reply_markup=admin_root_kb(),
+                    )
                     return {"ok": True}
 
                 result = set_menu_product_price(orders_sh, input_sku, float(n))
@@ -267,15 +304,26 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     f"✅ Precio actualizado.\nSKU: {input_sku}\nNuevo precio: Bs {fmt_price_short(result.get('price', 0))}",
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
 
             if input_mode == "discount_pct":
                 if n < 0:
-                    telegram_send_text(bot_token, chat_id, "El descuento no puede ser negativo. Intenta otra vez.")
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "El descuento no puede ser negativo. Intenta otra vez.",
+                        reply_markup=admin_root_kb(),
+                    )
                     return {"ok": True}
                 if n > 100:
-                    telegram_send_text(bot_token, chat_id, "El descuento no puede ser mayor a 100%. Intenta otra vez.")
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "El descuento no puede ser mayor a 100%. Intenta otra vez.",
+                        reply_markup=admin_root_kb(),
+                    )
                     return {"ok": True}
 
                 new_price = round(current_price * (1.0 - (float(n) / 100.0)), 2)
@@ -297,6 +345,7 @@ def handle_admin_message_impl(
                         f"Precio anterior: Bs {fmt_price_short(current_price)}\n"
                         f"Nuevo precio: Bs {fmt_price_short(result.get('price', 0))}"
                     ),
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
 
@@ -309,7 +358,7 @@ def handle_admin_message_impl(
                 "📊 Elige el período:",
                 reply_markup=admin_periods_inline_kb(tenant_id, periods),
             )
-            telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
+            telegram_send_text(bot_token, chat_id, "Usa el botón inferior para abrir el panel cuando quieras.", reply_markup=admin_root_kb())
             return {"ok": True}
 
         if (
@@ -349,10 +398,20 @@ def handle_admin_message_impl(
             return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
         if txt_norm in ("start", "/start", "hola"):
-            telegram_send_text(bot_token, chat_id, "Admin bot listo ✅", reply_markup=admin_fixed_kb())
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "Admin bot listo ✅",
+                reply_markup=admin_root_kb(),
+            )
             return {"ok": True}
 
-        telegram_send_text(bot_token, chat_id, "OK admin ✅", reply_markup=admin_fixed_kb())
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            "OK admin ✅",
+            reply_markup=admin_root_kb(),
+        )
         return {"ok": True}
 
     except Exception as e:
@@ -364,5 +423,10 @@ def handle_admin_message_impl(
             error=str(e),
         )
         alert_system_error(error=str(e), module="admin_message")
-        telegram_send_text(bot_token, chat_id, "⚠️ Ocurrió un error en el panel admin.", reply_markup=admin_fixed_kb())
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            "⚠️ Ocurrió un error en el panel admin.",
+            reply_markup=admin_root_kb(),
+        )
         return {"ok": True}
