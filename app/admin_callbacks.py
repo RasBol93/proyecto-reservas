@@ -18,12 +18,11 @@ from app.orders import (
 )
 from app.telegram_api import telegram_send_text
 from app.utils import normalize, log_event
-from app.stats import resolve_period, build_stats_report_text
+from app.stats import resolve_period, build_stats_report_text, build_periods
 from app.webhook_helpers import (
     get_sess,
     get_client_bot_token,
     assert_admin_authorized,
-    admin_fixed_kb,
     fmt_price_short,
     get_business_status_safe,
 )
@@ -77,6 +76,10 @@ from app.admin_manual_order import (
     _admin_order_add_to_cart,
     _send_admin_order_cart,
 )
+from app.admin_nav import (
+    admin_root_kb,
+    admin_panel_kb,
+)
 
 
 def handle_admin_callback_impl(
@@ -89,6 +92,58 @@ def handle_admin_callback_impl(
     tenant_tz: str,
 ) -> Dict[str, Any]:
     try:
+        if data == "admin_panel":
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "🧭 PANEL ADMIN\n\nElige una opción:",
+                reply_markup=admin_panel_kb(),
+            )
+            return {"ok": True}
+
+        if data == "admin_stats":
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            periods = build_periods(tenant_tz)
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "📊 ESTADÍSTICAS\n\nElige el período:",
+                reply_markup=admin_panel_kb(),
+            )
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "Selecciona el período:",
+                reply_markup={
+                    "inline_keyboard": [
+                        [{"text": p.label, "callback_data": f"admin_stats_period|{tenant_id}|{p.key}"}]
+                        for p in periods
+                    ]
+                },
+            )
+            return {"ok": True}
+
+        if data == "admin_consumers":
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            return {"ok": _send_consumers_menu(bot_token, chat_id, tenant_id)}
+
+        if data == "admin_order":
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            sess = get_sess(tenant_id, chat_id)
+            tmp = sess.setdefault("tmp", {})
+            _admin_order_reset(tmp)
+            tmp["admin_order_cart"] = []
+            return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if data == "admin_hours":
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
+
+        if data == "admin_menu":
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            sess = get_sess(tenant_id, chat_id)
+            return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
         if data.startswith("paid|"):
             parts = data.split("|")
             if len(parts) != 3:
@@ -110,7 +165,12 @@ def handle_admin_callback_impl(
                     new_status="PAID",
                     error=res.get("error") or "update_order_status failed",
                 )
-                telegram_send_text(bot_token, chat_id, "⚠️ Error actualizando el estado.", reply_markup=admin_fixed_kb())
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "⚠️ Error actualizando el estado.",
+                    reply_markup=admin_root_kb(),
+                )
                 return {"ok": True}
 
             if not res.get("found"):
@@ -118,7 +178,7 @@ def handle_admin_callback_impl(
                     bot_token,
                     chat_id,
                     f"⚠️ Pedido {order_id} no encontrado en Sheets.",
-                    reply_markup=admin_fixed_kb(),
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": True}
 
@@ -133,21 +193,21 @@ def handle_admin_callback_impl(
                         bot_token,
                         chat_id,
                         f"✅ El pedido de {customer_name}, con código de pedido {order_id}, ha sido confirmado.\nHora de recojo: {final_hhmm}.",
-                        reply_markup=admin_fixed_kb(),
+                        reply_markup=admin_root_kb(),
                     )
                 else:
                     telegram_send_text(
                         bot_token,
                         chat_id,
                         f"✅ El pedido de {customer_name}, con código de pedido {order_id}, ha sido confirmado.",
-                        reply_markup=admin_fixed_kb(),
+                        reply_markup=admin_root_kb(),
                     )
             else:
                 telegram_send_text(
                     bot_token,
                     chat_id,
                     f"✅ El pedido con código de pedido {order_id} ha sido confirmado.",
-                    reply_markup=admin_fixed_kb(),
+                    reply_markup=admin_root_kb(),
                 )
 
             if order_after:
@@ -210,7 +270,7 @@ def handle_admin_callback_impl(
             period = resolve_period(tenant_tz, period_key)
             txt = build_stats_report_text(orders_sh, tenant_id=tenant_id, tenant_tz=tenant_tz, period=period)
 
-            telegram_send_text(bot_token, chat_id, txt, reply_markup=admin_fixed_kb())
+            telegram_send_text(bot_token, chat_id, txt, reply_markup=admin_root_kb())
             return {"ok": True}
 
         if data.startswith("admcons|"):
@@ -227,7 +287,12 @@ def handle_admin_callback_impl(
             action = parts[2].strip()
 
             if action == "panel":
-                telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "🧭 PANEL ADMIN\n\nElige una opción:",
+                    reply_markup=admin_panel_kb(),
+                )
                 return {"ok": True}
 
             if action == "menu":
@@ -276,7 +341,12 @@ def handle_admin_callback_impl(
 
             if action == "panel":
                 _admin_order_reset(tmp)
-                telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "🧭 PANEL ADMIN\n\nElige una opción:",
+                    reply_markup=admin_panel_kb(),
+                )
                 return {"ok": True}
 
             if action == "home":
@@ -320,6 +390,7 @@ def handle_admin_callback_impl(
                     bot_token,
                     chat_id,
                     f"✅ Agregado al pedido: {qty} x {item.get('name', '')}",
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": _send_admin_order_cart(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
@@ -328,17 +399,32 @@ def handle_admin_callback_impl(
 
             if action == "clear":
                 tmp["admin_order_cart"] = []
-                telegram_send_text(bot_token, chat_id, "🧹 Carrito manual vaciado.")
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "🧹 Carrito manual vaciado.",
+                    reply_markup=admin_root_kb(),
+                )
                 return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
             if action == "confirm":
                 cart = tmp.get("admin_order_cart") or []
                 if not cart:
-                    telegram_send_text(bot_token, chat_id, "⚠️ El carrito está vacío.")
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ El carrito está vacío.",
+                        reply_markup=admin_root_kb(),
+                    )
                     return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
                 tmp["admin_order_step"] = "awaiting_name"
-                telegram_send_text(bot_token, chat_id, "Escribe el nombre del cliente:")
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Escribe el nombre del cliente:",
+                    reply_markup=admin_root_kb(),
+                )
                 return {"ok": True}
 
             return {"ok": True}
@@ -372,7 +458,12 @@ def handle_admin_callback_impl(
                 tmp.pop("admin_norm_close", None)
                 tmp.pop("admin_early_close", None)
                 admin_restore_habitual(orders_sh=orders_sh, updated_by=updated_by)
-                telegram_send_text(bot_token, chat_id, "✅ Se restauró la configuración habitual de hoy.")
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "✅ Se restauró la configuración habitual de hoy.",
+                    reply_markup=admin_root_kb(),
+                )
                 return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
             if action == "days":
@@ -412,7 +503,7 @@ def handle_admin_callback_impl(
                 if today_code and (not today_in) and (not force_open) and (not today_closed):
                     msg += f"\n⚠️ Ojo: hoy ({today_code}) quedó fuera de los días normales."
 
-                telegram_send_text(bot_token, chat_id, msg)
+                telegram_send_text(bot_token, chat_id, msg, reply_markup=admin_root_kb())
                 return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
             if action == "norm":
@@ -455,6 +546,7 @@ def handle_admin_callback_impl(
                     bot_token,
                     chat_id,
                     f"✅ Horario normal actualizado.\nApertura: {open_time}\nCierre: {close_time}\nÚltima hora de pedido: {last_time}",
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
@@ -483,6 +575,7 @@ def handle_admin_callback_impl(
                     bot_token,
                     chat_id,
                     f"✅ Cierre temprano configurado para hoy.\nCierre: {close_time}\nÚltima hora de pedido: {last_time}",
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
@@ -498,6 +591,7 @@ def handle_admin_callback_impl(
                     bot_token,
                     chat_id,
                     f"✅ Apertura tardía configurada para hoy.\nNueva apertura: {open_time}",
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
@@ -507,7 +601,12 @@ def handle_admin_callback_impl(
                 admin_set_today_open_override(orders_sh=orders_sh, open_time="", updated_by=updated_by)
                 admin_set_today_close_override(orders_sh=orders_sh, close_time="", updated_by=updated_by)
                 admin_set_today_last_order_override(orders_sh=orders_sh, last_order_time="", updated_by=updated_by)
-                telegram_send_text(bot_token, chat_id, "✅ Hoy quedó marcado como NO abrir.")
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "✅ Hoy quedó marcado como NO abrir.",
+                    reply_markup=admin_root_kb(),
+                )
                 return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
             if action == "openforce":
@@ -516,7 +615,12 @@ def handle_admin_callback_impl(
                 admin_set_today_open_override(orders_sh=orders_sh, open_time="", updated_by=updated_by)
                 admin_set_today_close_override(orders_sh=orders_sh, close_time="", updated_by=updated_by)
                 admin_set_today_last_order_override(orders_sh=orders_sh, last_order_time="", updated_by=updated_by)
-                telegram_send_text(bot_token, chat_id, "✅ Hoy quedó marcado como abrir excepcionalmente.")
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "✅ Hoy quedó marcado como abrir excepcionalmente.",
+                    reply_markup=admin_root_kb(),
+                )
                 return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
             return {"ok": True}
@@ -543,7 +647,12 @@ def handle_admin_callback_impl(
                 tmp.pop("admin_menu_price_sku", None)
                 tmp.pop("admin_menu_price_work", None)
                 tmp.pop("admin_menu_input_mode", None)
-                telegram_send_text(bot_token, chat_id, "Panel admin:", reply_markup=admin_fixed_kb())
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "🧭 PANEL ADMIN\n\nElige una opción:",
+                    reply_markup=admin_panel_kb(),
+                )
                 return {"ok": True}
 
             if action == "home":
@@ -551,7 +660,12 @@ def handle_admin_callback_impl(
 
             if action == "refresh":
                 invalidate_menu_cache(orders_sh)
-                telegram_send_text(bot_token, chat_id, "✅ Menú refrescado.")
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "✅ Menú refrescado.",
+                    reply_markup=admin_root_kb(),
+                )
                 return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
             if action == "catrefresh":
@@ -559,7 +673,12 @@ def handle_admin_callback_impl(
                 current_category = str(tmp.get("admin_menu_current_category") or "").strip()
                 if not current_category:
                     return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
-                telegram_send_text(bot_token, chat_id, "✅ Categoría refrescada.")
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "✅ Categoría refrescada.",
+                    reply_markup=admin_root_kb(),
+                )
                 return {"ok": send_admin_menu_category(bot_token, chat_id, tenant_id, orders_sh, sess, current_category)}
 
             if action == "cat" and len(parts) == 4:
@@ -599,6 +718,7 @@ def handle_admin_callback_impl(
                     bot_token,
                     chat_id,
                     f"✅ Estado actualizado.\nProducto: {item_after.get('name', '')}\nActivo: {'Sí' if item_after.get('active') else 'No'}",
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, sku)}
 
@@ -642,6 +762,7 @@ def handle_admin_callback_impl(
                     bot_token,
                     chat_id,
                     f"✅ Precio actualizado.\nSKU: {sku}\nNuevo precio: Bs {fmt_price_short(result.get('price', 0))}",
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, sku)}
 
@@ -672,6 +793,7 @@ def handle_admin_callback_impl(
                         "- 25 bs\n"
                         "- 25 bolivianos"
                     ),
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": True}
 
@@ -695,6 +817,7 @@ def handle_admin_callback_impl(
                         "- 15%\n"
                         "- 20 por ciento"
                     ),
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": True}
 
@@ -708,7 +831,8 @@ def handle_admin_callback_impl(
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    f"📷 Envía ahora la foto para:\n{item.get('name', '')}"
+                    f"📷 Envía ahora la foto para:\n{item.get('name', '')}",
+                    reply_markup=admin_root_kb(),
                 )
                 return {"ok": True}
 
@@ -726,5 +850,5 @@ def handle_admin_callback_impl(
             error=str(e),
         )
         alert_system_error(error=str(e), module="admin_callback")
-        telegram_send_text(bot_token, chat_id, "⚠️ Ocurrió un error en el panel admin.", reply_markup=admin_fixed_kb())
+        telegram_send_text(bot_token, chat_id, "⚠️ Ocurrió un error en el panel admin.", reply_markup=admin_root_kb())
         return {"ok": True}
