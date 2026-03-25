@@ -1,8 +1,7 @@
 # app/client_flow.py
 
-import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import HTTPException
 
@@ -30,7 +29,6 @@ from app.webhook_helpers import (
     fmt_snapshot_lines,
     build_order_recap_text,
     get_business_status_safe,
-    send_business_blocked_text,
     contact_link_for_admin,
     cart_kb,
     i_paid_kb,
@@ -47,279 +45,22 @@ from app.alerts import (
     alert_system_error,
 )
 from app.content import (
-    build_start_text,
     build_location_text,
     build_faq_text,
     build_survey_text,
-    load_content_map,
-    has_location,
-    has_faq,
-    has_survey,
 )
 from app.pickup import (
     generate_pickup_slots,
     build_pickup_slots_kb,
     build_pickup_offer_text,
 )
-
-
-def parse_manual_time_text(text: str) -> Optional[str]:
-    s = normalize(text or "").strip()
-    if not s:
-        return None
-
-    s = s.replace(".", ":")
-    s = re.sub(r"\s+", " ", s)
-
-    # 20:15 / 8:15 / 08:15 pm
-    m = re.match(r"^(\d{1,2}):(\d{2})(?:\s*(am|pm))?$", s)
-    if m:
-        hour = int(m.group(1))
-        minute = int(m.group(2))
-        suffix = m.group(3)
-
-        if minute < 0 or minute > 59:
-            return None
-
-        if suffix == "am":
-            if hour == 12:
-                hour = 0
-            elif hour < 1 or hour > 12:
-                return None
-        elif suffix == "pm":
-            if hour == 12:
-                hour = 12
-            elif 1 <= hour <= 11:
-                hour += 12
-            else:
-                return None
-        else:
-            if hour < 0 or hour > 23:
-                return None
-
-        return f"{hour:02d}:{minute:02d}"
-
-    # 2015
-    m = re.match(r"^(\d{2})(\d{2})$", s)
-    if m:
-        hour = int(m.group(1))
-        minute = int(m.group(2))
-        if 0 <= hour <= 23 and 0 <= minute <= 59:
-            return f"{hour:02d}:{minute:02d}"
-        return None
-
-    # 8 pm / 8am / 20h / 8 h / 20
-    m = re.match(r"^(\d{1,2})(?:\s*(am|pm|h))?$", s)
-    if m:
-        hour = int(m.group(1))
-        suffix = m.group(2)
-
-        if suffix == "am":
-            if hour == 12:
-                hour = 0
-            elif not (1 <= hour <= 12):
-                return None
-        elif suffix == "pm":
-            if hour == 12:
-                hour = 12
-            elif 1 <= hour <= 11:
-                hour += 12
-            else:
-                return None
-        else:
-            if not (0 <= hour <= 23):
-                return None
-
-        return f"{hour:02d}:00"
-
-    return None
-
-
-def build_dynamic_home_kb(content_map: Dict[str, str]):
-    rows = [
-        [("📋 Ver menú", "menu")],
-        [("🛒 Ver carrito", "cart")],
-    ]
-
-    if has_location(content_map):
-        rows.append([("📍 Ubicación", "location")])
-
-    rows.append([("⏰ Horarios", "hours")])
-
-    if has_faq(content_map):
-        rows.append([("❓ FAQ", "faq")])
-
-    if has_survey(content_map):
-        rows.append([("📝 Encuesta", "survey")])
-
-    return kb(rows)
-
-
-def _send_home(bot_token: str, chat_id: int, orders_sh) -> bool:
-    content_map = load_content_map(orders_sh)
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        build_start_text(orders_sh),
-        build_dynamic_home_kb(content_map),
-    )
-
-
-def _format_open_days(days: List[str]) -> str:
-    if not days:
-        return "No configurado"
-
-    alias_map = {
-        "MON": "Lunes",
-        "TUE": "Martes",
-        "WED": "Miércoles",
-        "THU": "Jueves",
-        "FRI": "Viernes",
-        "SAT": "Sábado",
-        "SUN": "Domingo",
-        "LUN": "Lunes",
-        "MAR": "Martes",
-        "MIE": "Miércoles",
-        "MIÉ": "Miércoles",
-        "JUE": "Jueves",
-        "VIE": "Viernes",
-        "SAB": "Sábado",
-        "SÁB": "Sábado",
-        "DOM": "Domingo",
-    }
-
-    normalized_days = []
-    seen = set()
-
-    for d in days:
-        d_norm = str(d or "").strip().upper()
-        if not d_norm:
-            continue
-        if d_norm in alias_map:
-            nice = alias_map[d_norm]
-            if nice not in seen:
-                seen.add(nice)
-                normalized_days.append(nice)
-
-    if normalized_days:
-        desired_order = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-        ordered_names = [name for name in desired_order if name in normalized_days]
-        return ", ".join(ordered_names)
-
-    return "No configurado"
-
-
-def _format_cart_detail_lines(cart: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str, Any]]) -> str:
-    lines: List[str] = []
-
-    for it in cart:
-        sku = str(it.get("sku") or "").strip()
-        if not sku or sku not in menu_idx:
-            continue
-
-        try:
-            qty = int(it.get("qty") or 0)
-        except Exception:
-            qty = 0
-
-        if qty <= 0:
-            continue
-
-        name = str(menu_idx[sku].get("name") or sku).strip()
-        unit_price = float(menu_idx[sku].get("price") or 0)
-        line_total = unit_price * qty
-
-        lines.append(f"• {qty} x {name} — Bs {line_total:.2f}")
-
-    return "\n".join(lines) if lines else "Tu carrito está vacío."
-
-
-def _send_category_products(
-    bot_token: str,
-    chat_id: int,
-    real_cat: str,
-    items: List[Dict[str, Any]],
-) -> None:
-    with_photo = []
-    without_photo = []
-
-    for it in items:
-        photo_url = str(it.get("photo_url") or "").strip()
-        photo_file_id = str(it.get("photo_file_id") or "").strip()
-        if photo_url or photo_file_id:
-            with_photo.append(it)
-        else:
-            without_photo.append(it)
-
-    telegram_send_text(bot_token, chat_id, f"🍽 {real_cat}")
-
-    for it in with_photo:
-        photo_url = str(it.get("photo_url") or "").strip()
-        photo_file_id = str(it.get("photo_file_id") or "").strip()
-        price_txt = f"{float(it['price']):.0f}"
-
-        reply_markup = kb([
-            [(f"⬆️ {it['name']} — Bs {price_txt}", f"prd|{it['sku']}")],
-        ])
-
-        if photo_url:
-            telegram_send_photo(
-                bot_token,
-                chat_id,
-                photo_url,
-                caption="",
-                reply_markup=reply_markup,
-            )
-        elif photo_file_id:
-            telegram_send_photo(
-                bot_token,
-                chat_id,
-                photo_file_id,
-                caption="",
-                reply_markup=reply_markup,
-            )
-
-    if without_photo:
-        rows = []
-        for it in without_photo[:25]:
-            rows.append([(f"{it['name']} — Bs {float(it['price']):.0f}", f"prd|{it['sku']}")])
-
-        telegram_send_text(
-            bot_token,
-            chat_id,
-            "Productos sin foto:",
-            kb(rows),
-        )
-
-    telegram_send_text(
-        bot_token,
-        chat_id,
-        "Otras opciones",
-        kb([
-            [("🛒 Carrito", "cart")],
-            [("⬅️ Categorías", "menu")],
-            [("🏠 Inicio", "home")],
-        ]),
-    )
-
-
-def client_orders_allowed_or_notify(bot_token: str, chat_id: int, orders_sh, tenant_tz: str) -> bool:
-    try:
-        bs = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
-        if bool(bs.get("accepts_orders_now")):
-            return True
-        telegram_send_text(bot_token, chat_id, send_business_blocked_text(bs))
-        return False
-    except Exception as e:
-        log_event(
-            "client_orders_allowed_check_error",
-            chat_id=chat_id,
-            error_type=type(e).__name__,
-            error=str(e),
-        )
-        alert_system_error(error=str(e), module="client_orders_allowed_or_notify")
-        telegram_send_text(bot_token, chat_id, "⚠️ Ocurrió un error verificando el horario del negocio.")
-        return False
+from app.client_time import parse_manual_time_text
+from app.client_ui import _send_home, _send_category_products
+from app.client_helpers import (
+    _format_open_days,
+    _format_cart_detail_lines,
+    client_orders_allowed_or_notify,
+)
 
 
 def handle_client_callback(
