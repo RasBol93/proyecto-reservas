@@ -1,4 +1,4 @@
-# app/admin_manual_order.py — versión completa compatible y optimizada
+# app/admin_manual_order.py — versión completa compatible, optimizada y con carrito editable
 
 from typing import Any, Dict, List, Tuple
 
@@ -13,10 +13,6 @@ from app.telegram_keyboard import kb
 from app.utils import normalize
 from app.webhook_helpers import fmt_price_short, fmt_snapshot_lines
 
-
-# -------------------------
-# Cache simple por sesión
-# -------------------------
 
 def _get_menu_cached(sess: Dict[str, Any], orders_sh):
     tmp = sess.setdefault("tmp", {})
@@ -44,10 +40,6 @@ def _clear_menu_cache(sess: Dict[str, Any]) -> None:
     sess.setdefault("tmp", {}).pop("admin_order_menu_cache", None)
 
 
-# -------------------------
-# Compat helpers esperados por otros módulos
-# -------------------------
-
 def _admin_order_reset(tmp: Dict[str, Any]) -> None:
     tmp.pop("admin_order_cart", None)
     tmp.pop("admin_order_step", None)
@@ -60,9 +52,6 @@ def _admin_order_reset(tmp: Dict[str, Any]) -> None:
 
 
 def _admin_order_get_active_categories(orders_sh) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]], List[str]]:
-    """
-    Mantiene compatibilidad con imports existentes.
-    """
     menu_idx = load_menu_admin_index(orders_sh, force=False)
     cats_raw = group_menu_admin_by_category(menu_idx)
 
@@ -75,10 +64,6 @@ def _admin_order_get_active_categories(orders_sh) -> Tuple[Dict[str, Any], Dict[
     cat_names = sorted(cats_active.keys(), key=lambda x: normalize(x))
     return menu_idx, cats_active, cat_names
 
-
-# -------------------------
-# Home
-# -------------------------
 
 def _admin_order_home_kb(tenant_id: str, cat_names: List[str], cats: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     rows: List[List[Tuple[str, str]]] = []
@@ -99,8 +84,7 @@ def _send_admin_order_home(
     orders_sh,
     sess: Dict[str, Any],
 ) -> bool:
-    menu_idx, cats, cat_names = _get_menu_cached(sess, orders_sh)
-
+    _, cats, cat_names = _get_menu_cached(sess, orders_sh)
     tmp = sess.setdefault("tmp", {})
     tmp["admin_order_categories"] = cat_names
     tmp.pop("admin_order_current_category", None)
@@ -117,10 +101,6 @@ def _send_admin_order_home(
         reply_markup=_admin_order_home_kb(tenant_id, cat_names, cats),
     )
 
-
-# -------------------------
-# Categoría
-# -------------------------
 
 def _admin_order_category_kb(tenant_id: str, category: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
     rows: List[List[Tuple[str, str]]] = []
@@ -164,10 +144,6 @@ def _send_admin_order_category(
     )
 
 
-# -------------------------
-# Cantidad
-# -------------------------
-
 def _admin_order_qty_kb(tenant_id: str, sku: str) -> Dict[str, Any]:
     return kb([
         [("1", f"admord|{tenant_id}|qty|{sku}|1"), ("2", f"admord|{tenant_id}|qty|{sku}|2"),
@@ -200,28 +176,73 @@ def _send_admin_order_product_qty(
     )
 
 
-# -------------------------
-# Carrito
-# -------------------------
-
 def _admin_order_add_to_cart(tmp: Dict[str, Any], sku: str, qty: int) -> None:
     cart = tmp.get("admin_order_cart") or []
     found = False
-
     for it in cart:
         if str(it.get("sku") or "").strip() == sku:
             it["qty"] = int(it.get("qty") or 0) + qty
             found = True
             break
-
     if not found:
         cart.append({"sku": sku, "qty": qty})
-
     tmp["admin_order_cart"] = cart
 
 
-def _admin_order_cart_kb(tenant_id: str, has_items: bool) -> Dict[str, Any]:
+def _admin_order_inc_item(tmp: Dict[str, Any], sku: str) -> None:
+    cart = tmp.get("admin_order_cart") or []
+    for it in cart:
+        if str(it.get("sku") or "").strip() == sku:
+            it["qty"] = max(1, int(it.get("qty") or 1) + 1)
+            break
+    tmp["admin_order_cart"] = cart
+
+
+def _admin_order_dec_item(tmp: Dict[str, Any], sku: str) -> None:
+    cart = tmp.get("admin_order_cart") or []
+    new_cart = []
+    for it in cart:
+        if str(it.get("sku") or "").strip() == sku:
+            new_qty = int(it.get("qty") or 1) - 1
+            if new_qty > 0:
+                it["qty"] = new_qty
+                new_cart.append(it)
+        else:
+            new_cart.append(it)
+    tmp["admin_order_cart"] = new_cart
+
+
+def _admin_order_remove_item(tmp: Dict[str, Any], sku: str) -> None:
+    cart = tmp.get("admin_order_cart") or []
+    tmp["admin_order_cart"] = [it for it in cart if str(it.get("sku") or "").strip() != sku]
+
+
+def _admin_order_time_choice_kb(tenant_id: str) -> Dict[str, Any]:
+    return kb([
+        [("🕒 Ahora", f"admord|{tenant_id}|timenow")],
+        [("⏰ Más tarde", f"admord|{tenant_id}|timelater")],
+        [("🛒 Volver al carrito", f"admord|{tenant_id}|cart")],
+        [("❌ Cancelar", f"admord|{tenant_id}|panel")],
+    ])
+
+
+def _admin_order_cart_kb(tenant_id: str, items_snapshot: List[Dict[str, Any]], has_items: bool) -> Dict[str, Any]:
     rows: List[List[Tuple[str, str]]] = []
+
+    for it in items_snapshot:
+        sku = str(it.get("sku") or "").strip()
+        name = str(it.get("name") or sku).strip()
+        try:
+            qty = int(it.get("qty") or 1)
+        except Exception:
+            qty = 1
+
+        rows.append([(f"{name} x{qty}", f"admord|{tenant_id}|noop")])
+        rows.append([
+            ("➖", f"admord|{tenant_id}|dec|{sku}"),
+            ("➕", f"admord|{tenant_id}|inc|{sku}"),
+            ("🗑", f"admord|{tenant_id}|rem|{sku}"),
+        ])
 
     if has_items:
         rows.append([("✅ Confirmar pedido", f"admord|{tenant_id}|confirm")])
@@ -248,14 +269,14 @@ def _send_admin_order_cart(
 
     msg = (
         "🛒 PEDIDO MANUAL\n\n"
-        f"Cantidad total: {total_qty}\n"
-        f"Total: Bs {total:.2f}\n\n"
-        f"Detalle:\n{lines_txt}"
+        f"{lines_txt}\n\n"
+        f"Resumen: {total_qty}\n"
+        f"Total: Bs {total:.2f}"
     )
 
     return telegram_send_text(
         bot_token,
         chat_id,
         msg,
-        reply_markup=_admin_order_cart_kb(tenant_id, total_qty > 0),
+        reply_markup=_admin_order_cart_kb(tenant_id, items_snapshot, total_qty > 0),
     )
