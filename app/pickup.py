@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import re
-from datetime import datetime, timedelta, time
+import secrets
+from datetime import datetime, timedelta, time, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
 from app.telegram_keyboard import kb
-from app.utils import normalize, to_bool, log_event
+from app.utils import normalize, to_bool
 from app.webhook_helpers import get_business_status_safe
 
 
@@ -20,13 +22,26 @@ ORDERS_SHEET_CANDIDATES = ["Orders", "ORDERS"]
 DEFAULT_TIEMPO_MINIMO_PREPARACION_MINUTOS = 20
 DEFAULT_INTERVALO_HORARIOS_RECOJO_MINUTOS = 15
 DEFAULT_MAXIMO_PEDIDOS_POR_HORARIO = 3
+DEFAULT_BLOQUEO_MINUTOS = 5
 HORIZONTE_MINUTOS_DEFAULT = 120
+
+ESTADOS_DEFINITIVOS_OCUPAN = {
+    "PAID",
+    "CONFIRMED",
+    "CONFIRMADO",
+    "PREPARING",
+    "EN_PREPARACION",
+    "READY",
+    "LISTO",
+}
 
 ESTADOS_NO_CONTAR = {
     "CANCELLED",
     "CANCELED",
     "REJECTED",
     "DECLINED",
+    "HOLD_EXPIRED",
+    "EXPIRED",
 }
 
 
@@ -51,6 +66,23 @@ def _now_local(tz_name: str) -> datetime:
         return datetime.now(ZoneInfo(tz_name or "America/La_Paz"))
     except Exception:
         return datetime.now()
+
+
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_datetime(v: str) -> Optional[datetime]:
+    s = _safe_str(v)
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
 
 
 def _parse_hhmm(v: str) -> Optional[time]:
@@ -96,47 +128,6 @@ def _round_up_datetime(dt: datetime, interval_minutes: int) -> datetime:
     if day_shift:
         out = out + timedelta(days=day_shift)
     return out
-
-
-def _open_days_to_spanish(days: List[str]) -> str:
-    alias_map = {
-        "MON": "Lunes",
-        "TUE": "Martes",
-        "WED": "Miércoles",
-        "THU": "Jueves",
-        "FRI": "Viernes",
-        "SAT": "Sábado",
-        "SUN": "Domingo",
-        "LUN": "Lunes",
-        "MAR": "Martes",
-        "MIE": "Miércoles",
-        "MIÉ": "Miércoles",
-        "JUE": "Jueves",
-        "VIE": "Viernes",
-        "SAB": "Sábado",
-        "SÁB": "Sábado",
-        "DOM": "Domingo",
-        "lun": "Lunes",
-        "mar": "Martes",
-        "mie": "Miércoles",
-        "mié": "Miércoles",
-        "jue": "Jueves",
-        "vie": "Viernes",
-        "sab": "Sábado",
-        "sáb": "Sábado",
-        "dom": "Domingo",
-    }
-
-    desired_order = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-    found: List[str] = []
-
-    for d in days or []:
-        x = alias_map.get(_safe_str(d), alias_map.get(_safe_str(d).upper()))
-        if x and x not in found:
-            found.append(x)
-
-    ordered = [d for d in desired_order if d in found]
-    return ", ".join(ordered) if ordered else "No configurado"
 
 
 # =========================================================
@@ -215,11 +206,12 @@ def get_pickup_config(orders_sh) -> Dict[str, int]:
         "tiempo_minimo_preparacion_minutos": tiempo_minimo_preparacion_minutos,
         "intervalo_horarios_recojo_minutos": intervalo_horarios_recojo_minutos,
         "maximo_pedidos_por_horario": maximo_pedidos_por_horario,
+        "bloqueo_minutos": DEFAULT_BLOQUEO_MINUTOS,
     }
 
 
 # =========================================================
-# Lectura de Orders y conteo por horario
+# Orders helpers
 # =========================================================
 
 def _get_orders_ws(orders_sh):
@@ -261,12 +253,47 @@ def _load_orders_records(orders_sh) -> List[Dict[str, str]]:
     return out
 
 
+def _get_orders_header(orders_sh) -> List[str]:
+    ws = _get_orders_ws(orders_sh)
+    return [str(x or "").strip() for x in ws.row_values(1)]
+
+
+def _find_col_idx(header: List[str], col_name: str) -> Optional[int]:
+    for i, h in enumerate(header):
+        if str(h or "").strip() == str(col_name or "").strip():
+            return i
+    return None
+
+
+def _build_row_by_header(header: List[str], data: Dict[str, Any]) -> List[str]:
+    row = [""] * len(header)
+    for k, v in (data or {}).items():
+        idx = _find_col_idx(header, k)
+        if idx is None:
+            continue
+        if isinstance(v, (dict, list)):
+            row[idx] = json.dumps(v, ensure_ascii=False)
+        elif v is None:
+            row[idx] = ""
+        else:
+            row[idx] = str(v)
+    return row
+
+
+def _append_order_like_row(orders_sh, data: Dict[str, Any]) -> None:
+    ws = _get_orders_ws(orders_sh)
+    header = _get_orders_header(orders_sh)
+    if not header:
+        raise HTTPException(status_code=500, detail="ORDERS header row missing")
+    row = _build_row_by_header(header, data)
+    ws.append_row(row, value_input_option="RAW")
+
+
 def _extract_slot_hhmm(requested_time: str) -> Optional[str]:
     s = _safe_str(requested_time)
     if not s:
         return None
 
-    # Si viene "Lo antes posible (18:30)" o parecido
     m = re.search(r"(\d{1,2}:\d{2})", s)
     if m:
         hhmm = m.group(1)
@@ -275,24 +302,64 @@ def _extract_slot_hhmm(requested_time: str) -> Optional[str]:
     return None
 
 
+def _parse_hold_notes(notes: str) -> Dict[str, Any]:
+    s = _safe_str(notes)
+    if not s:
+        return {}
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def _is_active_hold(row: Dict[str, str], now_utc: datetime) -> bool:
+    status = _safe_str(row.get("status")).upper()
+    if status != "HOLD":
+        return False
+
+    meta = _parse_hold_notes(row.get("notes"))
+    expires_at_raw = _safe_str(meta.get("hold_expires_at"))
+    dt = _parse_iso_datetime(expires_at_raw)
+    if not dt:
+        return False
+
+    return dt > now_utc
+
+
+def _build_slot_counter(rows: List[Dict[str, str]]) -> Dict[str, int]:
+    now_utc = datetime.now(timezone.utc)
+    counter: Dict[str, int] = {}
+
+    for r in rows:
+        status = _safe_str(r.get("status")).upper()
+
+        hhmm = _extract_slot_hhmm(r.get("requested_time"))
+        if not hhmm:
+            continue
+
+        if status in ESTADOS_NO_CONTAR:
+            continue
+
+        if status in ESTADOS_DEFINITIVOS_OCUPAN:
+            counter[hhmm] = counter.get(hhmm, 0) + 1
+            continue
+
+        if _is_active_hold(r, now_utc):
+            counter[hhmm] = counter.get(hhmm, 0) + 1
+            continue
+
+    return counter
+
+
 def count_orders_for_slot(orders_sh, slot_hhmm: str) -> int:
     slot_hhmm = _safe_str(slot_hhmm)
     if not _parse_hhmm(slot_hhmm):
         return 0
 
-    count = 0
     rows = _load_orders_records(orders_sh)
-
-    for r in rows:
-        status = _safe_str(r.get("status")).upper()
-        if status in ESTADOS_NO_CONTAR:
-            continue
-
-        requested_time = _extract_slot_hhmm(r.get("requested_time"))
-        if requested_time == slot_hhmm:
-            count += 1
-
-    return count
+    counter = _build_slot_counter(rows)
+    return counter.get(slot_hhmm, 0)
 
 
 # =========================================================
@@ -311,7 +378,6 @@ def parse_manual_time_text(text: str) -> Optional[str]:
     s = s.replace("pm", " pm")
     s = re.sub(r"\s+", " ", s).strip()
 
-    # 20:15 / 8:15
     m = re.fullmatch(r"(\d{1,2}):(\d{2})(?:\s*(am|pm))?", s)
     if m:
         hh = int(m.group(1))
@@ -327,7 +393,6 @@ def parse_manual_time_text(text: str) -> Optional[str]:
             return f"{hh:02d}:{mm:02d}"
         return None
 
-    # 2015 / 815
     m = re.fullmatch(r"(\d{3,4})", s)
     if m:
         raw = m.group(1)
@@ -341,7 +406,6 @@ def parse_manual_time_text(text: str) -> Optional[str]:
             return f"{hh:02d}:{mm:02d}"
         return None
 
-    # 8 pm / 20
     m = re.fullmatch(r"(\d{1,2})(?:\s*(am|pm))?", s)
     if m:
         hh = int(m.group(1))
@@ -360,7 +424,7 @@ def parse_manual_time_text(text: str) -> Optional[str]:
 
 
 # =========================================================
-# Validaciones de horario
+# Ventana de negocio
 # =========================================================
 
 def _get_today_business_window(orders_sh, tenant_tz: str) -> Dict[str, Any]:
@@ -369,7 +433,6 @@ def _get_today_business_window(orders_sh, tenant_tz: str) -> Dict[str, Any]:
     open_time = _safe_str(bs.get("open_time"))
     close_time = _safe_str(bs.get("close_time"))
     last_order_time = _safe_str(bs.get("last_order_time"))
-    weekly_open_days = bs.get("weekly_open_days") or []
 
     if not open_time or not close_time or not last_order_time:
         raise HTTPException(status_code=500, detail="Horario del negocio incompleto")
@@ -388,12 +451,15 @@ def _get_today_business_window(orders_sh, tenant_tz: str) -> Dict[str, Any]:
         "open_dt": _time_to_datetime(now_local, open_t),
         "close_dt": _time_to_datetime(now_local, close_t),
         "last_order_dt": _time_to_datetime(now_local, last_t),
-        "weekly_open_days": weekly_open_days,
         "open_time": open_time,
         "close_time": close_time,
         "last_order_time": last_order_time,
     }
 
+
+# =========================================================
+# Validación / generación de horarios visibles
+# =========================================================
 
 def validate_pickup_hhmm(orders_sh, tenant_tz: str, hhmm: str) -> Dict[str, Any]:
     cfg = get_pickup_config(orders_sh)
@@ -428,11 +494,14 @@ def validate_pickup_hhmm(orders_sh, tenant_tz: str, hhmm: str) -> Dict[str, Any]
             "message": f"Esa hora supera la última hora de pedido de hoy ({ctx['last_order_time']}).",
         }
 
-    ocupados = count_orders_for_slot(orders_sh, hhmm)
+    rows = _load_orders_records(orders_sh)
+    counter = _build_slot_counter(rows)
+    ocupados = counter.get(hhmm, 0)
+
     if ocupados >= cfg["maximo_pedidos_por_horario"]:
         return {
             "ok": False,
-            "message": f"Ese horario ya está completo. Elige otro por favor.",
+            "message": f"Ese horario ya no está disponible. Elige otro por favor.",
         }
 
     return {
@@ -441,10 +510,6 @@ def validate_pickup_hhmm(orders_sh, tenant_tz: str, hhmm: str) -> Dict[str, Any]
         "ocupados": ocupados,
     }
 
-
-# =========================================================
-# Generación de opciones propuestas
-# =========================================================
 
 def generate_pickup_slots(
     orders_sh,
@@ -466,6 +531,9 @@ def generate_pickup_slots(
             "slots": [],
             "config": cfg,
         }
+
+    rows = _load_orders_records(orders_sh)
+    counter = _build_slot_counter(rows)
 
     earliest_dt = _round_up_datetime(
         now_local + timedelta(minutes=cfg["tiempo_minimo_preparacion_minutos"]),
@@ -491,7 +559,6 @@ def generate_pickup_slots(
         end_dt = last_order_dt
 
     slots: List[Dict[str, Any]] = []
-
     current = earliest_dt
     seen = set()
 
@@ -500,12 +567,12 @@ def generate_pickup_slots(
 
         if hhmm not in seen:
             seen.add(hhmm)
-            ocupados = count_orders_for_slot(orders_sh, hhmm)
+            ocupados = counter.get(hhmm, 0)
             lleno = ocupados >= cfg["maximo_pedidos_por_horario"]
 
             if not lleno:
                 if not slots:
-                    label = f"Lo antes posible ({hhmm})"
+                    label = f"Ahora {hhmm}"
                     slot_id = "pickup|asap"
                 else:
                     label = hhmm
@@ -526,8 +593,8 @@ def generate_pickup_slots(
         return {
             "ok": False,
             "message": (
-                "Lo sentimos, por hoy ya no quedan horarios disponibles dentro del tiempo permitido. "
-                "Por favor vuelve mañana."
+                "Lo sentimos, por ahora ya no quedan horarios disponibles. "
+                "Por favor intenta nuevamente más tarde."
             ),
             "slots": [],
             "config": cfg,
@@ -538,7 +605,6 @@ def generate_pickup_slots(
         "message": "Elige una hora de recojo:",
         "slots": slots,
         "config": cfg,
-        "weekly_open_days_text": _open_days_to_spanish(ctx["weekly_open_days"]),
         "open_time": ctx["open_time"],
         "close_time": ctx["close_time"],
         "last_order_time": ctx["last_order_time"],
@@ -549,8 +615,12 @@ def generate_pickup_slots(
 def build_pickup_slots_kb(tenant_id: str, slots: List[Dict[str, Any]]) -> Dict[str, Any]:
     rows: List[List[Tuple[str, str]]] = []
 
+    if slots:
+        first = slots[0]
+        rows.append([(first["label"], first["id"])])
+
     current_row: List[Tuple[str, str]] = []
-    for s in slots:
+    for s in slots[1:]:
         current_row.append((s["label"], s["id"]))
         if len(current_row) == 2:
             rows.append(current_row)
@@ -566,32 +636,163 @@ def build_pickup_slots_kb(tenant_id: str, slots: List[Dict[str, Any]]) -> Dict[s
     return kb(rows)
 
 
-# =========================================================
-# Mensajes listos para usar en el flujo
-# =========================================================
-
 def build_pickup_offer_text(data: Dict[str, Any]) -> str:
     if not data.get("ok"):
         return _safe_str(data.get("message")) or "No hay horarios disponibles."
+
+    open_time = _safe_str(data.get("open_time"))
+    close_time = _safe_str(data.get("close_time"))
+    last_order_time = _safe_str(data.get("last_order_time"))
+    bloqueo_minutos = int((data.get("config") or {}).get("bloqueo_minutos") or DEFAULT_BLOQUEO_MINUTOS)
 
     parts = [
         "🕒 Hora de recojo",
         _safe_str(data.get("message")) or "Elige una hora de recojo:",
     ]
 
-    weekly_text = _safe_str(data.get("weekly_open_days_text"))
-    if weekly_text:
-        parts.append(f"Días regulares: {weekly_text}")
-
-    open_time = _safe_str(data.get("open_time"))
-    close_time = _safe_str(data.get("close_time"))
-    last_order_time = _safe_str(data.get("last_order_time"))
-
     if open_time and close_time:
-        parts.append(f"Horario regular: {open_time} - {close_time}")
+        parts.append(f"Horario: {open_time} - {close_time}")
     if last_order_time:
         parts.append(f"Última hora de pedido: {last_order_time}")
 
-    parts.append("También puedes tocar “Más tarde” y escribir otra hora manualmente.")
+    parts.append(
+        f"ℹ️ Cuando elijas una hora, quedará bloqueada para ti por {bloqueo_minutos} minutos mientras realizas el pago."
+    )
+    parts.append(
+        "El horario se confirma definitivamente cuando tu pago sea validado."
+    )
+    parts.append(
+        "Si no pagas dentro del tiempo, el horario se libera automáticamente."
+    )
 
     return "\n\n".join(parts)
+
+
+# =========================================================
+# Bloqueo temporal (5 min)
+# =========================================================
+
+def _build_hold_notes(
+    hold_expires_at: str,
+    hold_for_chat_id: str,
+    hold_for_tenant_id: str,
+) -> str:
+    return json.dumps(
+        {
+            "hold_expires_at": hold_expires_at,
+            "hold_for_chat_id": hold_for_chat_id,
+            "hold_for_tenant_id": hold_for_tenant_id,
+        },
+        ensure_ascii=False,
+    )
+
+
+def acquire_pickup_hold(
+    orders_sh,
+    tenant_id: str,
+    tenant_tz: str,
+    client_chat_id: str,
+    hhmm: str,
+    hold_minutes: int = DEFAULT_BLOQUEO_MINUTOS,
+) -> Dict[str, Any]:
+    hhmm = _safe_str(hhmm)
+    client_chat_id = _safe_str(client_chat_id)
+
+    validation = validate_pickup_hhmm(orders_sh=orders_sh, tenant_tz=tenant_tz, hhmm=hhmm)
+    if not validation.get("ok"):
+        return validation
+
+    hold_expires_at = datetime.now(timezone.utc) + timedelta(minutes=max(1, hold_minutes))
+    hold_expires_at_iso = hold_expires_at.isoformat()
+
+    hold_id = f"hold_{secrets.token_hex(4)}"
+
+    data = {
+        "order_id": hold_id,
+        "created_at": _now_utc_iso(),
+        "tenant_id": tenant_id,
+        "customer_name": "",
+        "customer_contact": client_chat_id,
+        "customer_telegram_chat_id": client_chat_id,
+        "items": "",
+        "items_snapshot": "",
+        "currency": "BOB",
+        "pricing_version": "hold_v1",
+        "notes": _build_hold_notes(
+            hold_expires_at=hold_expires_at_iso,
+            hold_for_chat_id=client_chat_id,
+            hold_for_tenant_id=tenant_id,
+        ),
+        "delivery_type": "pickup",
+        "requested_time": hhmm,
+        "status": "HOLD",
+        "source": "telegram_hold",
+        "total_amount": 0,
+        "payment_proof_file_id": "",
+        "payment_confirmed_at": "",
+        "payment_proof_type": "",
+        "payment_proof_caption": "",
+    }
+
+    _append_order_like_row(orders_sh, data)
+
+    return {
+        "ok": True,
+        "hold_id": hold_id,
+        "hhmm": hhmm,
+        "hold_expires_at": hold_expires_at_iso,
+        "hold_minutes": hold_minutes,
+        "message": (
+            f"Hora {hhmm} bloqueada para ti por {hold_minutes} minutos. "
+            "Completa el pago para confirmarla."
+        ),
+    }
+
+
+# =========================================================
+# Confirmación final del horario al pagar
+# =========================================================
+
+def find_next_available_slot(
+    orders_sh,
+    tenant_tz: str,
+    start_hhmm: str,
+    horizonte_minutos: int = HORIZONTE_MINUTOS_DEFAULT,
+) -> Dict[str, Any]:
+    data = generate_pickup_slots(
+        orders_sh=orders_sh,
+        tenant_tz=tenant_tz,
+        horizonte_minutos=horizonte_minutos,
+    )
+
+    if not data.get("ok"):
+        return data
+
+    slots = data.get("slots") or []
+    if not slots:
+        return {"ok": False, "message": "No hay horarios disponibles."}
+
+    start_t = _parse_hhmm(start_hhmm)
+    if not start_t:
+        return {"ok": False, "message": "Hora inicial inválida."}
+
+    start_minutes = start_t.hour * 60 + start_t.minute
+
+    best = None
+    best_minutes = None
+
+    for s in slots:
+        hhmm = _safe_str(s.get("hhmm"))
+        t = _parse_hhmm(hhmm)
+        if not t:
+            continue
+        mins = t.hour * 60 + t.minute
+        if mins >= start_minutes:
+            if best is None or mins < best_minutes:
+                best = s
+                best_minutes = mins
+
+    if best:
+        return {"ok": True, "slot": best}
+
+    return {"ok": False, "message": "No hay una siguiente hora disponible."}
