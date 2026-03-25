@@ -58,8 +58,10 @@ from app.content import (
 from app.pickup import (
     generate_pickup_slots,
     build_pickup_slots_kb,
+    build_pickup_offer_text,
     validate_pickup_hhmm,
     parse_manual_time_text,
+    acquire_pickup_hold,
 )
 
 
@@ -229,28 +231,6 @@ def _send_category_products(
             [("🏠 Inicio", "home")],
         ]),
     )
-
-
-def _build_pickup_offer_text_clean(pickup_data: Dict[str, Any]) -> str:
-    if not pickup_data.get("ok"):
-        return pickup_data.get("message") or "No hay horarios disponibles."
-
-    parts = [
-        "🕒 Hora de recojo",
-        pickup_data.get("message") or "Elige una hora de recojo:",
-    ]
-
-    open_time = str(pickup_data.get("open_time") or "").strip()
-    close_time = str(pickup_data.get("close_time") or "").strip()
-    last_order_time = str(pickup_data.get("last_order_time") or "").strip()
-
-    if open_time and close_time:
-        parts.append(f"Horario regular: {open_time} - {close_time}")
-    if last_order_time:
-        parts.append(f"Última hora de pedido: {last_order_time}")
-
-    parts.append("También puedes tocar “Más tarde” y escribir otra hora manualmente.")
-    return "\n\n".join(parts)
 
 
 def client_orders_allowed_or_notify(bot_token: str, chat_id: int, orders_sh, tenant_tz: str) -> bool:
@@ -538,7 +518,7 @@ def handle_client_callback(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                _build_pickup_offer_text_clean(pickup_data),
+                build_pickup_offer_text(pickup_data),
                 reply_markup=build_pickup_slots_kb(tenant_id, pickup_data["slots"]),
             )
             return {"ok": True}
@@ -554,14 +534,33 @@ def handle_client_callback(
                 return {"ok": True}
 
             chosen_hhmm = pickup_data["slots"][0]["hhmm"]
+
+            hold = acquire_pickup_hold(
+                orders_sh=orders_sh,
+                tenant_id=tenant_id,
+                tenant_tz=tenant_tz,
+                client_chat_id=str(chat_id),
+                hhmm=chosen_hhmm,
+            )
+
+            if not hold.get("ok"):
+                telegram_send_text(bot_token, chat_id, hold.get("message") or "Ese horario ya no está disponible.")
+                return {"ok": True}
+
             sess["tmp"]["pickup_time_hhmm"] = chosen_hhmm
-            sess["tmp"]["pickup_time_label"] = f"Lo antes posible ({chosen_hhmm})"
+            sess["tmp"]["pickup_time_label"] = chosen_hhmm
+            sess["tmp"]["pickup_hold_id"] = str(hold.get("hold_id") or "")
+            sess["tmp"]["pickup_hold_expires_at"] = str(hold.get("hold_expires_at") or "")
             sess["stage"] = "awaiting_name"
 
             telegram_send_text(
                 bot_token,
                 chat_id,
-                f"Perfecto. Hora de recojo elegida: *Lo antes posible ({chosen_hhmm})*\n\nAhora dime tu *nombre* para el pedido.",
+                (
+                    f"Perfecto. Hora de recojo elegida: *{chosen_hhmm}*\n\n"
+                    "Ese horario quedó bloqueado temporalmente para ti por *5 minutos* mientras realizas el pago.\n"
+                    "Ahora dime tu *nombre* para el pedido."
+                ),
                 parse_mode="Markdown",
             )
             return {"ok": True}
@@ -577,20 +576,32 @@ def handle_client_callback(
                 return {"ok": True}
 
             hhmm = f"{compact[:2]}:{compact[2:]}"
-            validation = validate_pickup_hhmm(orders_sh=orders_sh, tenant_tz=tenant_tz, hhmm=hhmm)
+            hold = acquire_pickup_hold(
+                orders_sh=orders_sh,
+                tenant_id=tenant_id,
+                tenant_tz=tenant_tz,
+                client_chat_id=str(chat_id),
+                hhmm=hhmm,
+            )
 
-            if not validation.get("ok"):
-                telegram_send_text(bot_token, chat_id, validation.get("message") or "Ese horario ya no está disponible.")
+            if not hold.get("ok"):
+                telegram_send_text(bot_token, chat_id, hold.get("message") or "Ese horario ya no está disponible.")
                 return {"ok": True}
 
             sess["tmp"]["pickup_time_hhmm"] = hhmm
             sess["tmp"]["pickup_time_label"] = hhmm
+            sess["tmp"]["pickup_hold_id"] = str(hold.get("hold_id") or "")
+            sess["tmp"]["pickup_hold_expires_at"] = str(hold.get("hold_expires_at") or "")
             sess["stage"] = "awaiting_name"
 
             telegram_send_text(
                 bot_token,
                 chat_id,
-                f"Perfecto. Hora de recojo elegida: *{hhmm}*\n\nAhora dime tu *nombre* para el pedido.",
+                (
+                    f"Perfecto. Hora de recojo elegida: *{hhmm}*\n\n"
+                    "Ese horario quedó bloqueado temporalmente para ti por *5 minutos* mientras realizas el pago.\n"
+                    "Ahora dime tu *nombre* para el pedido."
+                ),
                 parse_mode="Markdown",
             )
             return {"ok": True}
@@ -885,24 +896,32 @@ def handle_client_message(
                 )
                 return {"ok": True}
 
-            validation = validate_pickup_hhmm(
+            hold = acquire_pickup_hold(
                 orders_sh=orders_sh,
+                tenant_id=tenant_id,
                 tenant_tz=tenant_tz,
+                client_chat_id=str(chat_id),
                 hhmm=parsed_hhmm,
             )
 
-            if not validation.get("ok"):
-                telegram_send_text(bot_token, chat_id, validation.get("message") or "Ese horario no está disponible.")
+            if not hold.get("ok"):
+                telegram_send_text(bot_token, chat_id, hold.get("message") or "Ese horario no está disponible.")
                 return {"ok": True}
 
             sess["tmp"]["pickup_time_hhmm"] = parsed_hhmm
             sess["tmp"]["pickup_time_label"] = parsed_hhmm
+            sess["tmp"]["pickup_hold_id"] = str(hold.get("hold_id") or "")
+            sess["tmp"]["pickup_hold_expires_at"] = str(hold.get("hold_expires_at") or "")
             sess["stage"] = "awaiting_name"
 
             telegram_send_text(
                 bot_token,
                 chat_id,
-                f"Perfecto. Hora de recojo elegida: *{parsed_hhmm}*\n\nAhora dime tu *nombre* para el pedido.",
+                (
+                    f"Perfecto. Hora de recojo elegida: *{parsed_hhmm}*\n\n"
+                    "Ese horario quedó bloqueado temporalmente para ti por *5 minutos* mientras realizas el pago.\n"
+                    "Ahora dime tu *nombre* para el pedido."
+                ),
                 parse_mode="Markdown",
             )
             return {"ok": True}
@@ -946,33 +965,6 @@ def handle_client_message(
             if not customer_name:
                 sess["stage"] = "awaiting_name"
                 telegram_send_text(bot_token, chat_id, "Primero dime tu nombre.")
-                return {"ok": True}
-
-            validation = validate_pickup_hhmm(
-                orders_sh=orders_sh,
-                tenant_tz=tenant_tz,
-                hhmm=pickup_time_hhmm,
-            )
-
-            if not validation.get("ok"):
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    (validation.get("message") or "Ese horario ya no está disponible.") + "\n\nPor favor elige otro horario.",
-                )
-                sess["stage"] = "awaiting_pickup_time"
-
-                pickup_data = generate_pickup_slots(
-                    orders_sh=orders_sh,
-                    tenant_tz=tenant_tz,
-                )
-                if pickup_data.get("ok"):
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        _build_pickup_offer_text_clean(pickup_data),
-                        reply_markup=build_pickup_slots_kb(tenant_id, pickup_data["slots"]),
-                    )
                 return {"ok": True}
 
             try:
