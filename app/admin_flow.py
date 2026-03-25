@@ -1,9 +1,6 @@
 # app/admin_flow.py
 
-import json
-import re
-from datetime import datetime, timedelta, time, timezone
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple
 
 from fastapi import HTTPException
 
@@ -80,30 +77,6 @@ from app.alerts import (
     alert_tenant_error,
     alert_system_error,
 )
-from app.pickup import get_pickup_config
-
-
-PICKUP_HOLD_STATUS = "HOLD"
-PICKUP_HOLD_RELEASED_STATUS = "HOLD_EXPIRED"
-
-ESTADOS_DEFINITIVOS_OCUPAN = {
-    "PAID",
-    "CONFIRMED",
-    "CONFIRMADO",
-    "PREPARING",
-    "EN_PREPARACION",
-    "READY",
-    "LISTO",
-}
-
-ESTADOS_NO_CONTAR = {
-    "CANCELLED",
-    "CANCELED",
-    "REJECTED",
-    "DECLINED",
-    "HOLD_EXPIRED",
-    "EXPIRED",
-}
 
 
 def _safe_str(v: Any) -> str:
@@ -122,350 +95,13 @@ def _safe_client_chat_id_from_order(order: Dict[str, Any]) -> str:
     return ""
 
 
-def _parse_iso_datetime(v: str) -> Optional[datetime]:
-    s = _safe_str(v)
-    if not s:
-        return None
-    try:
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            return dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
-
-
-def _parse_hhmm(v: str) -> Optional[time]:
-    s = _safe_str(v)
-    if not s:
-        return None
-
-    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
-    if not m:
-        return None
-
-    hh = int(m.group(1))
-    mm = int(m.group(2))
-    if hh < 0 or hh > 23 or mm < 0 or mm > 59:
-        return None
-
-    return time(hour=hh, minute=mm)
-
-
-def _format_hhmm(dt: datetime) -> str:
-    return dt.strftime("%H:%M")
-
-
-def _time_to_datetime(base_dt: datetime, t: time) -> datetime:
-    return base_dt.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
-
-
-def _round_up_datetime(dt: datetime, interval_minutes: int) -> datetime:
-    if interval_minutes <= 0:
-        return dt.replace(second=0, microsecond=0)
-
-    base = dt.replace(second=0, microsecond=0)
-    minutes_total = base.hour * 60 + base.minute
-    rounded_total = ((minutes_total + interval_minutes - 1) // interval_minutes) * interval_minutes
-
-    day_shift = rounded_total // (24 * 60)
-    rounded_total = rounded_total % (24 * 60)
-
-    hh = rounded_total // 60
-    mm = rounded_total % 60
-
-    out = base.replace(hour=hh, minute=mm)
-    if day_shift:
-        out = out + timedelta(days=day_shift)
-    return out
-
-
-def _extract_slot_hhmm(requested_time: str) -> Optional[str]:
+def _extract_slot_hhmm(requested_time: str) -> str:
     s = _safe_str(requested_time)
     if not s:
-        return None
-
+        return ""
+    import re
     m = re.search(r"(\d{1,2}:\d{2})", s)
-    if m:
-        hhmm = m.group(1)
-        return hhmm if _parse_hhmm(hhmm) else None
-
-    return None
-
-
-def _get_orders_ws(orders_sh):
-    for title in ["ORDERS", "Orders"]:
-        try:
-            return orders_sh.worksheet(title)
-        except Exception:
-            pass
-    try:
-        return orders_sh.get_worksheet(0)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Orders worksheet not found: {e}")
-
-
-def _get_header(ws) -> List[str]:
-    return [str(x or "").strip() for x in ws.row_values(1)]
-
-
-def _find_col_idx(header: List[str], col_name: str) -> Optional[int]:
-    for i, h in enumerate(header):
-        if str(h or "").strip() == str(col_name or "").strip():
-            return i
-    return None
-
-
-def _iter_rows_as_dicts(ws) -> List[Dict[str, Any]]:
-    header = _get_header(ws)
-    if not header:
-        return []
-    values = ws.get_all_values()
-    if len(values) <= 1:
-        return []
-
-    out: List[Dict[str, Any]] = []
-    for r in values[1:]:
-        if not any(str(x).strip() for x in r):
-            continue
-        d: Dict[str, Any] = {}
-        for i, h in enumerate(header):
-            d[h] = r[i] if i < len(r) else ""
-        out.append(d)
-    return out
-
-
-def _find_row_index_by_order_id(ws, order_id: str) -> Optional[int]:
-    header = _get_header(ws)
-    if not header:
-        return None
-
-    oid_col = _find_col_idx(header, "order_id")
-    if oid_col is None:
-        return None
-
-    values = ws.get_all_values()
-    for i in range(1, len(values)):
-        row = values[i]
-        cell = row[oid_col] if oid_col < len(row) else ""
-        if str(cell).strip() == (order_id or "").strip():
-            return i + 1
-    return None
-
-
-def _update_requested_time(orders_sh, order_id: str, new_requested_time: str) -> bool:
-    try:
-        ws = _get_orders_ws(orders_sh)
-        header = _get_header(ws)
-        ridx = _find_row_index_by_order_id(ws, order_id)
-        if ridx is None:
-            return False
-
-        col = _find_col_idx(header, "requested_time")
-        if col is None:
-            raise RuntimeError("Missing requested_time column")
-
-        ws.update_cell(ridx, col + 1, str(new_requested_time).strip())
-        return True
-    except Exception as e:
-        log_event("update_requested_time_failed", order_id=order_id, error=str(e))
-        return False
-
-
-def _parse_hold_notes(notes: str) -> Dict[str, Any]:
-    s = _safe_str(notes)
-    if not s:
-        return {}
-    try:
-        obj = json.loads(s)
-        return obj if isinstance(obj, dict) else {}
-    except Exception:
-        return {}
-
-
-def _is_active_hold(row: Dict[str, Any], now_utc: datetime) -> bool:
-    status = _safe_str(row.get("status")).upper()
-    if status != PICKUP_HOLD_STATUS:
-        return False
-
-    meta = _parse_hold_notes(row.get("notes"))
-    expires_at_raw = _safe_str(meta.get("hold_expires_at"))
-    dt = _parse_iso_datetime(expires_at_raw)
-    if not dt:
-        return False
-
-    return dt > now_utc
-
-
-def _hold_belongs_to_chat(row: Dict[str, Any], client_chat_id: str) -> bool:
-    meta = _parse_hold_notes(row.get("notes"))
-    return _safe_str(meta.get("hold_for_chat_id")) == _safe_str(client_chat_id)
-
-
-def _count_slot_occupancy(
-    rows: List[Dict[str, Any]],
-    target_hhmm: str,
-    client_chat_id: str,
-    exclude_order_id: str = "",
-) -> int:
-    now_utc = datetime.now(timezone.utc)
-    target_hhmm = _safe_str(target_hhmm)
-    exclude_order_id = _safe_str(exclude_order_id)
-    client_chat_id = _safe_str(client_chat_id)
-
-    count = 0
-
-    for r in rows:
-        row_order_id = _safe_str(r.get("order_id"))
-        if exclude_order_id and row_order_id == exclude_order_id:
-            continue
-
-        hhmm = _extract_slot_hhmm(r.get("requested_time"))
-        if hhmm != target_hhmm:
-            continue
-
-        status = _safe_str(r.get("status")).upper()
-        if status in ESTADOS_NO_CONTAR:
-            continue
-
-        if status in ESTADOS_DEFINITIVOS_OCUPAN:
-            count += 1
-            continue
-
-        if _is_active_hold(r, now_utc):
-            # Si es el hold del mismo cliente, no lo contamos como conflicto final.
-            if _hold_belongs_to_chat(r, client_chat_id):
-                continue
-            count += 1
-            continue
-
-    return count
-
-
-def _get_today_business_window(orders_sh, tenant_tz: str) -> Dict[str, Any]:
-    bs = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
-
-    open_time = _safe_str(bs.get("open_time"))
-    close_time = _safe_str(bs.get("close_time"))
-    last_order_time = _safe_str(bs.get("last_order_time"))
-
-    if not open_time or not close_time or not last_order_time:
-        raise HTTPException(status_code=500, detail="Horario del negocio incompleto")
-
-    now_local = datetime.now().astimezone()  # fallback robusto
-    try:
-        from zoneinfo import ZoneInfo
-        now_local = datetime.now(ZoneInfo(tenant_tz or "America/La_Paz"))
-    except Exception:
-        pass
-
-    open_t = _parse_hhmm(open_time)
-    close_t = _parse_hhmm(close_time)
-    last_t = _parse_hhmm(last_order_time)
-
-    if not open_t or not close_t or not last_t:
-        raise HTTPException(status_code=500, detail="Formato de horario inválido en configuración")
-
-    return {
-        "now_local": now_local,
-        "open_dt": _time_to_datetime(now_local, open_t),
-        "close_dt": _time_to_datetime(now_local, close_t),
-        "last_order_dt": _time_to_datetime(now_local, last_t),
-        "open_time": open_time,
-        "close_time": close_time,
-        "last_order_time": last_order_time,
-    }
-
-
-def _find_next_available_slot_for_confirmation(
-    orders_sh,
-    tenant_tz: str,
-    desired_hhmm: str,
-    client_chat_id: str,
-    exclude_order_id: str = "",
-) -> Optional[str]:
-    cfg = get_pickup_config(orders_sh)
-    ctx = _get_today_business_window(orders_sh, tenant_tz)
-    now_local = ctx["now_local"]
-    last_order_dt = ctx["last_order_dt"]
-    open_dt = ctx["open_dt"]
-
-    rows = _iter_rows_as_dicts(_get_orders_ws(orders_sh))
-
-    desired_t = _parse_hhmm(desired_hhmm)
-    if not desired_t:
-        return None
-
-    desired_dt = _time_to_datetime(now_local, desired_t)
-    earliest_confirm_dt = _round_up_datetime(
-        now_local + timedelta(minutes=cfg["tiempo_minimo_preparacion_minutos"]),
-        cfg["intervalo_horarios_recojo_minutos"],
-    )
-
-    if earliest_confirm_dt < open_dt:
-        earliest_confirm_dt = open_dt
-
-    current = desired_dt if desired_dt > earliest_confirm_dt else earliest_confirm_dt
-    if current > last_order_dt:
-        return None
-
-    while current <= last_order_dt:
-        hhmm = _format_hhmm(current)
-        ocupados = _count_slot_occupancy(
-            rows=rows,
-            target_hhmm=hhmm,
-            client_chat_id=client_chat_id,
-            exclude_order_id=exclude_order_id,
-        )
-        if ocupados < cfg["maximo_pedidos_por_horario"]:
-            return hhmm
-
-        current = current + timedelta(minutes=cfg["intervalo_horarios_recojo_minutos"])
-
-    return None
-
-
-def _release_client_holds_for_slot(
-    orders_sh,
-    client_chat_id: str,
-    slot_hhmm: str,
-) -> int:
-    try:
-        ws = _get_orders_ws(orders_sh)
-        header = _get_header(ws)
-        status_col = _find_col_idx(header, "status")
-        if status_col is None:
-            return 0
-
-        rows = _iter_rows_as_dicts(ws)
-        changed = 0
-
-        for row in rows:
-            status = _safe_str(row.get("status")).upper()
-            if status != PICKUP_HOLD_STATUS:
-                continue
-
-            hhmm = _extract_slot_hhmm(row.get("requested_time"))
-            if hhmm != _safe_str(slot_hhmm):
-                continue
-
-            if not _hold_belongs_to_chat(row, client_chat_id):
-                continue
-
-            if not _is_active_hold(row, datetime.now(timezone.utc)):
-                continue
-
-            ridx = _find_row_index_by_order_id(ws, _safe_str(row.get("order_id")))
-            if ridx is None:
-                continue
-
-            ws.update_cell(ridx, status_col + 1, PICKUP_HOLD_RELEASED_STATUS)
-            changed += 1
-
-        return changed
-    except Exception as e:
-        log_event("release_client_holds_failed", client_chat_id=client_chat_id, slot_hhmm=slot_hhmm, error=str(e))
-        return 0
+    return m.group(1) if m else ""
 
 
 # =========================================================
@@ -748,52 +384,6 @@ def handle_admin_callback(
 
             assert_admin_authorized(tenant, chat_id, tenant_id)
 
-            order_before = get_order_by_id(orders_sh, order_id)
-            if not order_before:
-                telegram_send_text(bot_token, chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.", reply_markup=admin_fixed_kb())
-                return {"ok": True}
-
-            client_chat = _safe_client_chat_id_from_order(order_before)
-            desired_hhmm = _extract_slot_hhmm(order_before.get("requested_time"))
-            final_hhmm = desired_hhmm
-
-            if desired_hhmm:
-                next_slot = _find_next_available_slot_for_confirmation(
-                    orders_sh=orders_sh,
-                    tenant_tz=tenant_tz,
-                    desired_hhmm=desired_hhmm,
-                    client_chat_id=client_chat,
-                    exclude_order_id=order_id,
-                )
-
-                if next_slot:
-                    final_hhmm = next_slot
-                else:
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        "⚠️ No encontré una franja disponible para confirmar este pago. Revísalo manualmente.",
-                        reply_markup=admin_fixed_kb(),
-                    )
-                    return {"ok": True}
-
-                if final_hhmm != desired_hhmm:
-                    ok_update = _update_requested_time(orders_sh, order_id, final_hhmm)
-                    if not ok_update:
-                        telegram_send_text(
-                            bot_token,
-                            chat_id,
-                            "⚠️ No pude actualizar la hora final del pedido.",
-                            reply_markup=admin_fixed_kb(),
-                        )
-                        return {"ok": True}
-
-                _release_client_holds_for_slot(
-                    orders_sh=orders_sh,
-                    client_chat_id=client_chat,
-                    slot_hhmm=desired_hhmm,
-                )
-
             res = update_order_status(orders_sh, order_id, "PAID")
             if not res.get("ok"):
                 alert_order_status_failed(
@@ -809,46 +399,43 @@ def handle_admin_callback(
                 telegram_send_text(bot_token, chat_id, f"⚠️ Pedido {order_id} no encontrado en Sheets.", reply_markup=admin_fixed_kb())
                 return {"ok": True}
 
-            if final_hhmm and desired_hhmm and final_hhmm != desired_hhmm:
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    f"✅ Pedido {order_id} marcado como PAID.\nHora ajustada de {desired_hhmm} a {final_hhmm}.",
-                    reply_markup=admin_fixed_kb(),
-                )
-            elif final_hhmm:
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    f"✅ Pedido {order_id} marcado como PAID.\nHora confirmada: {final_hhmm}.",
-                    reply_markup=admin_fixed_kb(),
-                )
+            order_after = get_order_by_id(orders_sh, order_id)
+
+            if order_after:
+                final_hhmm = _extract_slot_hhmm(order_after.get("requested_time"))
+                if final_hhmm:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"✅ Pedido {order_id} marcado como PAID.\nHora de recojo: {final_hhmm}.",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                else:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"✅ Pedido {order_id} marcado como PAID.",
+                        reply_markup=admin_fixed_kb(),
+                    )
             else:
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    f"✅ Pedido {order_id} marcado como PAID",
+                    f"✅ Pedido {order_id} marcado como PAID.",
                     reply_markup=admin_fixed_kb(),
                 )
 
-            order_after = get_order_by_id(orders_sh, order_id)
             if order_after:
                 client_token = get_client_bot_token(tenant)
                 client_chat = _safe_client_chat_id_from_order(order_after)
 
                 if client_token and client_chat:
                     try:
-                        final_slot_for_msg = _safe_str(final_hhmm or _extract_slot_hhmm(order_after.get("requested_time")))
-                        if desired_hhmm and final_slot_for_msg and final_slot_for_msg != desired_hhmm:
+                        final_slot_for_msg = _safe_str(_extract_slot_hhmm(order_after.get("requested_time")))
+                        if final_slot_for_msg:
                             msg_client = (
                                 f"✅ Pago validado. Tu pedido {order_id} fue confirmado.\n\n"
-                                f"Tu horario elegido ({desired_hhmm}) ya no estaba disponible, "
-                                f"así que te asignamos la siguiente hora disponible: *{final_slot_for_msg}*."
-                            )
-                        elif final_slot_for_msg:
-                            msg_client = (
-                                f"✅ Pago validado. Tu pedido {order_id} fue confirmado.\n\n"
-                                f"Hora de recojo confirmada: *{final_slot_for_msg}*."
+                                f"Hora de recojo: *{final_slot_for_msg}*."
                             )
                         else:
                             msg_client = f"✅ Pago validado. Tu pedido {order_id} fue confirmado. ¡Gracias!"
@@ -935,9 +522,6 @@ def handle_admin_callback(
 
             return {"ok": True}
 
-        # =========================================
-        # ADMIN MANUAL ORDER FLOW
-        # =========================================
         if data.startswith("admord|"):
             assert_admin_authorized(tenant, chat_id, tenant_id)
 
