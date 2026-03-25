@@ -1,4 +1,4 @@
-# app/admin_callbacks.py
+# app/admin_callbacks.py — callbacks admin con nuevo flujo de horarios
 
 from typing import Any, Dict
 
@@ -24,28 +24,11 @@ from app.webhook_helpers import (
     get_client_bot_token,
     assert_admin_authorized,
     fmt_price_short,
-    get_business_status_safe,
     admin_periods_inline_kb,
 )
 from app.admin_hours import (
-    DAY_ORDER,
+    handle_admin_hours_callback,
     send_admin_hours_menu,
-    send_admin_days_menu,
-    send_admin_norm_open_menu,
-    send_admin_norm_close_menu,
-    send_admin_norm_last_menu,
-    send_admin_early_close_menu,
-    send_admin_early_last_menu,
-    send_admin_late_open_menu,
-    compact_to_hhmm,
-    admin_restore_habitual,
-    admin_set_weekly_open_days,
-    admin_set_weekly_normal_hours,
-    admin_set_today_closed,
-    admin_set_today_open_force,
-    admin_set_today_open_override,
-    admin_set_today_close_override,
-    admin_set_today_last_order_override,
 )
 from app.admin_menu import (
     send_admin_menu_home,
@@ -427,199 +410,16 @@ def handle_admin_callback_impl(
 
         if data.startswith("admhrs|"):
             assert_admin_authorized(tenant, chat_id, tenant_id)
-
-            parts = data.split("|")
-            if len(parts) < 3:
-                return {"ok": True}
-
-            cb_tenant_id = parts[1].strip()
-            if cb_tenant_id != tenant_id:
-                raise HTTPException(status_code=400, detail="Tenant mismatch in admin hours callback")
-
-            action = parts[2].strip()
-            sess = get_sess(tenant_id, chat_id)
-            tmp = sess.setdefault("tmp", {})
-            updated_by = f"admin_bot:{chat_id}"
-
-            if action == "menu":
-                tmp.pop("admin_days_selected", None)
-                tmp.pop("admin_norm_open", None)
-                tmp.pop("admin_norm_close", None)
-                tmp.pop("admin_early_close", None)
-                return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
-
-            if action == "habitual":
-                tmp.pop("admin_days_selected", None)
-                tmp.pop("admin_norm_open", None)
-                tmp.pop("admin_norm_close", None)
-                tmp.pop("admin_early_close", None)
-                admin_restore_habitual(orders_sh=orders_sh, updated_by=updated_by)
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    "✅ Se restauró la configuración habitual de hoy.",
-                    reply_markup=admin_root_kb(),
-                )
-                return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
-
-            if action == "days":
-                bs = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
-                tmp["admin_days_selected"] = list(bs.get("weekly_open_days") or [])
-                return {"ok": send_admin_days_menu(bot_token, chat_id, tenant_id, sess, bs)}
-
-            if action == "dayt" and len(parts) == 4:
-                code = parts[3].strip()
-                if code not in DAY_ORDER:
-                    return {"ok": True}
-                current = set(tmp.get("admin_days_selected") or [])
-                if code in current:
-                    current.remove(code)
-                else:
-                    current.add(code)
-                tmp["admin_days_selected"] = list(current)
-                bs = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
-                return {"ok": send_admin_days_menu(bot_token, chat_id, tenant_id, sess, bs)}
-
-            if action == "dayssave":
-                selected = [d for d in DAY_ORDER if d in set(tmp.get("admin_days_selected") or [])]
-                admin_set_weekly_open_days(
-                    orders_sh=orders_sh,
-                    days=selected,
-                    updated_by=updated_by,
-                )
-                tmp.pop("admin_days_selected", None)
-
-                bs_after = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
-                today_code = str(bs_after.get("today_weekday_code") or "").strip()
-                today_in = today_code in set(bs_after.get("weekly_open_days") or [])
-                force_open = bool(bs_after.get("today_open_force"))
-                today_closed = bool(bs_after.get("today_closed"))
-
-                msg = "✅ Días normales actualizados."
-                if today_code and (not today_in) and (not force_open) and (not today_closed):
-                    msg += f"\n⚠️ Ojo: hoy ({today_code}) quedó fuera de los días normales."
-
-                telegram_send_text(bot_token, chat_id, msg, reply_markup=admin_root_kb())
-                return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
-
-            if action == "norm":
-                tmp.pop("admin_norm_open", None)
-                tmp.pop("admin_norm_close", None)
-                return {"ok": send_admin_norm_open_menu(bot_token, chat_id, tenant_id)}
-
-            if action == "normopen" and len(parts) == 4:
-                open_time = compact_to_hhmm(parts[3].strip())
-                tmp["admin_norm_open"] = open_time
-                return {"ok": send_admin_norm_close_menu(bot_token, chat_id, tenant_id, open_time)}
-
-            if action == "normclose" and len(parts) == 4:
-                close_time = compact_to_hhmm(parts[3].strip())
-                open_time = str(tmp.get("admin_norm_open") or "").strip()
-                if not open_time:
-                    return {"ok": send_admin_norm_open_menu(bot_token, chat_id, tenant_id)}
-                tmp["admin_norm_close"] = close_time
-                return {"ok": send_admin_norm_last_menu(bot_token, chat_id, tenant_id, open_time, close_time)}
-
-            if action == "normlast" and len(parts) == 4:
-                last_time = compact_to_hhmm(parts[3].strip())
-                open_time = str(tmp.get("admin_norm_open") or "").strip()
-                close_time = str(tmp.get("admin_norm_close") or "").strip()
-                if not open_time or not close_time:
-                    return {"ok": send_admin_norm_open_menu(bot_token, chat_id, tenant_id)}
-
-                admin_set_weekly_normal_hours(
-                    orders_sh=orders_sh,
-                    open_time=open_time,
-                    close_time=close_time,
-                    last_order_time=last_time,
-                    updated_by=updated_by,
-                )
-
-                tmp.pop("admin_norm_open", None)
-                tmp.pop("admin_norm_close", None)
-
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    f"✅ Horario normal actualizado.\nApertura: {open_time}\nCierre: {close_time}\nÚltima hora de pedido: {last_time}",
-                    reply_markup=admin_root_kb(),
-                )
-                return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
-
-            if action == "early":
-                tmp.pop("admin_early_close", None)
-                return {"ok": send_admin_early_close_menu(bot_token, chat_id, tenant_id)}
-
-            if action == "earlyclose" and len(parts) == 4:
-                close_time = compact_to_hhmm(parts[3].strip())
-                tmp["admin_early_close"] = close_time
-                return {"ok": send_admin_early_last_menu(bot_token, chat_id, tenant_id, close_time)}
-
-            if action == "earlylast" and len(parts) == 4:
-                last_time = compact_to_hhmm(parts[3].strip())
-                close_time = str(tmp.get("admin_early_close") or "").strip()
-                if not close_time:
-                    return {"ok": send_admin_early_close_menu(bot_token, chat_id, tenant_id)}
-
-                admin_set_today_closed(orders_sh=orders_sh, enabled=False, updated_by=updated_by)
-                admin_set_today_open_force(orders_sh=orders_sh, enabled=False, updated_by=updated_by)
-                admin_set_today_close_override(orders_sh=orders_sh, close_time=close_time, updated_by=updated_by)
-                admin_set_today_last_order_override(orders_sh=orders_sh, last_order_time=last_time, updated_by=updated_by)
-
-                tmp.pop("admin_early_close", None)
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    f"✅ Cierre temprano configurado para hoy.\nCierre: {close_time}\nÚltima hora de pedido: {last_time}",
-                    reply_markup=admin_root_kb(),
-                )
-                return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
-
-            if action == "late":
-                return {"ok": send_admin_late_open_menu(bot_token, chat_id, tenant_id)}
-
-            if action == "lateopen" and len(parts) == 4:
-                open_time = compact_to_hhmm(parts[3].strip())
-                admin_set_today_closed(orders_sh=orders_sh, enabled=False, updated_by=updated_by)
-                admin_set_today_open_force(orders_sh=orders_sh, enabled=False, updated_by=updated_by)
-                admin_set_today_open_override(orders_sh=orders_sh, open_time=open_time, updated_by=updated_by)
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    f"✅ Apertura tardía configurada para hoy.\nNueva apertura: {open_time}",
-                    reply_markup=admin_root_kb(),
-                )
-                return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
-
-            if action == "closed":
-                admin_set_today_closed(orders_sh=orders_sh, enabled=True, updated_by=updated_by)
-                admin_set_today_open_force(orders_sh=orders_sh, enabled=False, updated_by=updated_by)
-                admin_set_today_open_override(orders_sh=orders_sh, open_time="", updated_by=updated_by)
-                admin_set_today_close_override(orders_sh=orders_sh, close_time="", updated_by=updated_by)
-                admin_set_today_last_order_override(orders_sh=orders_sh, last_order_time="", updated_by=updated_by)
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    "✅ Hoy quedó marcado como NO abrir.",
-                    reply_markup=admin_root_kb(),
-                )
-                return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
-
-            if action == "openforce":
-                admin_set_today_openForce = admin_set_today_open_force
-                admin_set_today_openForce(orders_sh=orders_sh, enabled=True, updated_by=updated_by)
-                admin_set_today_closed(orders_sh=orders_sh, enabled=False, updated_by=updated_by)
-                admin_set_today_open_override(orders_sh=orders_sh, open_time="", updated_by=updated_by)
-                admin_set_today_close_override(orders_sh=orders_sh, close_time="", updated_by=updated_by)
-                admin_set_today_last_order_override(orders_sh=orders_sh, last_order_time="", updated_by=updated_by)
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    "✅ Hoy quedó marcado como abrir excepcionalmente.",
-                    reply_markup=admin_root_kb(),
-                )
-                return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
-
+            handled = handle_admin_hours_callback(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                tenant_id=tenant_id,
+                data=data,
+                orders_sh=orders_sh,
+                tenant_tz=tenant_tz,
+            )
+            if handled.get("ok"):
+                return handled
             return {"ok": True}
 
         if data.startswith("admmenu|"):
