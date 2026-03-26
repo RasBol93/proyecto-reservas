@@ -198,6 +198,21 @@ def handle_admin_callback_impl(
             assert_admin_authorized(tenant, chat_id, tenant_id)
             return {"ok": _send_consumers_menu(bot_token, chat_id, tenant_id, tenant_tz)}
 
+        if data == "admin_surveys":
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "📝 ENCUESTAS\n\n¿Qué deseas hacer?",
+                reply_markup=kb([
+                    [("⚙️ Configuración", f"admsurv|{tenant_id}|config")],
+                    [("❓ Gestionar preguntas", f"admsurv|{tenant_id}|questions")],
+                    [("📊 Ver resultados", f"admsurv|{tenant_id}|analytics")],
+                    [("⬅️ Volver", "admin_panel")],
+                ]),
+            )
+            return {"ok": True}
+
         if data == "admin_order":
             assert_admin_authorized(tenant, chat_id, tenant_id)
             sess = get_sess(tenant_id, chat_id)
