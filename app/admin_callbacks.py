@@ -1,6 +1,6 @@
 # app/admin_callbacks.py — callbacks admin sin teclado persistente inferior y con cierre correcto de pedido manual
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
 
@@ -83,8 +83,11 @@ from app.survey import (
     get_survey_reward_text,
     build_survey_analytics_text,
     load_survey_questions,
-    disable_survey_question,
 )
+from app.sheets import get_ws
+
+
+SURVEY_CONFIG_WS = "Survey_Config"
 
 
 def _finalize_admin_manual_order_from_tmp(
@@ -173,6 +176,93 @@ def _finalize_admin_manual_order_from_tmp(
     return {"ok": True}
 
 
+def _survey_type_label(qtype: str) -> str:
+    q = str(qtype or "").strip().lower()
+    if q == "stars":
+        return "Estrellas"
+    if q == "text":
+        return "Texto"
+    return qtype or ""
+
+
+def _survey_config_ws(orders_sh):
+    return get_ws(orders_sh, SURVEY_CONFIG_WS)
+
+
+def _survey_header_map(ws) -> Dict[str, int]:
+    values = ws.get_all_values()
+    if not values:
+        return {}
+    header = [str(x or "").strip() for x in values[0]]
+    return {name: idx for idx, name in enumerate(header)}
+
+
+def _survey_bool_cell(value: str) -> bool:
+    v = str(value or "").strip().lower()
+    return v in ("true", "1", "yes", "si", "sí", "y")
+
+
+def _survey_find_last_active_question_row(ws, question_id: str) -> Optional[int]:
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return None
+
+    hmap = _survey_header_map(ws)
+    idx_qid = hmap.get("question_id")
+    idx_active = hmap.get("active")
+
+    if idx_qid is None or idx_active is None:
+        return None
+
+    for row_num in range(len(values), 1, -1):
+        row = values[row_num - 1]
+        row_qid = row[idx_qid].strip() if idx_qid < len(row) else ""
+        row_active = row[idx_active].strip() if idx_active < len(row) else ""
+        if row_qid == question_id and _survey_bool_cell(row_active):
+            return row_num
+
+    return None
+
+
+def _survey_get_question_by_id(orders_sh, question_id: str) -> Optional[Dict[str, Any]]:
+    questions = load_survey_questions(orders_sh)
+    for q in questions:
+        if str(q.get("question_id") or "").strip() == question_id:
+            return q
+    return None
+
+
+def _survey_update_question_in_place(
+    orders_sh,
+    question_id: str,
+    *,
+    question_text: Optional[str] = None,
+    question_type: Optional[str] = None,
+    active: Optional[bool] = None,
+) -> bool:
+    ws = _survey_config_ws(orders_sh)
+    hmap = _survey_header_map(ws)
+    target_row = _survey_find_last_active_question_row(ws, question_id)
+
+    if not target_row:
+        return False
+
+    idx_qtext = hmap.get("question_text")
+    idx_qtype = hmap.get("type")
+    idx_active = hmap.get("active")
+
+    if question_text is not None and idx_qtext is not None:
+        ws.update_cell(target_row, idx_qtext + 1, str(question_text).strip())
+
+    if question_type is not None and idx_qtype is not None:
+        ws.update_cell(target_row, idx_qtype + 1, str(question_type).strip().lower())
+
+    if active is not None and idx_active is not None:
+        ws.update_cell(target_row, idx_active + 1, "TRUE" if active else "FALSE")
+
+    return True
+
+
 def _send_admin_surveys_home(
     bot_token: str,
     chat_id: int,
@@ -241,25 +331,33 @@ def _send_admin_surveys_questions(
     questions = load_survey_questions(orders_sh)
 
     lines = [
-        "❓ GESTIONAR PREGUNTAS\n",
+        "❓ GESTIONAR PREGUNTAS",
+        "",
     ]
 
     if not questions:
-        lines.append("No hay preguntas activas.\n")
+        lines.append("No hay preguntas activas.")
     else:
         for idx, q in enumerate(questions, start=1):
             qid = str(q.get("question_id") or "").strip()
-            qtype = str(q.get("type") or "").strip()
+            qtype = _survey_type_label(str(q.get("type") or "").strip())
             qtext = str(q.get("question_text") or "").strip()
-            lines.append(f"{idx}. [{qid}] ({qtype}) {qtext}")
+            lines.append(f"{idx}. [{qid}] {qtext}")
+            lines.append(f"   {qtype}")
+            lines.append("")
 
     rows = []
     if questions:
         for q in questions[:20]:
             qid = str(q.get("question_id") or "").strip()
             qtext = str(q.get("question_text") or "").strip()
-            short_label = qtext[:24] + "..." if len(qtext) > 24 else qtext
-            rows.append([(f"🗑 Eliminar {short_label}", f"admsurv|{tenant_id}|delq|{qid}")])
+            short_label = qtext[:18] + "..." if len(qtext) > 18 else qtext
+
+            rows.append([
+                (f"✏️ {short_label}", f"admsurv|{tenant_id}|editq|{qid}"),
+                ("🔁 Tipo", f"admsurv|{tenant_id}|chtype|{qid}"),
+                ("🗑", f"admsurv|{tenant_id}|delq|{qid}"),
+            ])
 
     rows.extend([
         [("➕ Agregar pregunta", f"admsurv|{tenant_id}|addq")],
@@ -396,21 +494,118 @@ def handle_admin_callback_impl(
                 )
                 return {"ok": True}
 
-            if action == "delq" and len(parts) == 4:
+            if action == "editq" and len(parts) == 4:
                 question_id = parts[3].strip()
-                result = disable_survey_question(orders_sh, question_id)
-                if result.get("ok"):
+                question = _survey_get_question_by_id(orders_sh, question_id)
+
+                if not question:
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        f"✅ Pregunta {question_id} desactivada.",
+                        "⚠️ No encontré esa pregunta.",
+                    )
+                    return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
+
+                tmp["admin_survey_mode"] = "awaiting_edit_question_text"
+                tmp["admin_survey_edit_qid"] = question_id
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    (
+                        "✏️ CAMBIAR TEXTO DE PREGUNTA\n\n"
+                        f"Pregunta actual:\n{question.get('question_text', '')}\n\n"
+                        "Escribe el nuevo texto:"
+                    ),
+                )
+                return {"ok": True}
+
+            if action == "chtype" and len(parts) == 4:
+                question_id = parts[3].strip()
+                question = _survey_get_question_by_id(orders_sh, question_id)
+
+                if not question:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No encontré esa pregunta.",
+                    )
+                    return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
+
+                current_type = _survey_type_label(str(question.get("type") or "").strip())
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    (
+                        "🔁 CAMBIAR TIPO DE PREGUNTA\n\n"
+                        f"Pregunta:\n{question.get('question_text', '')}\n\n"
+                        f"Tipo actual: {current_type}\n\n"
+                        "Elige el nuevo tipo:"
+                    ),
+                    reply_markup=kb([
+                        [("✍️ Texto", f"admsurv|{tenant_id}|settype_existing|{question_id}|text")],
+                        [("⭐ Estrellas", f"admsurv|{tenant_id}|settype_existing|{question_id}|stars")],
+                        [("⬅️ Volver a preguntas", f"admsurv|{tenant_id}|questions")],
+                        [("🧭 Panel admin", "admin_panel")],
+                    ]),
+                )
+                return {"ok": True}
+
+            if action == "settype_existing" and len(parts) == 5:
+                question_id = parts[3].strip()
+                qtype = parts[4].strip().lower()
+
+                if qtype not in ("text", "stars"):
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ Tipo inválido.",
+                    )
+                    return {"ok": True}
+
+                ok = _survey_update_question_in_place(
+                    orders_sh,
+                    question_id,
+                    question_type=qtype,
+                )
+
+                if ok:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"✅ Tipo actualizado a {_survey_type_label(qtype)}.",
                     )
                 else:
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        "⚠️ No pude desactivar esa pregunta.",
+                        "⚠️ No pude actualizar el tipo de esa pregunta.",
                     )
+
+                return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
+
+            if action == "delq" and len(parts) == 4:
+                question_id = parts[3].strip()
+                ok = _survey_update_question_in_place(
+                    orders_sh,
+                    question_id,
+                    active=False,
+                )
+
+                if ok:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"✅ Pregunta {question_id} eliminada.",
+                    )
+                else:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No pude eliminar esa pregunta.",
+                    )
+
                 return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
 
             if action == "settype" and len(parts) == 4:
@@ -446,7 +641,7 @@ def handle_admin_callback_impl(
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        f"✅ Pregunta creada.\nTipo: {qtype}\nTexto: {pending_qtext}",
+                        f"✅ Pregunta creada.\nTipo: {_survey_type_label(qtype)}\nTexto: {pending_qtext}",
                     )
                 else:
                     telegram_send_text(
