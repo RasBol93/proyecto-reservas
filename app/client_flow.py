@@ -302,21 +302,129 @@ def _cart_remove(sess: Dict[str, Any], sku: str) -> None:
     sess["cart"] = [it for it in cart if str(it.get("sku") or "").strip() != sku]
 
 
-def _send_survey_question(bot_token: str, chat_id: int, q: Dict[str, Any]) -> bool:
+def _send_survey_question(bot_token: str, chat_id: int, q: Dict[str, Any], question_number: int) -> bool:
     q_text = str(q.get("question_text") or "").strip()
     q_type = str(q.get("type") or "").strip().lower()
+    header = f"Pregunta {question_number}\n\n{q_text}"
 
     if q_type == "stars":
         return telegram_send_text(
             bot_token,
             chat_id,
-            f"{q_text}\n\nResponde con un número del 1 al 5.",
+            f"{header}\n\nElige una calificación:",
             reply_markup=kb([
-                [("1", "noop"), ("2", "noop"), ("3", "noop"), ("4", "noop"), ("5", "noop")],
+                [
+                    ("1 ⭐", "survey_ans|1"),
+                    ("2 ⭐", "survey_ans|2"),
+                    ("3 ⭐", "survey_ans|3"),
+                    ("4 ⭐", "survey_ans|4"),
+                    ("5 ⭐", "survey_ans|5"),
+                ],
             ]),
         )
 
-    return telegram_send_text(bot_token, chat_id, q_text)
+    return telegram_send_text(bot_token, chat_id, header)
+
+
+def _save_current_survey_answer_and_advance(
+    tenant_id: str,
+    bot_token: str,
+    chat_id: int,
+    orders_sh,
+    tenant_tz: str,
+    sess: Dict[str, Any],
+    raw_answer: str,
+) -> Dict[str, Any]:
+    survey = sess.get("survey") or {}
+    questions = get_runtime_survey_questions(orders_sh)
+
+    try:
+        idx = int(survey.get("q_idx") or 0)
+    except Exception:
+        idx = 0
+
+    if idx < 0 or idx >= len(questions):
+        telegram_send_text(bot_token, chat_id, "⚠️ Error de encuesta. Intenta de nuevo.")
+        sess["stage"] = "idle"
+        sess["survey"] = {}
+        return {"ok": True}
+
+    q = questions[idx]
+    answer = str(raw_answer or "").strip()
+    q_type = str(q.get("type") or "").strip().lower()
+
+    if q_type == "stars":
+        if answer not in ("1", "2", "3", "4", "5"):
+            telegram_send_text(bot_token, chat_id, "Responde con una opción válida del 1 al 5.")
+            return {"ok": True}
+    else:
+        if not answer:
+            telegram_send_text(bot_token, chat_id, "Tu respuesta no puede estar vacía.")
+            return {"ok": True}
+
+    survey_answers = survey.get("answers") or []
+    survey_answers.append({
+        "question_id": str(q.get("question_id") or "").strip(),
+        "question_order": int(q.get("order") or 0),
+        "question_text": str(q.get("question_text") or "").strip(),
+        "answer_type": str(q.get("type") or "").strip(),
+        "answer_value": answer,
+    })
+
+    idx += 1
+    survey["answers"] = survey_answers
+    survey["q_idx"] = idx
+    sess["survey"] = survey
+
+    if idx < len(questions):
+        _send_survey_question(bot_token, chat_id, questions[idx], idx + 1)
+        return {"ok": True}
+
+    phone = str(survey.get("phone") or "").strip()
+    reward = get_survey_reward_text(orders_sh)
+
+    coupon_res = create_survey_coupon(
+        orders_sh=orders_sh,
+        tenant_id=tenant_id,
+        phone=phone,
+        reward_text=reward,
+    )
+    if not coupon_res.get("ok"):
+        telegram_send_text(bot_token, chat_id, "⚠️ No pude generar tu cupón en este momento.")
+        sess["stage"] = "idle"
+        sess["survey"] = {}
+        return {"ok": True}
+
+    coupon_code = str(coupon_res.get("coupon_code") or "").strip()
+
+    save_res = save_survey_answers(
+        orders_sh=orders_sh,
+        tenant_id=tenant_id,
+        tenant_tz=tenant_tz,
+        customer_phone=phone,
+        customer_name="",
+        answers=survey_answers,
+        coupon_code=coupon_code,
+    )
+    if not save_res.get("ok"):
+        telegram_send_text(bot_token, chat_id, "⚠️ No pude guardar tu encuesta en este momento.")
+        sess["stage"] = "idle"
+        sess["survey"] = {}
+        return {"ok": True}
+
+    telegram_send_text(
+        bot_token,
+        chat_id,
+        (
+            "🙏 Gracias por completar esta encuesta.\n\n"
+            f"Como agradecimiento te damos la siguiente recompensa:\n{reward}\n\n"
+            f"🎁 Código único de descuento:\n{coupon_code}"
+        ),
+    )
+
+    sess["stage"] = "idle"
+    sess["survey"] = {}
+    return {"ok": True}
 
 
 def handle_client_callback(
@@ -356,6 +464,26 @@ def handle_client_callback(
             sess["survey"] = {}
             telegram_send_text(bot_token, chat_id, "🔒 Ingresa el password de la encuesta:")
             return {"ok": True}
+
+        if data.startswith("survey_ans|"):
+            if sess.get("stage") != "survey_q":
+                telegram_send_text(bot_token, chat_id, "La encuesta ya no está activa. Vuelve a empezar.")
+                return {"ok": True}
+
+            parts = data.split("|", 1)
+            if len(parts) != 2:
+                return {"ok": True}
+
+            answer_value = parts[1].strip()
+            return _save_current_survey_answer_and_advance(
+                tenant_id=tenant_id,
+                bot_token=bot_token,
+                chat_id=chat_id,
+                orders_sh=orders_sh,
+                tenant_tz=tenant_tz,
+                sess=sess,
+                raw_answer=answer_value,
+            )
 
         if data == "hours":
             bs = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
@@ -941,7 +1069,11 @@ def handle_client_message(
                 return {"ok": True}
 
             sess["stage"] = "survey_phone"
-            telegram_send_text(bot_token, chat_id, "📱 Ingresa tu número de teléfono:")
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "😊 Ahora empezamos la encuesta.\n\n📱 Ingresa tu número de teléfono:",
+            )
             return {"ok": True}
 
         # -------------------------
@@ -974,11 +1106,11 @@ def handle_client_message(
             }
             sess["stage"] = "survey_q"
 
-            _send_survey_question(bot_token, chat_id, questions[0])
+            _send_survey_question(bot_token, chat_id, questions[0], 1)
             return {"ok": True}
 
         # -------------------------
-        # SURVEY: ANSWERS
+        # SURVEY: ANSWERS (TEXT)
         # -------------------------
         if sess.get("stage") == "survey_q":
             survey = sess.get("survey") or {}
@@ -996,80 +1128,21 @@ def handle_client_message(
                 return {"ok": True}
 
             q = questions[idx]
-            answer = text.strip()
+            q_type = str(q.get("type") or "").strip().lower()
 
-            if str(q.get("type") or "").strip().lower() == "stars":
-                if answer not in ("1", "2", "3", "4", "5"):
-                    telegram_send_text(bot_token, chat_id, "Responde con un número del 1 al 5.")
-                    return {"ok": True}
-
-            if not answer:
-                telegram_send_text(bot_token, chat_id, "Tu respuesta no puede estar vacía.")
+            if q_type == "stars":
+                telegram_send_text(bot_token, chat_id, "Usa los botones con estrellas para responder esta pregunta.")
                 return {"ok": True}
 
-            survey_answers = survey.get("answers") or []
-            survey_answers.append({
-                "question_id": str(q.get("question_id") or "").strip(),
-                "question_order": int(q.get("order") or 0),
-                "question_text": str(q.get("question_text") or "").strip(),
-                "answer_type": str(q.get("type") or "").strip(),
-                "answer_value": answer,
-            })
-
-            idx += 1
-            survey["answers"] = survey_answers
-            survey["q_idx"] = idx
-            sess["survey"] = survey
-
-            if idx < len(questions):
-                _send_survey_question(bot_token, chat_id, questions[idx])
-                return {"ok": True}
-
-            phone = str(survey.get("phone") or "").strip()
-            reward = get_survey_reward_text(orders_sh)
-
-            coupon_res = create_survey_coupon(
-                orders_sh=orders_sh,
+            return _save_current_survey_answer_and_advance(
                 tenant_id=tenant_id,
-                phone=phone,
-                reward_text=reward,
-            )
-            if not coupon_res.get("ok"):
-                telegram_send_text(bot_token, chat_id, "⚠️ No pude generar tu cupón en este momento.")
-                sess["stage"] = "idle"
-                sess["survey"] = {}
-                return {"ok": True}
-
-            coupon_code = str(coupon_res.get("coupon_code") or "").strip()
-
-            save_res = save_survey_answers(
+                bot_token=bot_token,
+                chat_id=chat_id,
                 orders_sh=orders_sh,
-                tenant_id=tenant_id,
                 tenant_tz=tenant_tz,
-                customer_phone=phone,
-                customer_name="",
-                answers=survey_answers,
-                coupon_code=coupon_code,
+                sess=sess,
+                raw_answer=text,
             )
-            if not save_res.get("ok"):
-                telegram_send_text(bot_token, chat_id, "⚠️ No pude guardar tu encuesta en este momento.")
-                sess["stage"] = "idle"
-                sess["survey"] = {}
-                return {"ok": True}
-
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                (
-                    "🙏 Gracias por completar esta encuesta.\n\n"
-                    f"Como agradecimiento te damos la siguiente recompensa:\n{reward}\n\n"
-                    f"🎁 Código único de descuento:\n{coupon_code}"
-                ),
-            )
-
-            sess["stage"] = "idle"
-            sess["survey"] = {}
-            return {"ok": True}
 
         if sess.get("stage") == "awaiting_pickup_custom_time":
             parsed_hhmm = parse_manual_time_text(text)
