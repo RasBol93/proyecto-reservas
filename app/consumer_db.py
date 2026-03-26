@@ -2,7 +2,7 @@ import json
 import re
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -24,19 +24,89 @@ class ConsumerPeriod:
     end_local: datetime
 
 
-def consumer_period_options() -> List[Tuple[str, str]]:
+def _month_name_es(month: int) -> str:
+    names = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+    try:
+        return names[month - 1]
+    except Exception:
+        return str(month)
+
+
+def _quarter_number(month: int) -> int:
+    if month in (1, 2, 3):
+        return 1
+    if month in (4, 5, 6):
+        return 2
+    if month in (7, 8, 9):
+        return 3
+    return 4
+
+
+def _shift_year_month(year: int, month: int, delta_months: int) -> Tuple[int, int]:
+    total = (year * 12 + (month - 1)) + delta_months
+    new_year = total // 12
+    new_month = (total % 12) + 1
+    return new_year, new_month
+
+
+def _start_of_day(dt: datetime) -> datetime:
+    return datetime(dt.year, dt.month, dt.day, 0, 0, 0, tzinfo=dt.tzinfo)
+
+
+def _start_of_month(dt: datetime) -> datetime:
+    return datetime(dt.year, dt.month, 1, 0, 0, 0, tzinfo=dt.tzinfo)
+
+
+def _start_of_year(dt: datetime) -> datetime:
+    return datetime(dt.year, 1, 1, 0, 0, 0, tzinfo=dt.tzinfo)
+
+
+def _start_of_week(dt: datetime) -> datetime:
+    day_start = _start_of_day(dt)
+    return day_start - timedelta(days=day_start.weekday())
+
+
+def _start_of_quarter(dt: datetime) -> datetime:
+    q = _quarter_number(dt.month)
+    if q == 1:
+        m = 1
+    elif q == 2:
+        m = 4
+    elif q == 3:
+        m = 7
+    else:
+        m = 10
+    return datetime(dt.year, m, 1, 0, 0, 0, tzinfo=dt.tzinfo)
+
+
+def consumer_period_options(tenant_tz: str) -> List[Tuple[str, str]]:
+    tz = ZoneInfo(tenant_tz)
+    now_local = datetime.now(tz)
+
+    year = now_local.year
+    month = now_local.month
+
+    y1, m1 = _shift_year_month(year, month, -1)
+    y2, m2 = _shift_year_month(year, month, -2)
+    y3, m3 = _shift_year_month(year, month, -3)
+
     return [
-        ("Hoy", "today"),
-        ("Esta semana", "week"),
-        ("Últimos 10 días", "last10d"),
-        ("Último mes", "last30d"),
-        ("Últimos 3 meses", "last90d"),
+        ("Esta semana", "this_week"),
+        ("Semana pasada", "last_week"),
+        ("Mes en curso", "month_to_date"),
+        ("Mes anterior", "last_month"),
+        (f"{_month_name_es(m1)} {y1}", "month_1_ago"),
+        (f"{_month_name_es(m2)} {y2}", "month_2_ago"),
+        (f"{_month_name_es(m3)} {y3}", "month_3_ago"),
+        ("Trimestre en curso", "quarter_to_date"),
+        ("Último trimestre", "last_quarter"),
+        ("Año en curso", "year_to_date"),
     ]
 
 
-def consumer_periods_inline_kb(tenant_id: str) -> Dict[str, Any]:
+def consumer_periods_inline_kb(tenant_id: str, tenant_tz: str = "America/La_Paz") -> Dict[str, Any]:
     rows = []
-    for label, key in consumer_period_options():
+    for label, key in consumer_period_options(tenant_tz):
         rows.append([(f"👥 {label}", f"admcons|{tenant_id}|period|{key}")])
     rows.append([("⬅️ Volver al panel", f"admcons|{tenant_id}|panel")])
     return kb(rows)
@@ -56,29 +126,61 @@ def resolve_consumer_period(period_key: str, tenant_tz: str) -> ConsumerPeriod:
     tz = ZoneInfo(tenant_tz)
     now_local = datetime.now(tz)
 
-    today_start = datetime.combine(now_local.date(), dtime.min, tzinfo=tz)
-    tomorrow_start = today_start + timedelta(days=1)
+    if period_key == "this_week":
+        start_local = _start_of_week(now_local)
+        return ConsumerPeriod("this_week", "Esta semana", start_local, now_local)
 
-    weekday = now_local.weekday()  # lunes=0
-    week_start = today_start - timedelta(days=weekday)
+    if period_key == "last_week":
+        current_week_start = _start_of_week(now_local)
+        last_week_start = current_week_start - timedelta(days=7)
+        return ConsumerPeriod("last_week", "Semana pasada", last_week_start, current_week_start)
 
-    if period_key == "today":
-        return ConsumerPeriod("today", "Hoy", today_start, tomorrow_start)
+    if period_key == "month_to_date":
+        start_local = _start_of_month(now_local)
+        return ConsumerPeriod("month_to_date", "Mes en curso", start_local, now_local)
 
-    if period_key == "week":
-        return ConsumerPeriod("week", "Esta semana", week_start, tomorrow_start)
+    if period_key == "last_month":
+        y, m = _shift_year_month(now_local.year, now_local.month, -1)
+        start_local = datetime(y, m, 1, 0, 0, 0, tzinfo=tz)
+        end_local = datetime(now_local.year, now_local.month, 1, 0, 0, 0, tzinfo=tz)
+        return ConsumerPeriod("last_month", "Mes anterior", start_local, end_local)
 
-    if period_key == "last10d":
-        start = today_start - timedelta(days=9)
-        return ConsumerPeriod("last10d", "Últimos 10 días", start, tomorrow_start)
+    if period_key == "month_1_ago":
+        y, m = _shift_year_month(now_local.year, now_local.month, -1)
+        start_local = datetime(y, m, 1, 0, 0, 0, tzinfo=tz)
+        y_next, m_next = _shift_year_month(y, m, 1)
+        end_local = datetime(y_next, m_next, 1, 0, 0, 0, tzinfo=tz)
+        return ConsumerPeriod("month_1_ago", f"{_month_name_es(m)} {y}", start_local, end_local)
 
-    if period_key == "last30d":
-        start = today_start - timedelta(days=29)
-        return ConsumerPeriod("last30d", "Último mes", start, tomorrow_start)
+    if period_key == "month_2_ago":
+        y, m = _shift_year_month(now_local.year, now_local.month, -2)
+        start_local = datetime(y, m, 1, 0, 0, 0, tzinfo=tz)
+        y_next, m_next = _shift_year_month(y, m, 1)
+        end_local = datetime(y_next, m_next, 1, 0, 0, 0, tzinfo=tz)
+        return ConsumerPeriod("month_2_ago", f"{_month_name_es(m)} {y}", start_local, end_local)
 
-    if period_key == "last90d":
-        start = today_start - timedelta(days=89)
-        return ConsumerPeriod("last90d", "Últimos 3 meses", start, tomorrow_start)
+    if period_key == "month_3_ago":
+        y, m = _shift_year_month(now_local.year, now_local.month, -3)
+        start_local = datetime(y, m, 1, 0, 0, 0, tzinfo=tz)
+        y_next, m_next = _shift_year_month(y, m, 1)
+        end_local = datetime(y_next, m_next, 1, 0, 0, 0, tzinfo=tz)
+        return ConsumerPeriod("month_3_ago", f"{_month_name_es(m)} {y}", start_local, end_local)
+
+    if period_key == "quarter_to_date":
+        start_local = _start_of_quarter(now_local)
+        return ConsumerPeriod("quarter_to_date", "Trimestre en curso", start_local, now_local)
+
+    if period_key == "last_quarter":
+        current_q_start = _start_of_quarter(now_local)
+        prev_q_end = current_q_start
+        prev_q_start_year, prev_q_start_month = _shift_year_month(current_q_start.year, current_q_start.month, -3)
+        prev_q_start = datetime(prev_q_start_year, prev_q_start_month, 1, 0, 0, 0, tzinfo=tz)
+        prev_q_num = _quarter_number(prev_q_start_month)
+        return ConsumerPeriod("last_quarter", f"T{prev_q_num} {prev_q_start_year}", prev_q_start, prev_q_end)
+
+    if period_key == "year_to_date":
+        start_local = _start_of_year(now_local)
+        return ConsumerPeriod("year_to_date", "Año en curso", start_local, now_local)
 
     raise ValueError(f"Unknown consumer period: {period_key}")
 
@@ -346,6 +448,8 @@ def _fmt_local_date(dt: datetime) -> str:
 
 
 def _period_range_text(period: ConsumerPeriod) -> str:
+    if period.end_local <= period.start_local:
+        return f"{_fmt_local_date(period.start_local)} – {_fmt_local_date(period.start_local)}"
     end_inclusive = period.end_local - timedelta(seconds=1)
     return f"{_fmt_local_date(period.start_local)} – {_fmt_local_date(end_inclusive)}"
 
