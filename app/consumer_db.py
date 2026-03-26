@@ -1,4 +1,5 @@
 import json
+import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, time as dtime
@@ -290,21 +291,63 @@ def _extract_product_counts(order: Dict[str, Any], menu_idx: Dict[str, Any]) -> 
     return out
 
 
-def _pick_most_frequent_name(name_counter: Counter, latest_name: str) -> str:
+def _normalize_contact(value: Any) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    digits = re.sub(r"\D+", "", s)
+    return digits
+
+
+def _clean_display_name(value: Any) -> str:
+    s = " ".join(str(value or "").strip().split())
+    return s if s else "Sin nombre"
+
+
+def _normalized_name_key(value: Any) -> str:
+    return normalize(" ".join(str(value or "").strip().split()))
+
+
+def _build_consumer_key(contact_norm: str, name_norm: str, row_idx: int) -> str:
+    if contact_norm:
+        return f"contact:{contact_norm}"
+    if name_norm:
+        return f"nocontact_name:{name_norm}"
+    return f"nocontact_row:{row_idx}"
+
+
+def _pick_hybrid_display_name(
+    name_counter: Counter,
+    latest_name: str,
+    latest_name_norm: str,
+    latest_display_by_norm: Dict[str, str],
+) -> str:
     if not name_counter:
-        return latest_name or "-"
+        return latest_name or "Sin nombre"
 
     max_count = max(name_counter.values())
-    tied = [name for name, cnt in name_counter.items() if cnt == max_count]
-    if latest_name in tied:
+    tied_norms = [norm_name for norm_name, cnt in name_counter.items() if cnt == max_count]
+
+    if latest_name_norm and latest_name_norm in tied_norms and latest_name:
         return latest_name
-    return sorted(tied)[0]
+
+    chosen_norm = sorted(tied_norms)[0]
+    return latest_display_by_norm.get(chosen_norm) or latest_name or "Sin nombre"
 
 
 def _fmt_local_dt(dt: Optional[datetime]) -> str:
     if not dt:
         return "-"
     return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def _fmt_local_date(dt: datetime) -> str:
+    return dt.strftime("%d/%m/%Y")
+
+
+def _period_range_text(period: ConsumerPeriod) -> str:
+    end_inclusive = period.end_local - timedelta(seconds=1)
+    return f"{_fmt_local_date(period.start_local)} – {_fmt_local_date(end_inclusive)}"
 
 
 def _fmt_money(v: float) -> str:
@@ -350,7 +393,7 @@ def aggregate_consumers(
     consumers: Dict[str, Dict[str, Any]] = {}
     paid_orders_in_period = 0
 
-    for row in rows:
+    for row_idx, row in enumerate(rows, start=1):
         if not _is_paid_order(row):
             continue
 
@@ -364,11 +407,15 @@ def aggregate_consumers(
 
         paid_orders_in_period += 1
 
-        contact = str(row.get("customer_contact") or "").strip()
-        if not contact:
-            contact = "SIN_CONTACTO"
+        contact_raw = str(row.get("customer_contact") or "").strip()
+        contact_norm = _normalize_contact(contact_raw)
+        display_contact = contact_norm if contact_norm else "Sin contacto"
 
-        name = str(row.get("customer_name") or "").strip() or "Sin nombre"
+        raw_name = str(row.get("customer_name") or "").strip()
+        display_name = _clean_display_name(raw_name)
+        name_norm = _normalized_name_key(display_name)
+
+        consumer_key = _build_consumer_key(contact_norm, name_norm, row_idx)
 
         try:
             total_amount = float(row.get("total_amount") or 0)
@@ -377,37 +424,51 @@ def aggregate_consumers(
 
         product_counts = _extract_product_counts(row, menu_idx)
 
-        if contact not in consumers:
-            consumers[contact] = {
-                "contact": contact,
+        if consumer_key not in consumers:
+            consumers[consumer_key] = {
+                "contact": display_contact,
+                "contact_norm": contact_norm,
                 "name_counter": Counter(),
-                "latest_name": name,
+                "latest_name": display_name,
+                "latest_name_norm": name_norm,
                 "latest_name_dt": created_local,
+                "latest_display_by_norm": {},
                 "orders_count": 0,
                 "total_spent": 0.0,
                 "last_purchase_dt": created_local,
+                "last_order_counter": Counter(),
                 "product_counter": Counter(),
             }
 
-        c = consumers[contact]
-        c["name_counter"][name] += 1
+        c = consumers[consumer_key]
+        c["name_counter"][name_norm] += 1
         c["orders_count"] += 1
         c["total_spent"] += total_amount
         c["product_counter"].update(product_counts)
 
+        if name_norm:
+            c["latest_display_by_norm"][name_norm] = display_name
+
         if created_local >= c["last_purchase_dt"]:
             c["last_purchase_dt"] = created_local
+            c["last_order_counter"] = Counter(product_counts)
 
         if created_local >= c["latest_name_dt"]:
             c["latest_name_dt"] = created_local
-            c["latest_name"] = name
+            c["latest_name"] = display_name
+            c["latest_name_norm"] = name_norm
 
     output: List[Dict[str, Any]] = []
     for _, c in consumers.items():
         if c["orders_count"] < min_orders:
             continue
 
-        resolved_name = _pick_most_frequent_name(c["name_counter"], c["latest_name"])
+        resolved_name = _pick_hybrid_display_name(
+            c["name_counter"],
+            c["latest_name"],
+            c["latest_name_norm"],
+            c["latest_display_by_norm"],
+        )
 
         output.append({
             "name": resolved_name,
@@ -415,6 +476,7 @@ def aggregate_consumers(
             "orders_count": int(c["orders_count"]),
             "total_spent": round(float(c["total_spent"]), 2),
             "last_purchase_dt": c["last_purchase_dt"],
+            "last_order_text": _top_products_text(c["last_order_counter"]),
             "products_text": _top_products_text(c["product_counter"]),
         })
 
@@ -456,6 +518,7 @@ def build_consumers_report_pages(
     header = (
         "👥 BASE DE CONSUMIDORES\n\n"
         f"Período: {period.label}\n"
+        f"Rango: {_period_range_text(period)}\n"
         f"Filtro: {filter_label}\n"
         f"Pedidos PAID en período: {paid_orders_in_period}\n"
         f"Consumidores encontrados: {len(consumers)}\n\n"
@@ -472,7 +535,8 @@ def build_consumers_report_pages(
             f"Pedidos: {c['orders_count']}\n"
             f"Total gastado: Bs {_fmt_money(c['total_spent'])}\n"
             f"Última compra: {_fmt_local_dt(c['last_purchase_dt'])}\n"
-            f"Pidió: {c['products_text']}\n"
+            f"Último pedido: {c['last_order_text']}\n"
+            f"Pedidos en total: {c['products_text']}\n"
         )
 
     pages: List[str] = []
