@@ -16,12 +16,12 @@ def _period_range_text(period) -> str:
     return f"{period.start_local.strftime('%d/%m/%Y')} – {end_inclusive.strftime('%d/%m/%Y')}"
 
 
-def _send_consumers_menu(bot_token: str, chat_id: int, tenant_id: str) -> bool:
+def _send_consumers_menu(bot_token: str, chat_id: int, tenant_id: str, tenant_tz: str) -> bool:
     return telegram_send_text(
         bot_token,
         chat_id,
         "👥 BASE DE CONSUMIDORES\n\nElige un período:",
-        reply_markup=consumer_periods_inline_kb(tenant_id),
+        reply_markup=consumer_periods_inline_kb(tenant_id, tenant_tz),
     )
 
 
