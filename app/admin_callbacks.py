@@ -196,7 +196,7 @@ def handle_admin_callback_impl(
 
         if data == "admin_consumers":
             assert_admin_authorized(tenant, chat_id, tenant_id)
-           return {"ok": _send_consumers_menu(bot_token, chat_id, tenant_id, tenant_tz)}
+            return {"ok": _send_consumers_menu(bot_token, chat_id, tenant_id, tenant_tz)}
 
         if data == "admin_order":
             assert_admin_authorized(tenant, chat_id, tenant_id)
