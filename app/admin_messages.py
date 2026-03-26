@@ -52,6 +52,12 @@ from app.admin_manual_order import (
 from app.admin_nav import (
     admin_panel_kb,
 )
+from app.survey import (
+    save_survey_password,
+    save_survey_reward,
+    add_survey_question,
+    load_survey_questions,
+)
 
 
 def _finalize_admin_manual_order(
@@ -138,6 +144,50 @@ def _finalize_admin_manual_order(
         parse_mode="Markdown",
     )
     return {"ok": True}
+
+
+def _send_admin_surveys_questions(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+) -> bool:
+    questions = load_survey_questions(orders_sh)
+
+    lines = [
+        "❓ GESTIONAR PREGUNTAS\n",
+    ]
+
+    if not questions:
+        lines.append("No hay preguntas activas.\n")
+    else:
+        for idx, q in enumerate(questions, start=1):
+            qid = str(q.get("question_id") or "").strip()
+            qtype = str(q.get("type") or "").strip()
+            qtext = str(q.get("question_text") or "").strip()
+            lines.append(f"{idx}. [{qid}] ({qtype}) {qtext}")
+
+    rows = []
+    if questions:
+        for q in questions[:20]:
+            qid = str(q.get("question_id") or "").strip()
+            qtext = str(q.get("question_text") or "").strip()
+            short_label = qtext[:24] + "..." if len(qtext) > 24 else qtext
+            rows.append([(f"🗑 Eliminar {short_label}", f"admsurv|{tenant_id}|delq|{qid}")])
+
+    rows.extend([
+        [("➕ Agregar pregunta", f"admsurv|{tenant_id}|addq")],
+        [("⬅️ Volver a encuestas", "admin_surveys")],
+        [("🧭 Panel admin", "admin_panel")],
+    ])
+
+    telegram_send_text(
+        bot_token,
+        chat_id,
+        "\n".join(lines),
+        reply_markup=kb(rows),
+    )
+    return True
 
 
 def handle_admin_message_impl(
@@ -237,6 +287,109 @@ def handle_admin_message_impl(
                     orders_sh=orders_sh,
                     tmp=tmp,
                 )
+
+        admin_survey_mode = str(tmp.get("admin_survey_mode") or "").strip()
+
+        if admin_survey_mode:
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+
+            if admin_survey_mode == "awaiting_password":
+                new_password = text.strip()
+                if not new_password:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "El password no puede estar vacío. Escríbelo otra vez:",
+                    )
+                    return {"ok": True}
+
+                ok = save_survey_password(orders_sh, new_password)
+                tmp.pop("admin_survey_mode", None)
+
+                if ok:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "✅ Password de encuesta actualizado.",
+                        reply_markup=kb([
+                            [("⚙️ Configuración", f"admsurv|{tenant_id}|config")],
+                            [("📝 Volver a encuestas", "admin_surveys")],
+                            [("🧭 Panel admin", "admin_panel")],
+                        ]),
+                    )
+                else:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No pude guardar el nuevo password.",
+                    )
+                return {"ok": True}
+
+            if admin_survey_mode == "awaiting_reward":
+                new_reward = text.strip()
+                if not new_reward:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "La recompensa no puede estar vacía. Escríbela otra vez:",
+                    )
+                    return {"ok": True}
+
+                ok = save_survey_reward(orders_sh, new_reward)
+                tmp.pop("admin_survey_mode", None)
+
+                if ok:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "✅ Recompensa de encuesta actualizada.",
+                        reply_markup=kb([
+                            [("⚙️ Configuración", f"admsurv|{tenant_id}|config")],
+                            [("📝 Volver a encuestas", "admin_surveys")],
+                            [("🧭 Panel admin", "admin_panel")],
+                        ]),
+                    )
+                else:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No pude guardar la nueva recompensa.",
+                    )
+                return {"ok": True}
+
+            if admin_survey_mode == "awaiting_new_question_text":
+                question_text = text.strip()
+                if not question_text:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "La pregunta no puede estar vacía. Escríbela otra vez:",
+                    )
+                    return {"ok": True}
+
+                tmp["admin_survey_new_question_text"] = question_text
+                tmp["admin_survey_mode"] = "awaiting_new_question_type"
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Elige el tipo de la nueva pregunta:",
+                    reply_markup=kb([
+                        [("⭐ Estrellas", f"admsurv|{tenant_id}|settype|stars")],
+                        [("✍️ Texto", f"admsurv|{tenant_id}|settype|text")],
+                        [("⬅️ Volver a preguntas", f"admsurv|{tenant_id}|questions")],
+                        [("🧭 Panel admin", "admin_panel")],
+                    ]),
+                )
+                return {"ok": True}
+
+            if admin_survey_mode == "awaiting_new_question_type":
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Selecciona el tipo usando los botones: ⭐ Estrellas o ✍️ Texto.",
+                )
+                return {"ok": True}
 
         input_mode = str(tmp.get("admin_menu_input_mode") or "").strip()
         input_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
@@ -616,6 +769,27 @@ def handle_admin_message_impl(
         ):
             assert_admin_authorized(tenant, chat_id, tenant_id)
             return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if txt_norm in (
+            "encuestas",
+            "encuesta",
+            "config encuestas",
+            "configuracion encuestas",
+            "configuracion de encuestas",
+        ):
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "📝 ENCUESTAS\n\n¿Qué deseas hacer?",
+                reply_markup=kb([
+                    [("⚙️ Configuración", f"admsurv|{tenant_id}|config")],
+                    [("❓ Gestionar preguntas", f"admsurv|{tenant_id}|questions")],
+                    [("📊 Ver resultados", f"admsurv|{tenant_id}|analytics")],
+                    [("🧭 Panel admin", "admin_panel")],
+                ]),
+            )
+            return {"ok": True}
 
         if txt_norm in ("start", "/start", "hola"):
             telegram_send_text(
