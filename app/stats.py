@@ -90,6 +90,27 @@ def _local_month_range_utc(tenant_tz: str, year: int, month: int) -> Tuple[datet
     return start_utc, end_utc
 
 
+def _local_year_range_utc(tenant_tz: str, year: int) -> Tuple[datetime, datetime]:
+    tz = _tz(tenant_tz)
+    if tz is None:
+        start = datetime(year, 1, 1, 0, 0, 0)
+        end = datetime(year + 1, 1, 1, 0, 0, 0)
+        return start, end
+
+    start_local = datetime(year, 1, 1, 0, 0, 0, tzinfo=tz)
+    end_local = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=tz)
+
+    start_utc = start_local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    end_utc = end_local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    return start_utc, end_utc
+
+
+def _local_datetime_to_utc_naive(dt_local: datetime) -> datetime:
+    if dt_local.tzinfo is None:
+        return dt_local
+    return dt_local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+
+
 def _fmt_date(d: datetime) -> str:
     return d.strftime("%d-%m-%Y")
 
@@ -133,6 +154,50 @@ def _period_range_text_local(period: "Period", tenant_tz: str) -> str:
     start_local = _to_local(period.start_utc.replace(tzinfo=ZoneInfo("UTC")), tenant_tz)
     end_local = _to_local((period.end_utc - timedelta(seconds=1)).replace(tzinfo=ZoneInfo("UTC")), tenant_tz)
     return f"{_fmt_date_local(start_local)} – {_fmt_date_local(end_local)}"
+
+
+def _month_name_es(month: int) -> str:
+    names = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+    try:
+        return names[month - 1]
+    except Exception:
+        return str(month)
+
+
+def _quarter_number(month: int) -> int:
+    if month in (1, 2, 3):
+        return 1
+    if month in (4, 5, 6):
+        return 2
+    if month in (7, 8, 9):
+        return 3
+    return 4
+
+
+def _quarter_start_month(month: int) -> int:
+    q = _quarter_number(month)
+    if q == 1:
+        return 1
+    if q == 2:
+        return 4
+    if q == 3:
+        return 7
+    return 10
+
+
+def _quarter_label(year: int, quarter: int) -> str:
+    return f"T{quarter} {year}"
+
+
+def _shift_year_month(year: int, month: int, delta_months: int) -> Tuple[int, int]:
+    total = (year * 12 + (month - 1)) + delta_months
+    new_year = total // 12
+    new_month = (total % 12) + 1
+    return new_year, new_month
+
+
+def _local_week_start(now_local: datetime) -> datetime:
+    return datetime(now_local.year, now_local.month, now_local.day, 0, 0, 0, tzinfo=now_local.tzinfo) - timedelta(days=now_local.weekday())
 
 
 # -------------------------
@@ -244,28 +309,25 @@ def build_periods(tenant_tz: str, now_utc: Optional[datetime] = None) -> List[Tu
     else:
         now_local = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
 
-    out: List[Tuple[str, str]] = []
-    out.append(("Hoy", "today"))
-    out.append(("Mes en curso", "mtd"))
+    year = now_local.year
+    month = now_local.month
 
-    y = now_local.year
-    m = now_local.month
-    for _ in range(6):
-        m -= 1
-        if m <= 0:
-            m = 12
-            y -= 1
-        out.append((f"{_month_name_es(m)} {y}", f"m:{y:04d}-{m:02d}"))
+    y1, m1 = _shift_year_month(year, month, -1)
+    y2, m2 = _shift_year_month(year, month, -2)
+    y3, m3 = _shift_year_month(year, month, -3)
 
-    return out
-
-
-def _month_name_es(month: int) -> str:
-    names = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
-    try:
-        return names[month - 1]
-    except Exception:
-        return str(month)
+    return [
+        ("Esta semana", "this_week"),
+        ("Semana pasada", "last_week"),
+        ("Mes en curso", "month_to_date"),
+        ("Mes anterior", "last_month"),
+        (f"{_month_name_es(m1)} {y1}", "month_1_ago"),
+        (f"{_month_name_es(m2)} {y2}", "month_2_ago"),
+        (f"{_month_name_es(m3)} {y3}", "month_3_ago"),
+        ("Trimestre en curso", "quarter_to_date"),
+        ("Último trimestre", "last_quarter"),
+        ("Año en curso", "year_to_date"),
+    ]
 
 
 def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] = None) -> Period:
@@ -278,27 +340,117 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
     else:
         now_local = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
 
-    if period_key == "today":
-        d = now_local.date()
-        s, e = _local_day_range_utc(tenant_tz, d)
-        return Period(label=f"{d.strftime('%d-%m-%Y')}", start_utc=s, end_utc=e)
+    # Esta semana: lunes 00:00 hasta ahora
+    if period_key == "this_week":
+        start_local = _local_week_start(now_local)
+        end_utc = now_utc
+        return Period(
+            label="Esta semana",
+            start_utc=_local_datetime_to_utc_naive(start_local),
+            end_utc=end_utc,
+        )
 
-    if period_key == "mtd":
-        y = now_local.year
-        m = now_local.month
-        s, e = _local_month_range_utc(tenant_tz, y, m)
-        return Period(label=f"{_month_name_es(m)} {y}", start_utc=s, end_utc=e)
+    # Semana pasada: lunes 00:00 a lunes 00:00 siguiente
+    if period_key == "last_week":
+        current_week_start = _local_week_start(now_local)
+        last_week_start = current_week_start - timedelta(days=7)
+        last_week_end = current_week_start
+        return Period(
+            label="Semana pasada",
+            start_utc=_local_datetime_to_utc_naive(last_week_start),
+            end_utc=_local_datetime_to_utc_naive(last_week_end),
+        )
 
-    if period_key.startswith("m:"):
-        ym = period_key.split(":", 1)[1].strip()
-        try:
-            y_s, m_s = ym.split("-", 1)
-            y = int(y_s)
-            m = int(m_s)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid period key")
+    # Mes en curso: día 1 00:00 hasta ahora
+    if period_key == "month_to_date":
+        start_utc, _ = _local_month_range_utc(tenant_tz, now_local.year, now_local.month)
+        return Period(
+            label="Mes en curso",
+            start_utc=start_utc,
+            end_utc=now_utc,
+        )
+
+    # Mes anterior: mes completo anterior
+    if period_key == "last_month":
+        y, m = _shift_year_month(now_local.year, now_local.month, -1)
         s, e = _local_month_range_utc(tenant_tz, y, m)
-        return Period(label=f"{_month_name_es(m)} {y}", start_utc=s, end_utc=e)
+        return Period(
+            label="Mes anterior",
+            start_utc=s,
+            end_utc=e,
+        )
+
+    # Hace 1 mes
+    if period_key == "month_1_ago":
+        y, m = _shift_year_month(now_local.year, now_local.month, -1)
+        s, e = _local_month_range_utc(tenant_tz, y, m)
+        return Period(
+            label=f"{_month_name_es(m)} {y}",
+            start_utc=s,
+            end_utc=e,
+        )
+
+    # Hace 2 meses
+    if period_key == "month_2_ago":
+        y, m = _shift_year_month(now_local.year, now_local.month, -2)
+        s, e = _local_month_range_utc(tenant_tz, y, m)
+        return Period(
+            label=f"{_month_name_es(m)} {y}",
+            start_utc=s,
+            end_utc=e,
+        )
+
+    # Hace 3 meses
+    if period_key == "month_3_ago":
+        y, m = _shift_year_month(now_local.year, now_local.month, -3)
+        s, e = _local_month_range_utc(tenant_tz, y, m)
+        return Period(
+            label=f"{_month_name_es(m)} {y}",
+            start_utc=s,
+            end_utc=e,
+        )
+
+    # Trimestre en curso: inicio trimestre hasta ahora
+    if period_key == "quarter_to_date":
+        q_start_month = _quarter_start_month(now_local.month)
+        q_num = _quarter_number(now_local.month)
+        tzinfo = now_local.tzinfo
+        start_local = datetime(now_local.year, q_start_month, 1, 0, 0, 0, tzinfo=tzinfo)
+        return Period(
+            label="Trimestre en curso",
+            start_utc=_local_datetime_to_utc_naive(start_local),
+            end_utc=now_utc,
+        )
+
+    # Último trimestre: trimestre completo anterior
+    if period_key == "last_quarter":
+        current_q_start_month = _quarter_start_month(now_local.month)
+        current_q_start_local = datetime(now_local.year, current_q_start_month, 1, 0, 0, 0, tzinfo=now_local.tzinfo)
+        prev_q_end_local = current_q_start_local
+
+        prev_q_start_year = current_q_start_local.year
+        prev_q_start_month = current_q_start_month - 3
+        if prev_q_start_month <= 0:
+            prev_q_start_month += 12
+            prev_q_start_year -= 1
+
+        prev_q_start_local = datetime(prev_q_start_year, prev_q_start_month, 1, 0, 0, 0, tzinfo=now_local.tzinfo)
+        prev_q_num = _quarter_number(prev_q_start_month)
+
+        return Period(
+            label=_quarter_label(prev_q_start_year, prev_q_num),
+            start_utc=_local_datetime_to_utc_naive(prev_q_start_local),
+            end_utc=_local_datetime_to_utc_naive(prev_q_end_local),
+        )
+
+    # Año en curso: 1 enero hasta ahora
+    if period_key == "year_to_date":
+        s, _ = _local_year_range_utc(tenant_tz, now_local.year)
+        return Period(
+            label="Año en curso",
+            start_utc=s,
+            end_utc=now_utc,
+        )
 
     raise HTTPException(status_code=400, detail="Invalid period key")
 
