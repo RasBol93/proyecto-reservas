@@ -1,6 +1,7 @@
 # app/stats.py — versión UX mejorada tipo app + resumen ejecutivo + insights + mini gráfico
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date
 from typing import Any, Dict, List, Optional, Tuple
@@ -93,6 +94,10 @@ def _fmt_date(d: datetime) -> str:
     return d.strftime("%d-%m-%Y")
 
 
+def _fmt_date_local(d: datetime) -> str:
+    return d.strftime("%d/%m/%Y")
+
+
 def _weekday_es(dt: datetime) -> str:
     return ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"][dt.weekday()]
 
@@ -106,6 +111,28 @@ def _safe_float(v: Any) -> float:
         return float(str(v).replace(",", "."))
     except Exception:
         return 0.0
+
+
+def _to_local(dt: datetime, tenant_tz: str) -> datetime:
+    tz = _tz(tenant_tz)
+    if tz is None:
+        return dt
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt.astimezone(tz)
+
+
+def _normalize_contact(value: Any) -> str:
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    return re.sub(r"\D+", "", s)
+
+
+def _period_range_text_local(period: "Period", tenant_tz: str) -> str:
+    start_local = _to_local(period.start_utc.replace(tzinfo=ZoneInfo("UTC")), tenant_tz)
+    end_local = _to_local((period.end_utc - timedelta(seconds=1)).replace(tzinfo=ZoneInfo("UTC")), tenant_tz)
+    return f"{_fmt_date_local(start_local)} – {_fmt_date_local(end_local)}"
 
 
 # -------------------------
@@ -318,7 +345,7 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
             raise HTTPException(status_code=500, detail=f"Cannot read Orders: {e}")
 
     if not values:
-        return f"📊 ESTADÍSTICAS\n\n📅 {_fmt_date(period.start_utc)} a {_fmt_date(period.end_utc)}\n\nSin datos."
+        return f"📊 ESTADÍSTICAS\n\n📅 {_period_range_text_local(period, tenant_tz)}\n\nSin datos."
 
     hdr_idx = _detect_header_row(values, required_headers=["order_id", "created_at", "status"], max_scan=30)
     headers_raw = values[hdr_idx]
@@ -335,7 +362,7 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
     i_contact = cidx("customer_contact")
 
     if i_created is None or i_status is None:
-        return f"📊 ESTADÍSTICAS\n\n📅 {_fmt_date(period.start_utc)} a {_fmt_date(period.end_utc)}\n\nLa hoja Orders no tiene las columnas requeridas."
+        return f"📊 ESTADÍSTICAS\n\n📅 {_period_range_text_local(period, tenant_tz)}\n\nLa hoja Orders no tiene las columnas requeridas."
 
     try:
         menu_idx = load_menu_index(orders_sh)
@@ -373,6 +400,8 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
         if not (period.start_utc <= dt_utc < period.end_utc):
             continue
 
+        dt_local = _to_local(dt, tenant_tz)
+
         orders_created += 1
 
         status = row[i_status] if i_status < len(row) else ""
@@ -388,8 +417,9 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
 
         if i_contact is not None:
             c = row[i_contact] if i_contact < len(row) else ""
-            if c:
-                paid_customers.add(str(c).strip())
+            c_norm = _normalize_contact(c)
+            if c_norm:
+                paid_customers.add(c_norm)
 
         items_field = row[i_items] if (i_items is not None and i_items < len(row)) else ""
         items = _parse_items(items_field)
@@ -424,14 +454,14 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
             sku_sales[sku] = sku_sales.get(sku, 0.0) + (price * qty)
             cats_in_order.add(cat)
 
-        weekday = _weekday_es(dt_utc)
+        weekday = _weekday_es(dt_local)
         if weekday not in weekday_stats:
             weekday_stats[weekday] = {"orders": 0, "units": 0, "sales": 0.0}
         weekday_stats[weekday]["orders"] += 1
         weekday_stats[weekday]["units"] += order_units
         weekday_stats[weekday]["sales"] += order_sales
 
-        hour_key = _hour_bucket(dt_utc)
+        hour_key = _hour_bucket(dt_local)
         hour_stats_sales[hour_key] = hour_stats_sales.get(hour_key, 0.0) + order_sales
         hour_stats_orders[hour_key] = hour_stats_orders.get(hour_key, 0) + 1
 
@@ -483,7 +513,7 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
 
     lines.append("📊 ESTADÍSTICAS")
     lines.append("")
-    lines.append(f"📅 {_fmt_date(period.start_utc)} a {_fmt_date(period.end_utc)}")
+    lines.append(f"📅 {_period_range_text_local(period, tenant_tz)}")
     lines.append("")
 
     lines.append("🧠 RESUMEN EJECUTIVO")
