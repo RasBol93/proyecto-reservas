@@ -13,6 +13,7 @@ def admin_panel_kb():
     return kb([
         [("📊 Estadísticas", "admin_stats")],
         [("👥 Base de consumidores", "admin_consumers")],
+        [("📝 Encuestas", "admin_surveys")],  # 👈 NUEVO
         [("➕ Crear pedido manual", "admin_order")],
         [("⚙️ Config días y horarios", "admin_hours")],
         [("🍔 Config menú y precios", "admin_menu")],
