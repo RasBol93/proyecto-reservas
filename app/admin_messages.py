@@ -1,6 +1,6 @@
 # app/admin_messages.py — admin por texto "panel", pedido manual mejorado y sin teclado persistente inferior
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from app.menu import (
     load_menu_admin_index,
@@ -58,6 +58,10 @@ from app.survey import (
     add_survey_question,
     load_survey_questions,
 )
+from app.sheets import get_ws
+
+
+SURVEY_CONFIG_WS = "Survey_Config"
 
 
 def _finalize_admin_manual_order(
@@ -146,6 +150,15 @@ def _finalize_admin_manual_order(
     return {"ok": True}
 
 
+def _survey_type_label(qtype: str) -> str:
+    q = str(qtype or "").strip().lower()
+    if q == "stars":
+        return "Estrellas"
+    if q == "text":
+        return "Texto"
+    return qtype or ""
+
+
 def _send_admin_surveys_questions(
     bot_token: str,
     chat_id: int,
@@ -155,25 +168,33 @@ def _send_admin_surveys_questions(
     questions = load_survey_questions(orders_sh)
 
     lines = [
-        "❓ GESTIONAR PREGUNTAS\n",
+        "❓ GESTIONAR PREGUNTAS",
+        "",
     ]
 
     if not questions:
-        lines.append("No hay preguntas activas.\n")
+        lines.append("No hay preguntas activas.")
     else:
         for idx, q in enumerate(questions, start=1):
             qid = str(q.get("question_id") or "").strip()
-            qtype = str(q.get("type") or "").strip()
+            qtype = _survey_type_label(str(q.get("type") or "").strip())
             qtext = str(q.get("question_text") or "").strip()
-            lines.append(f"{idx}. [{qid}] ({qtype}) {qtext}")
+            lines.append(f"{idx}. [{qid}] {qtext}")
+            lines.append(f"   {qtype}")
+            lines.append("")
 
     rows = []
     if questions:
         for q in questions[:20]:
             qid = str(q.get("question_id") or "").strip()
             qtext = str(q.get("question_text") or "").strip()
-            short_label = qtext[:24] + "..." if len(qtext) > 24 else qtext
-            rows.append([(f"🗑 Eliminar {short_label}", f"admsurv|{tenant_id}|delq|{qid}")])
+            short_label = qtext[:18] + "..." if len(qtext) > 18 else qtext
+
+            rows.append([
+                (f"✏️ {short_label}", f"admsurv|{tenant_id}|editq|{qid}"),
+                ("🔁 Tipo", f"admsurv|{tenant_id}|chtype|{qid}"),
+                ("🗑", f"admsurv|{tenant_id}|delq|{qid}"),
+            ])
 
     rows.extend([
         [("➕ Agregar pregunta", f"admsurv|{tenant_id}|addq")],
@@ -187,6 +208,65 @@ def _send_admin_surveys_questions(
         "\n".join(lines),
         reply_markup=kb(rows),
     )
+    return True
+
+
+def _survey_config_ws(orders_sh):
+    return get_ws(orders_sh, SURVEY_CONFIG_WS)
+
+
+def _survey_header_map(ws) -> Dict[str, int]:
+    values = ws.get_all_values()
+    if not values:
+        return {}
+    header = [str(x or "").strip() for x in values[0]]
+    return {name: idx for idx, name in enumerate(header)}
+
+
+def _survey_bool_cell(value: str) -> bool:
+    v = str(value or "").strip().lower()
+    return v in ("true", "1", "yes", "si", "sí", "y")
+
+
+def _survey_find_last_active_question_row(ws, question_id: str) -> Optional[int]:
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return None
+
+    hmap = _survey_header_map(ws)
+    idx_qid = hmap.get("question_id")
+    idx_active = hmap.get("active")
+
+    if idx_qid is None or idx_active is None:
+        return None
+
+    for row_num in range(len(values), 1, -1):
+        row = values[row_num - 1]
+        row_qid = row[idx_qid].strip() if idx_qid < len(row) else ""
+        row_active = row[idx_active].strip() if idx_active < len(row) else ""
+        if row_qid == question_id and _survey_bool_cell(row_active):
+            return row_num
+
+    return None
+
+
+def _survey_update_question_text_in_place(
+    orders_sh,
+    question_id: str,
+    new_text: str,
+) -> bool:
+    ws = _survey_config_ws(orders_sh)
+    hmap = _survey_header_map(ws)
+    target_row = _survey_find_last_active_question_row(ws, question_id)
+
+    if not target_row:
+        return False
+
+    idx_qtext = hmap.get("question_text")
+    if idx_qtext is None:
+        return False
+
+    ws.update_cell(target_row, idx_qtext + 1, str(new_text).strip())
     return True
 
 
@@ -391,6 +471,52 @@ def handle_admin_message_impl(
                 )
                 return {"ok": True}
 
+            if admin_survey_mode == "awaiting_edit_question_text":
+                question_id = str(tmp.get("admin_survey_edit_qid") or "").strip()
+                new_question_text = text.strip()
+
+                if not question_id:
+                    tmp.pop("admin_survey_mode", None)
+                    tmp.pop("admin_survey_edit_qid", None)
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No encontré la pregunta a editar. Vuelve a entrar.",
+                    )
+                    return {"ok": True}
+
+                if not new_question_text:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "El nuevo texto no puede estar vacío. Escríbelo otra vez:",
+                    )
+                    return {"ok": True}
+
+                ok = _survey_update_question_text_in_place(
+                    orders_sh=orders_sh,
+                    question_id=question_id,
+                    new_text=new_question_text,
+                )
+
+                tmp.pop("admin_survey_mode", None)
+                tmp.pop("admin_survey_edit_qid", None)
+
+                if ok:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "✅ Texto de pregunta actualizado.",
+                    )
+                else:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No pude actualizar el texto de esa pregunta.",
+                    )
+
+                return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
+
         input_mode = str(tmp.get("admin_menu_input_mode") or "").strip()
         input_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
 
@@ -456,7 +582,6 @@ def handle_admin_message_impl(
                 )
                 return {"ok": True}
 
-            # Se deja por compatibilidad hacia atrás si algún flujo viejo todavía lo dispara
             if create_step == "category":
                 category = text.strip()
                 if not category:
