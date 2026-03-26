@@ -76,6 +76,15 @@ from app.admin_manual_order import (
 from app.admin_nav import (
     admin_panel_kb,
 )
+from app.survey import (
+    survey_is_enabled,
+    save_survey_enabled,
+    get_survey_password,
+    get_survey_reward_text,
+    build_survey_analytics_text,
+    load_survey_questions,
+    disable_survey_question,
+)
 
 
 def _finalize_admin_manual_order_from_tmp(
@@ -164,6 +173,109 @@ def _finalize_admin_manual_order_from_tmp(
     return {"ok": True}
 
 
+def _send_admin_surveys_home(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+) -> bool:
+    enabled = survey_is_enabled(orders_sh)
+    status = "🟢 Activa" if enabled else "🔴 Inactiva"
+
+    telegram_send_text(
+        bot_token,
+        chat_id,
+        (
+            "📝 ENCUESTAS\n\n"
+            f"Estado actual: {status}\n\n"
+            "¿Qué deseas hacer?"
+        ),
+        reply_markup=kb([
+            [("⚙️ Configuración", f"admsurv|{tenant_id}|config")],
+            [("❓ Gestionar preguntas", f"admsurv|{tenant_id}|questions")],
+            [("📊 Ver resultados", f"admsurv|{tenant_id}|analytics")],
+            [("⬅️ Volver", "admin_panel")],
+        ]),
+    )
+    return True
+
+
+def _send_admin_surveys_config(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+) -> bool:
+    enabled = survey_is_enabled(orders_sh)
+    status = "🟢 Activa" if enabled else "🔴 Inactiva"
+    password = get_survey_password(orders_sh) or "(sin definir)"
+    reward = get_survey_reward_text(orders_sh) or "(sin definir)"
+
+    telegram_send_text(
+        bot_token,
+        chat_id,
+        (
+            "⚙️ CONFIGURACIÓN DE ENCUESTAS\n\n"
+            f"Estado: {status}\n"
+            f"Password actual: {password}\n"
+            f"Recompensa actual: {reward}\n\n"
+            "Elige una opción:"
+        ),
+        reply_markup=kb([
+            [("🔁 Activar / Desactivar", f"admsurv|{tenant_id}|toggle")],
+            [("🔑 Cambiar password", f"admsurv|{tenant_id}|password")],
+            [("🎁 Cambiar recompensa", f"admsurv|{tenant_id}|reward")],
+            [("⬅️ Volver a encuestas", "admin_surveys")],
+            [("🧭 Panel admin", "admin_panel")],
+        ]),
+    )
+    return True
+
+
+def _send_admin_surveys_questions(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+) -> bool:
+    questions = load_survey_questions(orders_sh)
+
+    lines = [
+        "❓ GESTIONAR PREGUNTAS\n",
+    ]
+
+    if not questions:
+        lines.append("No hay preguntas activas.\n")
+    else:
+        for idx, q in enumerate(questions, start=1):
+            qid = str(q.get("question_id") or "").strip()
+            qtype = str(q.get("type") or "").strip()
+            qtext = str(q.get("question_text") or "").strip()
+            lines.append(f"{idx}. [{qid}] ({qtype}) {qtext}")
+
+    rows = []
+    if questions:
+        for q in questions[:20]:
+            qid = str(q.get("question_id") or "").strip()
+            qtext = str(q.get("question_text") or "").strip()
+            short_label = qtext[:24] + "..." if len(qtext) > 24 else qtext
+            rows.append([(f"🗑 Eliminar {short_label}", f"admsurv|{tenant_id}|delq|{qid}")])
+
+    rows.extend([
+        [("➕ Agregar pregunta", f"admsurv|{tenant_id}|addq")],
+        [("⬅️ Volver a encuestas", "admin_surveys")],
+        [("🧭 Panel admin", "admin_panel")],
+    ])
+
+    telegram_send_text(
+        bot_token,
+        chat_id,
+        "\n".join(lines),
+        reply_markup=kb(rows),
+    )
+    return True
+
+
 def handle_admin_callback_impl(
     tenant: Dict[str, Any],
     tenant_id: str,
@@ -200,18 +312,7 @@ def handle_admin_callback_impl(
 
         if data == "admin_surveys":
             assert_admin_authorized(tenant, chat_id, tenant_id)
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                "📝 ENCUESTAS\n\n¿Qué deseas hacer?",
-                reply_markup=kb([
-                    [("⚙️ Configuración", f"admsurv|{tenant_id}|config")],
-                    [("❓ Gestionar preguntas", f"admsurv|{tenant_id}|questions")],
-                    [("📊 Ver resultados", f"admsurv|{tenant_id}|analytics")],
-                    [("⬅️ Volver", "admin_panel")],
-                ]),
-            )
-            return {"ok": True}
+            return {"ok": _send_admin_surveys_home(bot_token, chat_id, tenant_id, orders_sh)}
 
         if data == "admin_order":
             assert_admin_authorized(tenant, chat_id, tenant_id)
@@ -229,6 +330,147 @@ def handle_admin_callback_impl(
             assert_admin_authorized(tenant, chat_id, tenant_id)
             sess = get_sess(tenant_id, chat_id)
             return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if data.startswith("admsurv|"):
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+
+            parts = data.split("|")
+            if len(parts) < 3:
+                return {"ok": True}
+
+            cb_tenant_id = parts[1].strip()
+            if cb_tenant_id != tenant_id:
+                raise HTTPException(status_code=400, detail="Tenant mismatch in survey callback")
+
+            action = parts[2].strip()
+            sess = get_sess(tenant_id, chat_id)
+            tmp = sess.setdefault("tmp", {})
+
+            if action == "config":
+                return {"ok": _send_admin_surveys_config(bot_token, chat_id, tenant_id, orders_sh)}
+
+            if action == "toggle":
+                current = survey_is_enabled(orders_sh)
+                ok = save_survey_enabled(orders_sh, not current)
+                if ok:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"✅ Encuesta {'activada' if not current else 'desactivada'}.",
+                    )
+                else:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No pude cambiar el estado de la encuesta.",
+                    )
+                return {"ok": _send_admin_surveys_config(bot_token, chat_id, tenant_id, orders_sh)}
+
+            if action == "password":
+                tmp["admin_survey_mode"] = "awaiting_password"
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "🔑 Escribe el nuevo password de la encuesta:",
+                )
+                return {"ok": True}
+
+            if action == "reward":
+                tmp["admin_survey_mode"] = "awaiting_reward"
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "🎁 Escribe la nueva recompensa literal.\nEjemplo: 50% de descuento",
+                )
+                return {"ok": True}
+
+            if action == "questions":
+                return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
+
+            if action == "addq":
+                tmp["admin_survey_mode"] = "awaiting_new_question_text"
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "✍️ Escribe el texto de la nueva pregunta:",
+                )
+                return {"ok": True}
+
+            if action == "delq" and len(parts) == 4:
+                question_id = parts[3].strip()
+                result = disable_survey_question(orders_sh, question_id)
+                if result.get("ok"):
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"✅ Pregunta {question_id} desactivada.",
+                    )
+                else:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No pude desactivar esa pregunta.",
+                    )
+                return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
+
+            if action == "settype" and len(parts) == 4:
+                qtype = parts[3].strip().lower()
+                pending_qtext = str(tmp.get("admin_survey_new_question_text") or "").strip()
+
+                if not pending_qtext:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No encontré el texto de la nueva pregunta. Vuelve a empezar.",
+                    )
+                    tmp.pop("admin_survey_mode", None)
+                    tmp.pop("admin_survey_new_question_text", None)
+                    return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
+
+                if qtype not in ("text", "stars"):
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ Tipo inválido.",
+                    )
+                    return {"ok": True}
+
+                from app.survey import add_survey_question
+
+                result = add_survey_question(orders_sh, pending_qtext, qtype)
+
+                tmp.pop("admin_survey_mode", None)
+                tmp.pop("admin_survey_new_question_text", None)
+
+                if result.get("ok"):
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"✅ Pregunta creada.\nTipo: {qtype}\nTexto: {pending_qtext}",
+                    )
+                else:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No pude crear la pregunta.",
+                    )
+
+                return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
+
+            if action == "analytics":
+                txt = build_survey_analytics_text(orders_sh)
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    txt,
+                    reply_markup=kb([
+                        [("⬅️ Volver a encuestas", "admin_surveys")],
+                        [("🧭 Panel admin", "admin_panel")],
+                    ]),
+                )
+                return {"ok": True}
+
+            return {"ok": True}
 
         if data.startswith("paid|"):
             parts = data.split("|")
