@@ -200,6 +200,10 @@ def _local_week_start(now_local: datetime) -> datetime:
     return datetime(now_local.year, now_local.month, now_local.day, 0, 0, 0, tzinfo=now_local.tzinfo) - timedelta(days=now_local.weekday())
 
 
+def _local_day_start(now_local: datetime) -> datetime:
+    return datetime(now_local.year, now_local.month, now_local.day, 0, 0, 0, tzinfo=now_local.tzinfo)
+
+
 # -------------------------
 # Worksheet helpers
 # -------------------------
@@ -317,6 +321,8 @@ def build_periods(tenant_tz: str, now_utc: Optional[datetime] = None) -> List[Tu
     y3, m3 = _shift_year_month(year, month, -3)
 
     return [
+        ("Hoy", "today"),
+        ("Ayer", "yesterday"),
         ("Esta semana", "this_week"),
         ("Semana pasada", "last_week"),
         ("Mes en curso", "month_to_date"),
@@ -339,6 +345,23 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
         now_local = now_utc
     else:
         now_local = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+
+    if period_key == "today":
+        start_local = _local_day_start(now_local)
+        return Period(
+            label="Hoy",
+            start_utc=_local_datetime_to_utc_naive(start_local),
+            end_utc=now_utc,
+        )
+
+    if period_key == "yesterday":
+        current_day_start = _local_day_start(now_local)
+        yesterday_start = current_day_start - timedelta(days=1)
+        return Period(
+            label="Ayer",
+            start_utc=_local_datetime_to_utc_naive(yesterday_start),
+            end_utc=_local_datetime_to_utc_naive(current_day_start),
+        )
 
     # Esta semana: lunes 00:00 hasta ahora
     if period_key == "this_week":
