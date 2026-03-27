@@ -18,7 +18,7 @@
 import random
 import string
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 from zoneinfo import ZoneInfo
 
 from app.sheets import get_ws, read_records_manual
@@ -106,16 +106,6 @@ def _make_coupon_code(phone: str) -> str:
     if not phone_norm:
         phone_norm = "SINNUMERO"
     return f"{phone_norm}{_random_letters(3)}"
-
-
-def _spreadsheet_id(spreadsheet) -> str:
-    try:
-        sid = getattr(spreadsheet, "id", None)
-        if sid:
-            return str(sid)
-    except Exception:
-        pass
-    return ""
 
 
 # ---------------------------------------------------------
@@ -676,10 +666,8 @@ def load_survey_response_rows(orders_sh) -> List[Dict[str, Any]]:
 
 
 def build_survey_analytics(orders_sh) -> Dict[str, Any]:
-    """
-    Devuelve estructura simple para luego renderizar en admin.
-    """
     rows = load_survey_response_rows(orders_sh)
+
     if not rows:
         return {
             "total_answers": 0,
@@ -713,10 +701,19 @@ def build_survey_analytics(orders_sh) -> Dict[str, Any]:
                 "stars_values": [],
                 "stars_hist": {1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
                 "text_answers": [],
+                "order_hint": 999999,
             }
 
         q = by_question_map[qid]
         q["count"] += 1
+
+        try:
+            q_order = int(_safe_str(r.get("question_order")) or "999999")
+        except Exception:
+            q_order = 999999
+
+        if q_order < q["order_hint"]:
+            q["order_hint"] = q_order
 
         if atype == "stars":
             try:
@@ -748,10 +745,11 @@ def build_survey_analytics(orders_sh) -> Dict[str, Any]:
             "count": q["count"],
             "stars_avg": stars_avg,
             "stars_hist": q["stars_hist"],
-            "text_answers": q["text_answers"][:20],  # límite defensivo para reporte simple
+            "text_answers": q["text_answers"][:20],
+            "order_hint": q["order_hint"],
         })
 
-    by_question.sort(key=lambda x: (_safe_str(x["question_id"])))
+    by_question.sort(key=lambda x: (int(x.get("order_hint", 999999)), _safe_str(x["question_id"])))
 
     general_avg = round(sum(general_stars_values) / len(general_stars_values), 2) if general_stars_values else 0.0
 
@@ -765,50 +763,95 @@ def build_survey_analytics(orders_sh) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------
-# Reporte admin simple
+# Render visual admin
 # ---------------------------------------------------------
 
-def _stars_hist_text(hist: Dict[int, int]) -> str:
-    parts = []
+def _hist_total(hist: Dict[int, int]) -> int:
+    return sum(int(hist.get(n, 0)) for n in [1, 2, 3, 4, 5])
+
+
+def _bar_blue(count: int, max_count: int, width: int = 10) -> str:
+    if max_count <= 0:
+        return "▫️"
+    if count <= 0:
+        return "▫️"
+
+    filled = round((count / max_count) * width)
+    filled = max(1, filled)
+    return "🟦" * filled
+
+
+def _build_hist_block(hist: Dict[int, int], width: int = 10) -> List[str]:
+    max_count = max([int(hist.get(n, 0)) for n in [1, 2, 3, 4, 5]] + [0])
+    lines: List[str] = []
+
     for n in [1, 2, 3, 4, 5]:
-        parts.append(f"{n}⭐: {int(hist.get(n, 0))}")
-    return " | ".join(parts)
+        count = int(hist.get(n, 0))
+        bar = _bar_blue(count, max_count, width=width)
+        lines.append(f"{n}⭐  {bar}  {count}")
+
+    return lines
 
 
 def build_survey_analytics_text(orders_sh) -> str:
     data = build_survey_analytics(orders_sh)
 
+    total_completed = int(data.get("total_unique_responses", 0))
+    general_avg = float(data.get("general_stars_avg", 0.0))
+    general_hist = data.get("general_stars_hist", {}) or {}
+    by_question = data.get("by_question", []) or []
+
     lines: List[str] = []
-    lines.append("🌟 ENCUESTAS")
-    lines.append("")
-    lines.append(f"Total respuestas guardadas: {int(data.get('total_answers', 0))}")
-    lines.append(f"Encuestas completadas: {int(data.get('total_unique_responses', 0))}")
-    lines.append(f"Promedio general estrellas: {float(data.get('general_stars_avg', 0.0)):.2f}")
-    lines.append(f"Gráfico general estrellas: {_stars_hist_text(data.get('general_stars_hist', {}))}")
+
+    lines.append("╔══════════════════════╗")
+    lines.append("║   🌟  ENCUESTAS      ║")
+    lines.append("╚══════════════════════╝")
     lines.append("")
 
-    by_question = data.get("by_question") or []
+    lines.append("📌 RESUMEN GENERAL")
+    lines.append(f"• Encuestas completadas: {total_completed}")
+    lines.append(f"• Promedio general: {general_avg:.2f}")
+    lines.append("")
+    lines.append("🟦 Distribución general de estrellas")
+    lines.extend(_build_hist_block(general_hist))
+    lines.append("")
+
     if not by_question:
-        lines.append("No hay resultados todavía.")
+        lines.append("Aún no hay resultados guardados.")
         return "\n".join(lines)
 
-    lines.append("Detalle por pregunta:")
-    for q in by_question:
-        lines.append("")
-        lines.append(f"• {q.get('question_text', '')}")
-        lines.append(f"  Tipo: {q.get('answer_type', '')}")
-        lines.append(f"  Respuestas: {int(q.get('count', 0))}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("🧩 DETALLE POR PREGUNTA")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
 
-        if q.get("answer_type") == "stars":
-            lines.append(f"  Promedio: {float(q.get('stars_avg', 0.0)):.2f}")
-            lines.append(f"  Gráfico: {_stars_hist_text(q.get('stars_hist', {}))}")
+    for idx, q in enumerate(by_question, start=1):
+        qtext = _safe_str(q.get("question_text"))
+        answer_type = normalize(q.get("answer_type", ""))
+        count = int(q.get("count", 0))
+        stars_avg = float(q.get("stars_avg", 0.0))
+        stars_hist = q.get("stars_hist", {}) or {}
+        text_answers = q.get("text_answers", []) or []
+
+        lines.append("")
+        lines.append(f"❓ Pregunta {idx}")
+        lines.append(qtext)
+        lines.append(f"• Respuestas: {count}")
+
+        if answer_type == "stars":
+            lines.append(f"• Promedio: {stars_avg:.2f}")
+            lines.append("🟦 Distribución")
+            lines.extend(_build_hist_block(stars_hist))
         else:
-            text_answers = q.get("text_answers") or []
+            lines.append("💬 Respuestas recientes")
             if text_answers:
-                lines.append("  Últimas respuestas:")
                 for ans in text_answers[:5]:
-                    lines.append(f"   - {ans}")
+                    lines.append(f"• {ans}")
             else:
-                lines.append("  Sin respuestas textuales.")
+                lines.append("• Sin respuestas todavía.")
+
+        lines.append("──────────────────────")
+
+    if lines and lines[-1] == "──────────────────────":
+        lines.pop()
 
     return "\n".join(lines)
