@@ -91,6 +91,8 @@ def consumer_period_options(tenant_tz: str) -> List[Tuple[str, str]]:
     y3, m3 = _shift_year_month(year, month, -3)
 
     return [
+        ("Hoy", "today"),
+        ("Ayer", "yesterday"),
         ("Esta semana", "this_week"),
         ("Semana pasada", "last_week"),
         ("Mes en curso", "month_to_date"),
@@ -125,6 +127,15 @@ def consumer_filters_inline_kb(tenant_id: str, period_key: str) -> Dict[str, Any
 def resolve_consumer_period(period_key: str, tenant_tz: str) -> ConsumerPeriod:
     tz = ZoneInfo(tenant_tz)
     now_local = datetime.now(tz)
+
+    if period_key == "today":
+        start_local = _start_of_day(now_local)
+        return ConsumerPeriod("today", "Hoy", start_local, now_local)
+
+    if period_key == "yesterday":
+        current_day_start = _start_of_day(now_local)
+        yesterday_start = current_day_start - timedelta(days=1)
+        return ConsumerPeriod("yesterday", "Ayer", yesterday_start, current_day_start)
 
     if period_key == "this_week":
         start_local = _start_of_week(now_local)
