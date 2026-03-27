@@ -83,6 +83,7 @@ from app.survey import (
     get_survey_reward_text,
     build_survey_analytics_text,
     load_survey_questions,
+    survey_period_options,
 )
 from app.sheets import get_ws
 
@@ -374,6 +375,30 @@ def _send_admin_surveys_questions(
     return True
 
 
+def _send_admin_surveys_periods(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    tenant_tz: str,
+) -> bool:
+    rows = []
+    for label, key in survey_period_options(tenant_tz):
+        rows.append([(f"📊 {label}", f"admsurv|{tenant_id}|period|{key}")])
+
+    rows.extend([
+        [("⬅️ Volver a encuestas", "admin_surveys")],
+        [("🧭 Panel admin", "admin_panel")],
+    ])
+
+    telegram_send_text(
+        bot_token,
+        chat_id,
+        "📊 RESULTADOS DE ENCUESTAS\n\nSelecciona el período:",
+        reply_markup=kb(rows),
+    )
+    return True
+
+
 def handle_admin_callback_impl(
     tenant: Dict[str, Any],
     tenant_id: str,
@@ -653,12 +678,21 @@ def handle_admin_callback_impl(
                 return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
 
             if action == "analytics":
-                txt = build_survey_analytics_text(orders_sh)
+                return {"ok": _send_admin_surveys_periods(bot_token, chat_id, tenant_id, tenant_tz)}
+
+            if action == "period" and len(parts) == 4:
+                period_key = parts[3].strip()
+                txt = build_survey_analytics_text(
+                    orders_sh,
+                    tenant_tz=tenant_tz,
+                    period_key=period_key,
+                )
                 telegram_send_text(
                     bot_token,
                     chat_id,
                     txt,
                     reply_markup=kb([
+                        [("⬅️ Períodos", f"admsurv|{tenant_id}|analytics")],
                         [("⬅️ Volver a encuestas", "admin_surveys")],
                         [("🧭 Panel admin", "admin_panel")],
                     ]),
