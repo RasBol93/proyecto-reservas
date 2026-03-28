@@ -98,6 +98,7 @@ def _finalize_admin_manual_order_from_tmp(
     chat_id: int,
     orders_sh,
     tmp: Dict[str, Any],
+    tenant: Dict[str, Any],
 ) -> Dict[str, Any]:
     requested_time = str(tmp.get("admin_order_requested_time") or "").strip() or "ahora"
     cart = tmp.get("admin_order_cart") or []
@@ -175,6 +176,33 @@ def _finalize_admin_manual_order_from_tmp(
         "✅ *Pedido manual registrado como pagado.*\nYa cuenta para estadísticas y base de consumidores.",
         parse_mode="Markdown",
     )
+
+    try:
+        owner_enabled = str(tenant.get("owner_enabled") or "").strip().lower() == "true"
+        owner_chat = str(tenant.get("owner_chat_id") or "").strip()
+        owner_token = str(tenant.get("owner_bot_token") or "").strip()
+
+        if owner_enabled and owner_chat and owner_token:
+            telegram_send_text(
+                owner_token,
+                int(owner_chat),
+                (
+                    "📦 *Nuevo pedido registrado (manual)*\n\n"
+                    f"Código: {order_id}\n"
+                    f"Cliente: {customer_name}\n"
+                    f"Contacto: {customer_contact}\n\n"
+                    f"Total: Bs {total_amount}"
+                ),
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        log_event(
+            "notify_owner_manual_order_failed",
+            tenant_id=tenant_id,
+            order_id=order_id,
+            error=str(e),
+        )
+
     return {"ok": True}
 
 
@@ -1034,6 +1062,7 @@ def handle_admin_callback_impl(
                     chat_id=chat_id,
                     orders_sh=orders_sh,
                     tmp=tmp,
+                    tenant=tenant,
                 )
 
             if action == "timelater":
