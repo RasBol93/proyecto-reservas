@@ -9,15 +9,22 @@ def admin_root_kb():
     ])
 
 
-def admin_panel_kb():
-    return kb([
+def admin_panel_kb(user_role: str = "admin"):
+    rows = [
         [("📊 Estadísticas", "admin_stats")],
         [("👥 Base de consumidores", "admin_consumers")],
-        [("📝 Encuestas", "admin_surveys")],  # 👈 NUEVO
-        [("➕ Crear pedido manual", "admin_order")],
+        [("📝 Encuestas", "admin_surveys")],
+    ]
+
+    if str(user_role or "").strip().lower() != "owner":
+        rows.append([("➕ Crear pedido manual", "admin_order")])
+
+    rows.extend([
         [("⚙️ Config días y horarios", "admin_hours")],
         [("🍔 Config menú y precios", "admin_menu")],
     ])
+
+    return kb(rows)
 
 
 def admin_back_panel_kb(back_data: str):
