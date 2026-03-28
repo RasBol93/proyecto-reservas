@@ -438,6 +438,24 @@ def handle_admin_callback_impl(
             return {"ok": _send_admin_surveys_home(bot_token, chat_id, tenant_id, orders_sh)}
 
         if data == "admin_order":
+    assert_admin_authorized(tenant, chat_id, tenant_id)
+
+    from app.webhook_helpers import get_user_role
+    role = get_user_role(tenant, chat_id)
+
+    # 🔴 BLOQUEO OWNER
+    if role == "owner":
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            "🚫 Esta opción no está disponible para el propietario.",
+        )
+        return {"ok": True}
+    sess = get_sess(tenant_id, chat_id)
+    tmp = sess.setdefault("tmp", {})
+    _admin_order_reset(tmp)
+    tmp["admin_order_cart"] = []
+    return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
             assert_admin_authorized(tenant, chat_id, tenant_id)
             sess = get_sess(tenant_id, chat_id)
             tmp = sess.setdefault("tmp", {})
