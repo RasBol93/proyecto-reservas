@@ -60,6 +60,13 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         if not bot_token:
             return {"ok": True}
 
+        # 🔴 NUEVO: detectar si es owner
+        owner_secret = (tenant.get("webhook_secret_owner") or "").strip()
+        if owner_secret and secret == owner_secret:
+            tenant["_is_owner_bot"] = True
+        else:
+            tenant["_is_owner_bot"] = False
+
         # -------------------------
         # Sheet (con cache)
         # -------------------------
