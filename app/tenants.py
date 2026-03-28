@@ -126,6 +126,7 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
       - admin_bot_token + webhook_secret_admin (nuevo)
       - bot_token + webhook_secret (viejo fallback)
       - bot_token_admin / bot_token_client (alternos)
+      - owner_bot_token + webhook_secret_owner
     """
     global _TENANTS_CACHE, _TENANTS_CACHE_AT, _TENANTS_CACHE_AT_TS
 
@@ -196,6 +197,9 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
                 get(row, "client_bot_token"),
                 get(row, "bot_token_client"),
             )
+            owner_bot_token = _pick_first_nonempty(
+                get(row, "owner_bot_token"),
+            )
 
             webhook_secret_admin = _pick_first_nonempty(
                 get(row, "webhook_secret_admin"),
@@ -203,6 +207,9 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
             )
             webhook_secret_client = _pick_first_nonempty(
                 get(row, "webhook_secret_client")
+            )
+            webhook_secret_owner = _pick_first_nonempty(
+                get(row, "webhook_secret_owner")
             )
 
             tenant_obj: Dict[str, Any] = {
@@ -218,10 +225,16 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
 
                 "admin_bot_token": _safe_str(admin_bot_token).strip(),
                 "client_bot_token": _safe_str(client_bot_token).strip(),
+                "owner_bot_token": _safe_str(owner_bot_token).strip(),
+
                 "webhook_secret_admin": _safe_str(webhook_secret_admin).strip(),
                 "webhook_secret_client": _safe_str(webhook_secret_client).strip(),
+                "webhook_secret_owner": _safe_str(webhook_secret_owner).strip(),
 
                 "admin_chat_id": _safe_str(get(row, "admin_chat_id")).strip(),
+                "owner_chat_id": _safe_str(get(row, "owner_chat_id")).strip(),
+                "owner_enabled": to_bool(get(row, "owner_enabled")),
+
                 "timezone": (_safe_str(get(row, "timezone")) or "America/La_Paz").strip(),
                 "admin_whatsapp": _safe_str(get(row, "admin_whatsapp")).strip(),
                 "admin_username": _safe_str(get(row, "admin_username")).strip(),
@@ -300,6 +313,7 @@ def resolve_bot_by_secret(tenant: Dict[str, Any], secret: str) -> Tuple[str, str
     s = (secret or "").strip()
     admin_secret = (tenant.get("webhook_secret_admin") or "").strip()
     client_secret = (tenant.get("webhook_secret_client") or "").strip()
+    owner_secret = (tenant.get("webhook_secret_owner") or "").strip()
 
     if admin_secret and s == admin_secret:
         token = (tenant.get("admin_bot_token") or "").strip()
@@ -312,6 +326,12 @@ def resolve_bot_by_secret(tenant: Dict[str, Any], secret: str) -> Tuple[str, str
         if not token:
             raise HTTPException(status_code=500, detail="client_bot_token missing for tenant")
         return ("client", token)
+
+    if owner_secret and s == owner_secret:
+        token = (tenant.get("owner_bot_token") or "").strip()
+        if not token:
+            raise HTTPException(status_code=500, detail="owner_bot_token missing for tenant")
+        return ("admin", token)
 
     raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
@@ -332,28 +352,39 @@ def validate_tenant_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
 
     admin_bot_token = (tenant.get("admin_bot_token") or "").strip()
     client_bot_token = (tenant.get("client_bot_token") or "").strip()
+    owner_bot_token = (tenant.get("owner_bot_token") or "").strip()
+
     secret_admin = (tenant.get("webhook_secret_admin") or "").strip()
     secret_client = (tenant.get("webhook_secret_client") or "").strip()
+    secret_owner = (tenant.get("webhook_secret_owner") or "").strip()
 
     if not admin_bot_token:
         warnings.append("admin_bot_token missing (admin bot no funcionará)")
     if not client_bot_token:
         warnings.append("client_bot_token missing (client bot no funcionará)")
+    if bool(tenant.get("owner_enabled")) and not owner_bot_token:
+        warnings.append("owner_bot_token missing (owner bot no funcionará)")
 
     if admin_bot_token and ":" not in admin_bot_token:
         warnings.append("admin_bot_token shape looks wrong (expected ':')")
     if client_bot_token and ":" not in client_bot_token:
         warnings.append("client_bot_token shape looks wrong (expected ':')")
+    if owner_bot_token and ":" not in owner_bot_token:
+        warnings.append("owner_bot_token shape looks wrong (expected ':')")
 
     if not secret_admin:
         warnings.append("webhook_secret_admin missing")
     if not secret_client:
         warnings.append("webhook_secret_client missing")
+    if bool(tenant.get("owner_enabled")) and not secret_owner:
+        warnings.append("webhook_secret_owner missing")
 
     if secret_admin and len(secret_admin) < 8:
         warnings.append("webhook_secret_admin too short (recommend >= 8)")
     if secret_client and len(secret_client) < 8:
         warnings.append("webhook_secret_client too short (recommend >= 8)")
+    if secret_owner and len(secret_owner) < 8:
+        warnings.append("webhook_secret_owner too short (recommend >= 8)")
 
     orders_enabled = bool(tenant.get("orders_enabled"))
     qr_file_id = (tenant.get("payment_qr_file_id") or "").strip()
@@ -366,6 +397,11 @@ def validate_tenant_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
     if orders_enabled and not admin_chat_id:
         warnings.append("admin_chat_id missing (no podrás recibir notificaciones/confirmar pagos)")
 
+    if bool(tenant.get("owner_enabled")):
+        owner_chat_id = (tenant.get("owner_chat_id") or "").strip()
+        if not owner_chat_id:
+            warnings.append("owner_chat_id missing (owner no podrá recibir notificaciones)")
+
     folder_id = (tenant.get("product_photos_drive_folder_id") or "").strip()
     if not folder_id:
         warnings.append("product_photos_drive_folder_id missing (no podrás subir fotos de productos a Drive)")
@@ -377,10 +413,14 @@ def validate_tenant_config(tenant: Dict[str, Any]) -> Dict[str, Any]:
 
         "has_admin_bot_token": bool(admin_bot_token),
         "has_client_bot_token": bool(client_bot_token),
+        "has_owner_bot_token": bool(owner_bot_token),
+
         "has_webhook_secret_admin": bool(secret_admin),
         "has_webhook_secret_client": bool(secret_client),
+        "has_webhook_secret_owner": bool(secret_owner),
 
         "has_admin_chat_id": bool(admin_chat_id),
+        "has_owner_chat_id": bool((tenant.get("owner_chat_id") or "").strip()),
 
         "has_qr_file_id": bool(qr_file_id),
         "has_qr_url": bool(qr_url),
