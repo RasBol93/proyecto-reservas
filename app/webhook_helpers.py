@@ -51,6 +51,66 @@ def get_admin_chat_id(tenant: Dict[str, Any]) -> Optional[int]:
         return None
 
 
+# =========================
+# 🔴 NUEVO — OWNER SUPPORT
+# =========================
+
+def get_owner_bot_token(tenant: Dict[str, Any]) -> str:
+    return (tenant.get("owner_bot_token") or "").strip()
+
+
+def get_owner_chat_id(tenant: Dict[str, Any]) -> Optional[int]:
+    raw = (tenant.get("owner_chat_id") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+
+def is_owner_enabled(tenant: Dict[str, Any]) -> bool:
+    v = str(tenant.get("owner_enabled") or "").strip().lower()
+    return v in ("true", "1", "yes")
+
+
+def get_user_role(tenant: Dict[str, Any], chat_id: int) -> str:
+    admin_chat_id = get_admin_chat_id(tenant)
+    owner_chat_id = get_owner_chat_id(tenant)
+
+    if admin_chat_id and chat_id == admin_chat_id:
+        return "admin"
+
+    if is_owner_enabled(tenant) and owner_chat_id and chat_id == owner_chat_id:
+        return "owner"
+
+    return "unknown"
+
+
+# =========================
+# 🔴 MODIFICADO — AUTH
+# =========================
+
+def assert_admin_authorized(tenant: Dict[str, Any], chat_id: int, tenant_id: str) -> None:
+    role = get_user_role(tenant, chat_id)
+
+    if role in ("admin", "owner"):
+        return
+
+    admin_chat_id = get_admin_chat_id(tenant)
+    if admin_chat_id is None:
+        log_event("admin_chat_id_missing_security_warning", tenant_id=tenant_id, chat_id=chat_id)
+        return
+
+    log_event(
+        "admin_paid_unauthorized",
+        tenant_id=tenant_id,
+        chat_id=chat_id,
+        expected_admin_chat_id=admin_chat_id,
+    )
+    raise HTTPException(status_code=403, detail="Not authorized")
+
+
 def get_admin_username(tenant: Dict[str, Any]) -> str:
     return (tenant.get("admin_username") or "").strip().lstrip("@") 
 
@@ -255,16 +315,6 @@ def safe_int(v: Any) -> Optional[int]:
         return int(v)
     except Exception:
         return None
-
-
-def assert_admin_authorized(tenant: Dict[str, Any], chat_id: int, tenant_id: str) -> None:
-    admin_chat_id = get_admin_chat_id(tenant)
-    if admin_chat_id is None:
-        log_event("admin_chat_id_missing_security_warning", tenant_id=tenant_id, chat_id=chat_id)
-        return
-    if chat_id != admin_chat_id:
-        log_event("admin_paid_unauthorized", tenant_id=tenant_id, chat_id=chat_id, expected_admin_chat_id=admin_chat_id)
-        raise HTTPException(status_code=403, detail="Not authorized")
 
 
 def contact_link_for_admin(tenant: Dict[str, Any]) -> Optional[str]:
