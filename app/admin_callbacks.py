@@ -30,6 +30,7 @@ from app.webhook_helpers import (
     get_sess,
     get_client_bot_token,
     assert_admin_authorized,
+    get_user_role,
     fmt_price_short,
     admin_periods_inline_kb,
     fmt_snapshot_lines,
@@ -410,11 +411,12 @@ def handle_admin_callback_impl(
 ) -> Dict[str, Any]:
     try:
         if data == "admin_panel":
+            user_role = get_user_role(tenant, chat_id)
             telegram_send_text(
                 bot_token,
                 chat_id,
                 "🧭 PANEL ADMIN\n\nElige una opción:",
-                reply_markup=admin_panel_kb(),
+                reply_markup=admin_panel_kb(user_role=user_role),
             )
             return {"ok": True}
 
@@ -438,25 +440,17 @@ def handle_admin_callback_impl(
             return {"ok": _send_admin_surveys_home(bot_token, chat_id, tenant_id, orders_sh)}
 
         if data == "admin_order":
-    assert_admin_authorized(tenant, chat_id, tenant_id)
-
-    from app.webhook_helpers import get_user_role
-    role = get_user_role(tenant, chat_id)
-
-    # 🔴 BLOQUEO OWNER
-    if role == "owner":
-        telegram_send_text(
-            bot_token,
-            chat_id,
-            "🚫 Esta opción no está disponible para el propietario.",
-        )
-        return {"ok": True}
-    sess = get_sess(tenant_id, chat_id)
-    tmp = sess.setdefault("tmp", {})
-    _admin_order_reset(tmp)
-    tmp["admin_order_cart"] = []
-    return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
             assert_admin_authorized(tenant, chat_id, tenant_id)
+
+            user_role = get_user_role(tenant, chat_id)
+            if user_role == "owner":
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "🚫 Esta opción no está disponible para el propietario.",
+                )
+                return {"ok": True}
+
             sess = get_sess(tenant_id, chat_id)
             tmp = sess.setdefault("tmp", {})
             _admin_order_reset(tmp)
@@ -867,11 +861,12 @@ def handle_admin_callback_impl(
             action = parts[2].strip()
 
             if action == "panel":
+                user_role = get_user_role(tenant, chat_id)
                 telegram_send_text(
                     bot_token,
                     chat_id,
                     "🧭 PANEL ADMIN\n\nElige una opción:",
-                    reply_markup=admin_panel_kb(),
+                    reply_markup=admin_panel_kb(user_role=user_role),
                 )
                 return {"ok": True}
 
@@ -902,6 +897,15 @@ def handle_admin_callback_impl(
         if data.startswith("admord|"):
             assert_admin_authorized(tenant, chat_id, tenant_id)
 
+            user_role = get_user_role(tenant, chat_id)
+            if user_role == "owner":
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "🚫 Esta opción no está disponible para el propietario.",
+                )
+                return {"ok": True}
+
             parts = data.split("|")
             if len(parts) < 3:
                 return {"ok": True}
@@ -924,11 +928,12 @@ def handle_admin_callback_impl(
 
             if action == "panel":
                 _admin_order_reset(tmp)
+                user_role = get_user_role(tenant, chat_id)
                 telegram_send_text(
                     bot_token,
                     chat_id,
                     "🧭 PANEL ADMIN\n\nElige una opción:",
-                    reply_markup=admin_panel_kb(),
+                    reply_markup=admin_panel_kb(user_role=user_role),
                 )
                 return {"ok": True}
 
@@ -1083,11 +1088,12 @@ def handle_admin_callback_impl(
                 tmp.pop("admin_menu_create_name", None)
                 tmp.pop("admin_menu_create_category", None)
                 tmp.pop("admin_menu_create_price", None)
+                user_role = get_user_role(tenant, chat_id)
                 telegram_send_text(
                     bot_token,
                     chat_id,
                     "🧭 PANEL ADMIN\n\nElige una opción:",
-                    reply_markup=admin_panel_kb(),
+                    reply_markup=admin_panel_kb(user_role=user_role),
                 )
                 return {"ok": True}
 
