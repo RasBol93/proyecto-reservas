@@ -92,6 +92,12 @@ from app.sheets import get_ws
 SURVEY_CONFIG_WS = "Survey_Config"
 
 
+def _effective_admin_role(tenant: Dict[str, Any], chat_id: int) -> str:
+    if bool(tenant.get("_is_owner_bot")):
+        return "owner"
+    return get_user_role(tenant, chat_id)
+
+
 def _finalize_admin_manual_order_from_tmp(
     tenant_id: str,
     bot_token: str,
@@ -186,13 +192,7 @@ def _finalize_admin_manual_order_from_tmp(
             telegram_send_text(
                 owner_token,
                 int(owner_chat),
-                (
-                    "📦 *Nuevo pedido registrado (manual)*\n\n"
-                    f"Código: {order_id}\n"
-                    f"Cliente: {customer_name}\n"
-                    f"Contacto: {customer_contact}\n\n"
-                    f"Total: Bs {total_amount}"
-                ),
+                recap,
                 parse_mode="Markdown",
             )
     except Exception as e:
@@ -439,7 +439,7 @@ def handle_admin_callback_impl(
 ) -> Dict[str, Any]:
     try:
         if data == "admin_panel":
-            user_role = get_user_role(tenant, chat_id)
+            user_role = _effective_admin_role(tenant, chat_id)
             telegram_send_text(
                 bot_token,
                 chat_id,
@@ -470,7 +470,7 @@ def handle_admin_callback_impl(
         if data == "admin_order":
             assert_admin_authorized(tenant, chat_id, tenant_id)
 
-            user_role = get_user_role(tenant, chat_id)
+            user_role = _effective_admin_role(tenant, chat_id)
             if user_role == "owner":
                 telegram_send_text(
                     bot_token,
@@ -852,29 +852,26 @@ def handle_admin_callback_impl(
 
                     if owner_enabled and owner_chat and owner_token:
                         customer_name = _safe_str(order_after.get("customer_name"))
-                        final_hhmm = _extract_slot_hhmm(order_after.get("requested_time"))
-                        total_amount = _safe_str(order_after.get("total_amount"))
+                        customer_contact = _safe_str(order_after.get("customer_contact"))
+                        requested_time = _safe_str(order_after.get("requested_time"))
 
-                        if final_hhmm:
-                            owner_msg = (
-                                "✅ *Pago validado por admin*\n\n"
-                                f"Código: {order_id}\n"
-                                f"Cliente: {customer_name}\n"
-                                f"Hora de recojo: {final_hhmm}\n"
-                                f"Total: Bs {total_amount}"
-                            )
-                        else:
-                            owner_msg = (
-                                "✅ *Pago validado por admin*\n\n"
-                                f"Código: {order_id}\n"
-                                f"Cliente: {customer_name}\n"
-                                f"Total: Bs {total_amount}"
-                            )
+                        items_snapshot = order_after.get("items_snapshot") or []
+                        detail_lines, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
+
+                        owner_recap = build_order_recap_text(
+                            order_id=order_id,
+                            customer_name=customer_name,
+                            customer_contact=customer_contact,
+                            requested_time=requested_time,
+                            detail_lines=detail_lines,
+                            total_qty=total_qty,
+                            total=total_amount,
+                        )
 
                         telegram_send_text(
                             owner_token,
                             int(owner_chat),
-                            owner_msg,
+                            owner_recap,
                             parse_mode="Markdown",
                         )
                 except Exception as e:
@@ -930,7 +927,7 @@ def handle_admin_callback_impl(
             action = parts[2].strip()
 
             if action == "panel":
-                user_role = get_user_role(tenant, chat_id)
+                user_role = _effective_admin_role(tenant, chat_id)
                 telegram_send_text(
                     bot_token,
                     chat_id,
@@ -966,7 +963,7 @@ def handle_admin_callback_impl(
         if data.startswith("admord|"):
             assert_admin_authorized(tenant, chat_id, tenant_id)
 
-            user_role = get_user_role(tenant, chat_id)
+            user_role = _effective_admin_role(tenant, chat_id)
             if user_role == "owner":
                 telegram_send_text(
                     bot_token,
@@ -997,7 +994,7 @@ def handle_admin_callback_impl(
 
             if action == "panel":
                 _admin_order_reset(tmp)
-                user_role = get_user_role(tenant, chat_id)
+                user_role = _effective_admin_role(tenant, chat_id)
                 telegram_send_text(
                     bot_token,
                     chat_id,
@@ -1158,7 +1155,7 @@ def handle_admin_callback_impl(
                 tmp.pop("admin_menu_create_name", None)
                 tmp.pop("admin_menu_create_category", None)
                 tmp.pop("admin_menu_create_price", None)
-                user_role = get_user_role(tenant, chat_id)
+                user_role = _effective_admin_role(tenant, chat_id)
                 telegram_send_text(
                     bot_token,
                     chat_id,
