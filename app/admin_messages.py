@@ -1,4 +1,3 @@
-```python
 # app/admin_messages.py — admin por texto "panel", pedido manual mejorado y sin teclado persistente inferior
 
 from typing import Any, Dict, Optional
@@ -987,4 +986,3 @@ def handle_admin_message_impl(
             "⚠️ Ocurrió un error en el panel admin.",
         )
         return {"ok": True}
-```
