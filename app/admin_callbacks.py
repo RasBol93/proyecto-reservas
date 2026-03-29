@@ -844,6 +844,47 @@ def handle_admin_callback_impl(
                         reason="missing_client_token_or_chat_id",
                     )
 
+            if order_after:
+                try:
+                    owner_enabled = str(tenant.get("owner_enabled") or "").strip().lower() == "true"
+                    owner_chat = str(tenant.get("owner_chat_id") or "").strip()
+                    owner_token = str(tenant.get("owner_bot_token") or "").strip()
+
+                    if owner_enabled and owner_chat and owner_token:
+                        customer_name = _safe_str(order_after.get("customer_name"))
+                        final_hhmm = _extract_slot_hhmm(order_after.get("requested_time"))
+                        total_amount = _safe_str(order_after.get("total_amount"))
+
+                        if final_hhmm:
+                            owner_msg = (
+                                "✅ *Pago validado por admin*\n\n"
+                                f"Código: {order_id}\n"
+                                f"Cliente: {customer_name}\n"
+                                f"Hora de recojo: {final_hhmm}\n"
+                                f"Total: Bs {total_amount}"
+                            )
+                        else:
+                            owner_msg = (
+                                "✅ *Pago validado por admin*\n\n"
+                                f"Código: {order_id}\n"
+                                f"Cliente: {customer_name}\n"
+                                f"Total: Bs {total_amount}"
+                            )
+
+                        telegram_send_text(
+                            owner_token,
+                            int(owner_chat),
+                            owner_msg,
+                            parse_mode="Markdown",
+                        )
+                except Exception as e:
+                    log_event(
+                        "notify_owner_paid_validated_failed",
+                        tenant_id=tenant_id,
+                        order_id=order_id,
+                        error=str(e),
+                    )
+
             return {"ok": True}
 
         if data.startswith("admin_stats_period|"):
