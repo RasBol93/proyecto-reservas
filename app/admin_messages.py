@@ -1,3 +1,4 @@
+```python
 # app/admin_messages.py — admin por texto "panel", pedido manual mejorado y sin teclado persistente inferior
 
 from typing import Any, Dict, Optional
@@ -62,6 +63,10 @@ from app.sheets import get_ws
 
 
 SURVEY_CONFIG_WS = "Survey_Config"
+
+
+def _is_owner_bot(tenant: Dict[str, Any]) -> bool:
+    return bool(tenant.get("_is_owner_bot"))
 
 
 def _finalize_admin_manual_order(
@@ -280,6 +285,8 @@ def handle_admin_message_impl(
     tenant_tz: str,
 ) -> Dict[str, Any]:
     try:
+        is_owner = _is_owner_bot(tenant)
+
         text = (msg.get("text") or "").strip()
         txt_norm = normalize(text)
         sess = get_sess(tenant_id, chat_id)
@@ -291,7 +298,7 @@ def handle_admin_message_impl(
                 bot_token,
                 chat_id,
                 "🧭 PANEL ADMIN\n\nElige una opción:",
-                reply_markup=admin_panel_kb(),
+                reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
             )
             return {"ok": True}
 
@@ -299,6 +306,16 @@ def handle_admin_message_impl(
 
         if admin_order_step:
             assert_admin_authorized(tenant, chat_id, tenant_id)
+
+            if is_owner:
+                _admin_order_reset(tmp)
+                tmp.pop("admin_order_step", None)
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "🚫 Como propietario no puedes crear pedidos.",
+                )
+                return {"ok": True}
 
             if admin_order_step == "awaiting_name":
                 customer_name = text.strip()
@@ -864,6 +881,15 @@ def handle_admin_message_impl(
             or "crear pedido" in txt_norm
         ):
             assert_admin_authorized(tenant, chat_id, tenant_id)
+
+            if is_owner:
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "🚫 Como propietario no puedes crear pedidos.",
+                )
+                return {"ok": True}
+
             _admin_order_reset(tmp)
             tmp["admin_order_cart"] = []
             return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
@@ -917,18 +943,33 @@ def handle_admin_message_impl(
             return {"ok": True}
 
         if txt_norm in ("start", "/start", "hola"):
+            if is_owner:
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Bot propietario listo ✅\n\nEscribe 'panel' para abrir el panel.",
+                )
+            else:
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Admin bot listo ✅\n\nEscribe 'panel' para abrir el panel admin.",
+                )
+            return {"ok": True}
+
+        if is_owner:
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "Admin bot listo ✅\n\nEscribe 'panel' para abrir el panel admin.",
+                "OK propietario ✅\n\nEscribe 'panel' para abrir el panel.",
             )
-            return {"ok": True}
+        else:
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "OK admin ✅\n\nEscribe 'panel' para abrir el panel admin.",
+            )
 
-        telegram_send_text(
-            bot_token,
-            chat_id,
-            "OK admin ✅\n\nEscribe 'panel' para abrir el panel admin.",
-        )
         return {"ok": True}
 
     except Exception as e:
@@ -946,3 +987,4 @@ def handle_admin_message_impl(
             "⚠️ Ocurrió un error en el panel admin.",
         )
         return {"ok": True}
+```
