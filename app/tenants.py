@@ -151,6 +151,19 @@ def _find_header_col(headers_norm: List[str], key: str) -> Optional[int]:
     return None
 
 
+def _build_telegram_file_url(bot_token: str, file_id: str) -> str:
+    """
+    URL pública basada en Telegram file endpoint.
+    Mantiene simplicidad y evita cambiar la estructura actual de TENANTS,
+    que hoy usa payment_qr_url.
+    """
+    bot_token = _safe_str(bot_token).strip()
+    file_id = _safe_str(file_id).strip()
+    if not bot_token or not file_id:
+        return ""
+    return f"https://api.telegram.org/file/bot{bot_token}/{file_id}"
+
+
 # -------------------------
 # Main API
 # -------------------------
@@ -374,13 +387,16 @@ def resolve_bot_by_secret(tenant: Dict[str, Any], secret: str) -> Tuple[str, str
 
 
 # =========================================================
-# QR updater (NUEVO)
+# QR updater
 # =========================================================
 
 def update_tenant_payment_qr(tenant_id: str, file_id: str, gc=None) -> bool:
     """
-    Actualiza payment_qr_file_id para un tenant en la hoja TENANTS
+    Actualiza payment_qr_url para un tenant en la hoja TENANTS
     y refresca cache en memoria.
+
+    IMPORTANTE:
+    Tu hoja real usa payment_qr_url, no payment_qr_file_id.
     """
     tid = _norm_tenant_id(tenant_id)
     file_id = _safe_str(file_id).strip()
@@ -389,6 +405,19 @@ def update_tenant_payment_qr(tenant_id: str, file_id: str, gc=None) -> bool:
         return False
 
     try:
+        # Necesitamos tenant para sacar el admin_bot_token y construir la URL
+        tenant = get_tenant_or_404(tid, gc=gc)
+        admin_bot_token = _safe_str(tenant.get("admin_bot_token")).strip()
+        payment_qr_url = _build_telegram_file_url(admin_bot_token, file_id)
+
+        if not payment_qr_url:
+            log_event(
+                "tenant_payment_qr_update_missing_token_or_url",
+                tenant_id=tid,
+                has_admin_bot_token=bool(admin_bot_token),
+            )
+            return False
+
         ws = _get_tenants_ws(gc=gc)
         values, header_idx, headers_raw, headers_norm = _get_tenants_values_and_header(ws)
 
@@ -396,14 +425,14 @@ def update_tenant_payment_qr(tenant_id: str, file_id: str, gc=None) -> bool:
             return False
 
         tenant_col = _find_header_col(headers_norm, "tenant_id")
-        qr_col = _find_header_col(headers_norm, "payment_qr_file_id")
+        qr_url_col = _find_header_col(headers_norm, "payment_qr_url")
 
-        if tenant_col is None or qr_col is None:
+        if tenant_col is None or qr_url_col is None:
             log_event(
                 "tenant_payment_qr_update_missing_column",
                 tenant_id=tid,
                 has_tenant_col=(tenant_col is not None),
-                has_qr_col=(qr_col is not None),
+                has_qr_url_col=(qr_url_col is not None),
             )
             return False
 
@@ -412,14 +441,14 @@ def update_tenant_payment_qr(tenant_id: str, file_id: str, gc=None) -> bool:
         for row_idx_0b, row in enumerate(values[header_idx + 1:], start=header_idx + 1):
             raw_tid = row[tenant_col] if tenant_col < len(row) else ""
             if _norm_tenant_id(raw_tid) == tid:
-                target_sheet_row = row_idx_0b + 1  # gspread is 1-based
+                target_sheet_row = row_idx_0b + 1  # gspread 1-based
                 break
 
         if target_sheet_row is None:
             log_event("tenant_payment_qr_update_not_found", tenant_id=tid)
             return False
 
-        ws.update_cell(target_sheet_row, qr_col + 1, file_id)
+        ws.update_cell(target_sheet_row, qr_url_col + 1, payment_qr_url)
 
         # Refrescar cache
         load_tenants(gc=gc, force=True)
@@ -429,6 +458,7 @@ def update_tenant_payment_qr(tenant_id: str, file_id: str, gc=None) -> bool:
                 "tenant_payment_qr_updated",
                 tenant_id=tid,
                 sheet_row=target_sheet_row,
+                target_column="payment_qr_url",
             )
         except Exception:
             pass
