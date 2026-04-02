@@ -35,9 +35,6 @@ from app.webhook_helpers import (
     i_paid_kb,
     paid_actions_kb,
     contact_admin_kb,
-    get_owner_bot_token,
-    get_owner_chat_id,
-    is_owner_enabled,
 )
 from app.payment_flow import notify_admin_payment_reported
 from app.alerts import (
@@ -1063,9 +1060,6 @@ def handle_client_message(
             _send_home(bot_token, chat_id, orders_sh)
             return {"ok": True}
 
-        # -------------------------
-        # SURVEY: PASSWORD
-        # -------------------------
         if sess.get("stage") == "survey_password":
             if not validate_survey_password(orders_sh, text):
                 telegram_send_text(bot_token, chat_id, "❌ Password incorrecto.")
@@ -1079,9 +1073,6 @@ def handle_client_message(
             )
             return {"ok": True}
 
-        # -------------------------
-        # SURVEY: PHONE
-        # -------------------------
         if sess.get("stage") == "survey_phone":
             phone = _normalize_phone(text)
 
@@ -1112,9 +1103,6 @@ def handle_client_message(
             _send_survey_question(bot_token, chat_id, questions[0], 1)
             return {"ok": True}
 
-        # -------------------------
-        # SURVEY: ANSWERS (TEXT)
-        # -------------------------
         if sess.get("stage") == "survey_q":
             survey = sess.get("survey") or {}
             questions = get_runtime_survey_questions(orders_sh)
@@ -1279,33 +1267,6 @@ def handle_client_message(
                 )
                 telegram_send_text(bot_token, chat_id, "⚠️ No pude crear tu pedido en este momento. Intenta nuevamente.")
                 return {"ok": True}
-
-            try:
-                if is_owner_enabled(tenant):
-                    owner_bot_token = get_owner_bot_token(tenant)
-                    owner_chat_id = get_owner_chat_id(tenant)
-
-                    if owner_bot_token and owner_chat_id:
-                        telegram_send_text(
-                            owner_bot_token,
-                            owner_chat_id,
-                            (
-                                "🆕 Nuevo pedido recibido\n\n"
-                                f"Pedido: {order_id}\n"
-                                f"Cliente: {customer_name}\n"
-                                f"Teléfono: {customer_phone}\n"
-                                f"Hora: {requested_time}\n\n"
-                                f"Total: Bs {total_real:.2f}"
-                            ),
-                        )
-            except Exception as e:
-                log_event(
-                    "owner_notification_failed",
-                    tenant_id=tenant_id,
-                    order_id=order_id,
-                    error_type=type(e).__name__,
-                    error=str(e),
-                )
 
             sess["stage"] = "awaiting_proof"
             sess["tmp"] = sess.get("tmp") or {}
