@@ -112,7 +112,7 @@ def assert_admin_authorized(tenant: Dict[str, Any], chat_id: int, tenant_id: str
 
 
 def get_admin_username(tenant: Dict[str, Any]) -> str:
-    return (tenant.get("admin_username") or "").strip().lstrip("@") 
+    return (tenant.get("admin_username") or "").strip().lstrip("@")
 
 
 def get_payment_qr_file_id(tenant: Dict[str, Any]) -> str:
@@ -436,11 +436,7 @@ def contact_admin_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
 
 def admin_fixed_kb() -> Dict[str, Any]:
     return reply_kb([
-        ["📊 Estadísticas"],
-        ["⚙️ Config días y horarios"],
-        ["⚙️ Config menú y precios"],
-        ["👥 Base de consumidores"],
-        ["➕ Crear pedido"],
+        ["Panel"],
     ], resize=True, one_time=False)
 
 
