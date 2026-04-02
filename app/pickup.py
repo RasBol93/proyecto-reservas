@@ -1,4 +1,4 @@
-# app/pickup.py — generación de horarios de recojo compatible con today_slots
+# app/pickup.py — generación de horarios de recojo configurable desde AdminSettings
 
 from datetime import datetime, timedelta, time
 from typing import Any, Dict, List, Optional
@@ -8,15 +8,25 @@ from fastapi import HTTPException
 
 from app.telegram_keyboard import kb
 from app.webhook_helpers import get_business_status_safe
+from app.admin_settings import load_admin_settings, get_admin_setting_value
 
 
-DEFAULT_TIEMPO_MINIMO_PREPARACION_MINUTOS = 20
-DEFAULT_INTERVALO_HORARIOS_RECOJO_MINUTOS = 15
+DEFAULT_PICKUP_INTERVAL_MINUTES = 15
 HORIZONTE_MINUTOS_DEFAULT = 120
 
 
 def _safe_str(v: Any) -> str:
     return str(v or "").strip()
+
+
+def _safe_int(v: Any, default: int) -> int:
+    try:
+        n = int(str(v or "").strip())
+        if n <= 0:
+            return default
+        return n
+    except Exception:
+        return default
 
 
 def _parse_hhmm(v: str) -> Optional[time]:
@@ -40,6 +50,7 @@ def _now_local(tz_name: str) -> datetime:
 
 
 def _round_up_datetime(dt: datetime, interval: int) -> datetime:
+    interval = max(1, int(interval))
     minutes = dt.hour * 60 + dt.minute
     rounded = ((minutes + interval - 1) // interval) * interval
     hh = min(23, rounded // 60)
@@ -48,10 +59,21 @@ def _round_up_datetime(dt: datetime, interval: int) -> datetime:
 
 
 def get_pickup_config(orders_sh) -> Dict[str, int]:
-    return {
-        "tiempo_minimo_preparacion_minutos": DEFAULT_TIEMPO_MINIMO_PREPARACION_MINUTOS,
-        "intervalo_horarios_recojo_minutos": DEFAULT_INTERVALO_HORARIOS_RECOJO_MINUTOS,
-    }
+    try:
+        settings = load_admin_settings(orders_sh)
+        interval = _safe_int(
+            get_admin_setting_value(settings, "pickup_interval_minutes", str(DEFAULT_PICKUP_INTERVAL_MINUTES)),
+            DEFAULT_PICKUP_INTERVAL_MINUTES,
+        )
+        return {
+            "pickup_interval_minutes": interval,
+            "pickup_lead_time_minutes": interval,
+        }
+    except Exception:
+        return {
+            "pickup_interval_minutes": DEFAULT_PICKUP_INTERVAL_MINUTES,
+            "pickup_lead_time_minutes": DEFAULT_PICKUP_INTERVAL_MINUTES,
+        }
 
 
 def _build_dt(now: datetime, hhmm: str) -> datetime:
@@ -129,48 +151,64 @@ def generate_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
         return {
             "ok": False,
             "message": ctx["public_message"] or "No estamos abiertos.",
-            "slots": []
+            "slots": [],
         }
 
     now = ctx["now"]
+    interval = max(1, int(cfg["pickup_interval_minutes"]))
+    lead = max(1, int(cfg["pickup_lead_time_minutes"]))
 
-    earliest = now + timedelta(minutes=cfg["tiempo_minimo_preparacion_minutos"])
-    earliest = _round_up_datetime(earliest, cfg["intervalo_horarios_recojo_minutos"])
+    earliest_asap = now + timedelta(minutes=lead)
 
-    if ctx["open_dt"] and earliest < ctx["open_dt"]:
-        earliest = ctx["open_dt"]
+    first_interval_slot = _round_up_datetime(earliest_asap, interval)
+    if ctx["open_dt"] and first_interval_slot < ctx["open_dt"]:
+        first_interval_slot = ctx["open_dt"]
 
-    if ctx["last_dt"] and earliest > ctx["last_dt"]:
+    asap_hhmm = _format_hhmm(earliest_asap)
+
+    if ctx["last_dt"] and earliest_asap > ctx["last_dt"]:
         return {
             "ok": False,
             "message": "Ya no estamos aceptando pedidos hoy.",
-            "slots": []
+            "slots": [],
         }
 
-    slots = []
-    current = earliest
-    end = earliest + timedelta(minutes=HORIZONTE_MINUTOS_DEFAULT)
+    if ctx["last_dt"] and first_interval_slot > ctx["last_dt"]:
+        slots = [{
+            "id": "pickup|asap",
+            "label": f"Lo antes posible ({asap_hhmm})",
+            "hhmm": asap_hhmm,
+        }]
+        return {
+            "ok": True,
+            "message": "Elige una hora de recojo:",
+            "slots": slots,
+            "open_time": ctx["open_time"],
+            "close_time": ctx["close_time"],
+            "last_order_time": ctx["last_order_time"],
+            "pickup_interval_minutes": interval,
+        }
+
+    slots = [{
+        "id": "pickup|asap",
+        "label": f"Lo antes posible ({asap_hhmm})",
+        "hhmm": asap_hhmm,
+    }]
+
+    current = first_interval_slot
+    end = first_interval_slot + timedelta(minutes=HORIZONTE_MINUTOS_DEFAULT)
 
     if ctx["last_dt"] and end > ctx["last_dt"]:
         end = ctx["last_dt"]
 
     while current <= end:
         hhmm = _format_hhmm(current)
-
-        if not slots:
-            label = f"Ahora {hhmm}"
-            slot_id = "pickup|asap"
-        else:
-            label = hhmm
-            slot_id = f"pickup|slot|{hhmm.replace(':','')}"
-
         slots.append({
-            "id": slot_id,
-            "label": label,
-            "hhmm": hhmm
+            "id": f"pickup|slot|{hhmm.replace(':', '')}",
+            "label": hhmm,
+            "hhmm": hhmm,
         })
-
-        current += timedelta(minutes=cfg["intervalo_horarios_recojo_minutos"])
+        current += timedelta(minutes=interval)
 
     return {
         "ok": True,
@@ -179,6 +217,7 @@ def generate_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
         "open_time": ctx["open_time"],
         "close_time": ctx["close_time"],
         "last_order_time": ctx["last_order_time"],
+        "pickup_interval_minutes": interval,
     }
 
 
@@ -209,9 +248,12 @@ def build_pickup_offer_text(data: Dict[str, Any]) -> str:
     if not data.get("ok"):
         return data.get("message", "No hay horarios.")
 
+    interval = int(data.get("pickup_interval_minutes") or DEFAULT_PICKUP_INTERVAL_MINUTES)
+
     return (
         "🕒 Hora de recojo\n\n"
         f"{data['message']}\n\n"
+        f"Intervalo configurado: {interval} min\n"
         f"Horario actual: {data['open_time']} - {data['close_time']}\n"
         f"Última hora de pedido actual: {data['last_order_time']}"
     )
