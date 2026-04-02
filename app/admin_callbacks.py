@@ -495,6 +495,36 @@ def handle_admin_callback_impl(
             sess = get_sess(tenant_id, chat_id)
             return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
+        # =========================
+        # PAGOS / QR (NUEVO)
+        # =========================
+
+        if data == "admin_payments":
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "💳 *Gestión de pagos*\n\nPuedes subir o actualizar el QR de pagos.",
+                parse_mode="Markdown",
+                reply_markup=kb([
+                    [("📷 Subir QR", "admin_payments_upload")],
+                    [("🧭 Panel admin", "admin_panel")],
+                ]),
+            )
+            return {"ok": True}
+
+        if data == "admin_payments_upload":
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            sess = get_sess(tenant_id, chat_id)
+            tmp = sess.setdefault("tmp", {})
+            tmp["admin_payment_mode"] = "awaiting_qr"
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "📷 Envíame la imagen del QR de pagos.",
+            )
+            return {"ok": True}
+
         if data.startswith("admsurv|"):
             assert_admin_authorized(tenant, chat_id, tenant_id)
 
