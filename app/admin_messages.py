@@ -1,4 +1,4 @@
-# app/admin_messages.py — admin por texto con botón fijo inferior "Panel"
+# app/admin_messages.py — admin por texto con botón fijo inferior "⚙️ Panel"
 
 from typing import Any, Dict, Optional
 
@@ -72,27 +72,19 @@ def _is_owner_bot(tenant: Dict[str, Any]) -> bool:
 
 
 def _send_admin_panel(bot_token: str, chat_id: int, is_owner: bool) -> bool:
-    ok1 = telegram_send_text(
+    return telegram_send_text(
         bot_token,
         chat_id,
         "🧭 PANEL ADMIN\n\nElige una opción:",
         reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
     )
-    # Reforzamos que el teclado reply inferior quede siempre visible
-    ok2 = telegram_send_text(
-        bot_token,
-        chat_id,
-        "Botón fijo activo abajo: Panel",
-        reply_markup=admin_fixed_kb(),
-    )
-    return bool(ok1 or ok2)
 
 
 def _send_admin_ready(bot_token: str, chat_id: int, is_owner: bool) -> bool:
     msg = (
-        "Bot propietario listo ✅\n\nUsa el botón inferior *Panel*."
+        "Bot propietario listo ✅\n\nUsa el botón inferior *⚙️ Panel*."
         if is_owner
-        else "Admin bot listo ✅\n\nUsa el botón inferior *Panel*."
+        else "Admin bot listo ✅\n\nUsa el botón inferior *⚙️ Panel*."
     )
     return telegram_send_text(
         bot_token,
@@ -105,9 +97,9 @@ def _send_admin_ready(bot_token: str, chat_id: int, is_owner: bool) -> bool:
 
 def _send_admin_idle_hint(bot_token: str, chat_id: int, is_owner: bool) -> bool:
     msg = (
-        "OK propietario ✅\n\nUsa el botón inferior *Panel*."
+        "OK propietario ✅\n\nUsa el botón inferior *⚙️ Panel*."
         if is_owner
-        else "OK admin ✅\n\nUsa el botón inferior *Panel*."
+        else "OK admin ✅\n\nUsa el botón inferior *⚙️ Panel*."
     )
     return telegram_send_text(
         bot_token,
@@ -344,8 +336,8 @@ def handle_admin_message_impl(
         sess = get_sess(tenant_id, chat_id)
         tmp = sess.setdefault("tmp", {})
 
-        # Soporte oficial: botón reply "Panel"
-        if txt_norm in ("panel", "🧭paneladmin", "🧭 panel admin"):
+        # Soporte oficial: botón reply "⚙️ Panel"
+        if txt_norm in ("panel", "⚙️panel", "⚙️ panel", "🧭paneladmin", "🧭 panel admin"):
             assert_admin_authorized(tenant, chat_id, tenant_id)
             return {"ok": _send_admin_panel(bot_token, chat_id, is_owner)}
 
@@ -1009,7 +1001,7 @@ def handle_admin_message_impl(
                 "📊 Elige el período:",
                 reply_markup=admin_periods_inline_kb(tenant_id, periods),
             )
-            telegram_send_text(bot_token, chat_id, "Usa el botón inferior Panel cuando quieras volver.", reply_markup=admin_fixed_kb())
+            telegram_send_text(bot_token, chat_id, "Usa el botón inferior ⚙️ Panel cuando quieras volver.", reply_markup=admin_fixed_kb())
             return {"ok": True}
 
         if (
@@ -1077,7 +1069,7 @@ def handle_admin_message_impl(
                     [("🧭 Panel admin", "admin_panel")],
                 ]),
             )
-            telegram_send_text(bot_token, chat_id, "Usa el botón inferior Panel cuando quieras volver.", reply_markup=admin_fixed_kb())
+            telegram_send_text(bot_token, chat_id, "Usa el botón inferior ⚙️ Panel cuando quieras volver.", reply_markup=admin_fixed_kb())
             return {"ok": True}
 
         if txt_norm in ("start", "/start", "hola"):
