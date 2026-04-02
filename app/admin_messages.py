@@ -1,4 +1,4 @@
-# app/admin_messages.py — admin por texto con botón fijo inferior "⚙️ Panel"
+# app/admin_messages.py — admin por texto "panel", pedido manual mejorado y soporte de QR de pagos
 
 from typing import Any, Dict, Optional
 
@@ -53,7 +53,6 @@ from app.admin_manual_order import (
 from app.admin_nav import (
     admin_panel_kb,
 )
-from app.admin_settings import set_admin_setting_value
 from app.survey import (
     save_survey_password,
     save_survey_reward,
@@ -61,53 +60,14 @@ from app.survey import (
     load_survey_questions,
 )
 from app.sheets import get_ws
+from app.tenants import update_tenant_payment_qr
 
 
 SURVEY_CONFIG_WS = "Survey_Config"
-DEFAULT_PICKUP_INTERVAL_MINUTES = 15
 
 
 def _is_owner_bot(tenant: Dict[str, Any]) -> bool:
     return bool(tenant.get("_is_owner_bot"))
-
-
-def _send_admin_panel(bot_token: str, chat_id: int, is_owner: bool) -> bool:
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        "🧭 PANEL ADMIN\n\nElige una opción:",
-        reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
-    )
-
-
-def _send_admin_ready(bot_token: str, chat_id: int, is_owner: bool) -> bool:
-    msg = (
-        "Bot propietario listo ✅\n\nUsa el botón inferior *⚙️ Panel*."
-        if is_owner
-        else "Admin bot listo ✅\n\nUsa el botón inferior *⚙️ Panel*."
-    )
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        msg,
-        reply_markup=admin_fixed_kb(),
-        parse_mode="Markdown",
-    )
-
-
-def _send_admin_idle_hint(bot_token: str, chat_id: int, is_owner: bool) -> bool:
-    msg = (
-        "OK propietario ✅\n\nUsa el botón inferior *⚙️ Panel*."
-        if is_owner
-        else "OK admin ✅\n\nUsa el botón inferior *⚙️ Panel*."
-    )
-    return telegram_send_text(
-        bot_token,
-        chat_id,
-        msg,
-        reply_markup=admin_fixed_kb(),
-        parse_mode="Markdown",
-    )
 
 
 def _finalize_admin_manual_order(
@@ -336,61 +296,58 @@ def handle_admin_message_impl(
         sess = get_sess(tenant_id, chat_id)
         tmp = sess.setdefault("tmp", {})
 
-        # Soporte oficial: botón reply "⚙️ Panel"
-        if txt_norm in ("panel", "⚙️panel", "⚙️ panel", "🧭paneladmin", "🧭 panel admin"):
+        if txt_norm in ("panel", "⚙️panel", "⚙️ panel"):
             assert_admin_authorized(tenant, chat_id, tenant_id)
-            return {"ok": _send_admin_panel(bot_token, chat_id, is_owner)}
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "🧭 PANEL ADMIN\n\nElige una opción:",
+                reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
+            )
+            return {"ok": True}
 
-        admin_hours_mode_input = str(tmp.get("admin_hours_mode_input") or "").strip()
+        # =========================
+        # QR de pagos (NUEVO)
+        # =========================
+        admin_payment_mode = str(tmp.get("admin_payment_mode") or "").strip()
 
-        if admin_hours_mode_input:
+        if admin_payment_mode == "awaiting_qr":
             assert_admin_authorized(tenant, chat_id, tenant_id)
 
-            if admin_hours_mode_input == "pickup_interval_custom":
-                n = extract_first_number(text)
-                if n is None:
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        "No pude leer un número válido.\nEscribe algo como: 12, 15, 20 o 30",
-                        reply_markup=admin_fixed_kb(),
-                    )
-                    return {"ok": True}
+            if msg.get("photo"):
+                file_id = msg["photo"][-1]["file_id"]
 
-                interval = int(n)
-                if interval <= 0:
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        "El intervalo debe ser mayor que 0. Intenta otra vez.",
-                        reply_markup=admin_fixed_kb(),
-                    )
-                    return {"ok": True}
-
-                if interval > 180:
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        "Ese valor es demasiado alto. Usa un intervalo más razonable, por ejemplo 10, 15, 20, 30, 45 o 60.",
-                        reply_markup=admin_fixed_kb(),
-                    )
-                    return {"ok": True}
-
-                set_admin_setting_value(
-                    orders_sh,
-                    "pickup_interval_minutes",
-                    str(interval),
-                    updated_by=f"admin_bot:{chat_id}",
+                ok = update_tenant_payment_qr(
+                    tenant_id=tenant_id,
+                    file_id=file_id,
                 )
-                tmp.pop("admin_hours_mode_input", None)
 
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    f"✅ Intervalo de recojo actualizado a {interval} min.",
-                    reply_markup=admin_fixed_kb(),
-                )
-                return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
+                tmp.pop("admin_payment_mode", None)
+
+                if ok:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "✅ QR actualizado correctamente.",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                else:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ Error guardando el QR.",
+                        reply_markup=admin_fixed_kb(),
+                    )
+
+                return {"ok": True}
+
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "📷 Estoy esperando una imagen del QR.",
+                reply_markup=admin_fixed_kb(),
+            )
+            return {"ok": True}
 
         admin_order_step = str(tmp.get("admin_order_step") or "").strip()
 
@@ -492,7 +449,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El password no puede estar vacío. Escríbelo otra vez:",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -515,7 +471,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "⚠️ No pude guardar el nuevo password.",
-                        reply_markup=admin_fixed_kb(),
                     )
                 return {"ok": True}
 
@@ -526,7 +481,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "La recompensa no puede estar vacía. Escríbela otra vez:",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -549,7 +503,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "⚠️ No pude guardar la nueva recompensa.",
-                        reply_markup=admin_fixed_kb(),
                     )
                 return {"ok": True}
 
@@ -560,7 +513,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "La pregunta no puede estar vacía. Escríbela otra vez:",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -585,7 +537,6 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "Selecciona el tipo usando los botones: ⭐ Estrellas o ✍️ Texto.",
-                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -600,7 +551,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "⚠️ No encontré la pregunta a editar. Vuelve a entrar.",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -609,7 +559,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El nuevo texto no puede estar vacío. Escríbelo otra vez:",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -633,7 +582,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "⚠️ No pude actualizar el texto de esa pregunta.",
-                        reply_markup=admin_fixed_kb(),
                     )
 
                 return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
@@ -653,7 +601,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El nombre no puede estar vacío. Escribe el nombre del producto:",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -677,12 +624,19 @@ def handle_admin_message_impl(
                 )
                 return {"ok": True}
 
+            if create_step == "awaiting_category_SELECTION":
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Selecciona una categoría usando los botones o toca 'Nueva categoría'.",
+                )
+                return {"ok": True}
+
             if create_step == "awaiting_category_selection":
                 telegram_send_text(
                     bot_token,
                     chat_id,
                     "Selecciona una categoría usando los botones o toca 'Nueva categoría'.",
-                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -693,7 +647,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "La categoría no puede estar vacía. Escríbela:",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -703,7 +656,6 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "Escribe el precio del producto.\nEjemplos: 25, 25 bs",
-                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -714,7 +666,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "La categoría no puede estar vacía. Escríbela:",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -724,7 +675,6 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "Escribe el precio del producto.\nEjemplos: 25, 25 bs",
-                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -735,7 +685,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "No pude leer un precio válido.\nEscribe algo como: 25 o 25 bs",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -744,7 +693,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El precio no puede ser negativo. Intenta otra vez.",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -778,7 +726,6 @@ def handle_admin_message_impl(
                         f"Precio: Bs {fmt_price_short(result.get('price', 0))}\n\n"
                         "Ahora puedes enviar una foto del producto."
                     ),
-                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -811,7 +758,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "No pude subir la foto al storage configurado.",
-                        reply_markup=admin_fixed_kb(),
                     )
                     log_event("admin_product_photo_storage_upload_failed", tenant_id=tenant_id, sku=input_sku, error=str(e))
                     alert_photo_upload_failed(tenant_id=tenant_id, sku=input_sku, error=str(e))
@@ -825,7 +771,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         f"No encontré el producto SKU {input_sku} en la hoja Menu.",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -838,7 +783,6 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "✅ Foto guardada correctamente y vinculada al producto.",
-                    reply_markup=admin_fixed_kb(),
                 )
 
                 return {
@@ -851,7 +795,6 @@ def handle_admin_message_impl(
                 bot_token,
                 chat_id,
                 "📷 Estoy esperando una foto del producto. Envíala como imagen de Telegram.",
-                reply_markup=admin_fixed_kb(),
             )
             return {"ok": True}
 
@@ -865,7 +808,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El nombre no puede estar vacío. Escribe el nuevo nombre del producto:",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -878,7 +820,6 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     f"✅ Nombre actualizado.\nNuevo nombre: {result.get('name', '')}",
-                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
 
@@ -889,7 +830,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "La categoría no puede estar vacía. Escríbela otra vez:",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -903,7 +843,6 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     f"✅ Categoría actualizada.\nNueva categoría: {result.get('category', '')}",
-                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
 
@@ -917,14 +856,12 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "No pude leer un número válido.\nEscribe solo el precio o algo como: 25 bs",
-                        reply_markup=admin_fixed_kb(),
                     )
                 elif input_mode == "discount_pct":
                     telegram_send_text(
                         bot_token,
                         chat_id,
                         "No pude leer un porcentaje válido.\nEscribe algo como: 10 o 15%",
-                        reply_markup=admin_fixed_kb(),
                     )
                 return {"ok": True}
 
@@ -934,7 +871,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El precio no puede ser negativo. Intenta otra vez.",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -947,7 +883,6 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     f"✅ Precio actualizado.\nSKU: {input_sku}\nNuevo precio: Bs {fmt_price_short(result.get('price', 0))}",
-                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
 
@@ -957,7 +892,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El descuento no puede ser negativo. Intenta otra vez.",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
                 if n > 100:
@@ -965,7 +899,6 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El descuento no puede ser mayor a 100%. Intenta otra vez.",
-                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -988,7 +921,6 @@ def handle_admin_message_impl(
                         f"Precio anterior: Bs {fmt_price_short(current_price)}\n"
                         f"Nuevo precio: Bs {fmt_price_short(result.get('price', 0))}"
                     ),
-                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
 
@@ -1001,7 +933,12 @@ def handle_admin_message_impl(
                 "📊 Elige el período:",
                 reply_markup=admin_periods_inline_kb(tenant_id, periods),
             )
-            telegram_send_text(bot_token, chat_id, "Usa el botón inferior ⚙️ Panel cuando quieras volver.", reply_markup=admin_fixed_kb())
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "Usa el botón inferior ⚙️ Panel cuando quieras volver.",
+                reply_markup=admin_fixed_kb(),
+            )
             return {"ok": True}
 
         if (
@@ -1015,7 +952,6 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "🚫 Como propietario no puedes crear pedidos.",
-                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -1069,13 +1005,41 @@ def handle_admin_message_impl(
                     [("🧭 Panel admin", "admin_panel")],
                 ]),
             )
-            telegram_send_text(bot_token, chat_id, "Usa el botón inferior ⚙️ Panel cuando quieras volver.", reply_markup=admin_fixed_kb())
             return {"ok": True}
 
         if txt_norm in ("start", "/start", "hola"):
-            return {"ok": _send_admin_ready(bot_token, chat_id, is_owner)}
+            if is_owner:
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Bot propietario listo ✅\n\nUsa el botón inferior ⚙️ Panel.",
+                    reply_markup=admin_fixed_kb(),
+                )
+            else:
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "Admin bot listo ✅\n\nUsa el botón inferior ⚙️ Panel.",
+                    reply_markup=admin_fixed_kb(),
+                )
+            return {"ok": True}
 
-        return {"ok": _send_admin_idle_hint(bot_token, chat_id, is_owner)}
+        if is_owner:
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "OK propietario ✅\n\nUsa el botón inferior ⚙️ Panel.",
+                reply_markup=admin_fixed_kb(),
+            )
+        else:
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "OK admin ✅\n\nUsa el botón inferior ⚙️ Panel.",
+                reply_markup=admin_fixed_kb(),
+            )
+
+        return {"ok": True}
 
     except Exception as e:
         log_event(
