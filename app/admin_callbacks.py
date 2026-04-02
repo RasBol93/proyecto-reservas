@@ -35,6 +35,7 @@ from app.webhook_helpers import (
     admin_periods_inline_kb,
     fmt_snapshot_lines,
     build_order_recap_text,
+    parse_items_field,
 )
 from app.admin_hours import (
     handle_admin_hours_callback,
@@ -784,7 +785,7 @@ def handle_admin_callback_impl(
                 customer_contact = _safe_str(order_after.get("customer_contact"))
                 requested_time = _safe_str(order_after.get("requested_time"))
 
-                items_snapshot = order_after.get("items_snapshot") or []
+                items_snapshot = parse_items_field(order_after.get("items_snapshot"))
                 detail_lines, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
 
                 recap = build_order_recap_text(
@@ -868,7 +869,7 @@ def handle_admin_callback_impl(
                         customer_contact = _safe_str(order_after.get("customer_contact"))
                         requested_time = _safe_str(order_after.get("requested_time"))
 
-                        items_snapshot = order_after.get("items_snapshot") or []
+                        items_snapshot = parse_items_field(order_after.get("items_snapshot"))
                         detail_lines, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
 
                         owner_recap = build_order_recap_text(
