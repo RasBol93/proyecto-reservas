@@ -319,21 +319,36 @@ def handle_admin_message_impl(
 
                 try:
                     file_path = telegram_get_file_path(bot_token, file_id)
+                    file_bytes = telegram_download_file_bytes(bot_token, file_path)
+
+                    content_type = "image/jpeg"
+                    low_path = file_path.lower()
+                    if low_path.endswith(".png"):
+                        content_type = "image/png"
+                    elif low_path.endswith(".webp"):
+                        content_type = "image/webp"
+
+                    qr_url = upload_product_photo_for_tenant(
+                        tenant=tenant,
+                        tenant_id=tenant_id,
+                        sku="payment_qr",
+                        file_bytes=file_bytes,
+                        mime_type=content_type,
+                    )
+
                 except Exception as e:
                     log_event(
-                        "admin_payment_qr_get_file_path_error",
+                        "admin_payment_qr_upload_failed",
                         tenant_id=tenant_id,
                         error=str(e),
                     )
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        "⚠️ No pude procesar el archivo del QR. Intenta nuevamente.",
+                        "⚠️ Error procesando el QR. Intenta nuevamente.",
                         reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
-
-                qr_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
 
                 ok = update_tenant_payment_qr(
                     tenant_id=tenant_id,
