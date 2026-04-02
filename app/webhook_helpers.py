@@ -436,7 +436,7 @@ def contact_admin_kb(tenant_id: str, order_id: str) -> Dict[str, Any]:
 
 def admin_fixed_kb() -> Dict[str, Any]:
     return reply_kb([
-        ["Panel"],
+        ["⚙️ Panel"],
     ], resize=True, one_time=False)
 
 
