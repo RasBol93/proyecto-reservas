@@ -52,6 +52,7 @@ from app.admin_manual_order import (
 from app.admin_nav import (
     admin_panel_kb,
 )
+from app.admin_settings import set_admin_setting_value
 from app.survey import (
     save_survey_password,
     save_survey_reward,
@@ -62,6 +63,7 @@ from app.sheets import get_ws
 
 
 SURVEY_CONFIG_WS = "Survey_Config"
+DEFAULT_PICKUP_INTERVAL_MINUTES = 15
 
 
 def _is_owner_bot(tenant: Dict[str, Any]) -> bool:
@@ -300,6 +302,53 @@ def handle_admin_message_impl(
                 reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
             )
             return {"ok": True}
+
+        admin_hours_mode_input = str(tmp.get("admin_hours_mode_input") or "").strip()
+
+        if admin_hours_mode_input:
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+
+            if admin_hours_mode_input == "pickup_interval_custom":
+                n = extract_first_number(text)
+                if n is None:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "No pude leer un número válido.\nEscribe algo como: 12, 15, 20 o 30",
+                    )
+                    return {"ok": True}
+
+                interval = int(n)
+                if interval <= 0:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "El intervalo debe ser mayor que 0. Intenta otra vez.",
+                    )
+                    return {"ok": True}
+
+                if interval > 180:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "Ese valor es demasiado alto. Usa un intervalo más razonable, por ejemplo 10, 15, 20, 30, 45 o 60.",
+                    )
+                    return {"ok": True}
+
+                set_admin_setting_value(
+                    orders_sh,
+                    "pickup_interval_minutes",
+                    str(interval),
+                    updated_by=f"admin_bot:{chat_id}",
+                )
+                tmp.pop("admin_hours_mode_input", None)
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    f"✅ Intervalo de recojo actualizado a {interval} min.",
+                )
+                return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
         admin_order_step = str(tmp.get("admin_order_step") or "").strip()
 
