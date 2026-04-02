@@ -310,6 +310,44 @@ def _update_admin_setting_cells(
         ws.update_cell(row_idx, updated_by_col + 1, str(updated_by))
 
 
+def _append_admin_setting_row(
+    ws,
+    key: str,
+    value: str,
+    *,
+    active: bool = True,
+    scope: str = "global",
+    updated_by: str = "admin_bot",
+) -> None:
+    header = _get_header(ws)
+    if not header:
+        raise RuntimeError("AdminSettings header row missing")
+
+    row = [""] * len(header)
+
+    key_col = _find_col_idx(header, "key")
+    value_col = _find_col_idx(header, "value")
+    active_col = _find_col_idx(header, "active")
+    scope_col = _find_col_idx(header, "scope")
+    updated_at_col = _find_col_idx(header, "updated_at")
+    updated_by_col = _find_col_idx(header, "updated_by")
+
+    if key_col is not None:
+        row[key_col] = normalize(key).replace(" ", "_")
+    if value_col is not None:
+        row[value_col] = str(value)
+    if active_col is not None:
+        row[active_col] = "TRUE" if active else "FALSE"
+    if scope_col is not None:
+        row[scope_col] = str(scope)
+    if updated_at_col is not None:
+        row[updated_at_col] = datetime.utcnow().isoformat()
+    if updated_by_col is not None:
+        row[updated_by_col] = str(updated_by)
+
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+
 def set_admin_setting_value(
     orders_sh,
     key: str,
@@ -318,8 +356,21 @@ def set_admin_setting_value(
 ) -> Dict[str, Any]:
     ws = get_admin_settings_ws(orders_sh)
     row_idx = _find_row_idx_by_key(ws, key)
+
     if row_idx is None:
-        raise HTTPException(status_code=500, detail=f"AdminSettings key not found: {key}")
+        _append_admin_setting_row(
+            ws=ws,
+            key=key,
+            value=value,
+            active=True,
+            scope="global",
+            updated_by=updated_by,
+        )
+        try:
+            log_event("admin_setting_created", key=key, value=value, updated_by=updated_by)
+        except Exception:
+            pass
+        return {"ok": True, "key": normalize(key).replace(" ", "_"), "value": value, "created": True}
 
     _update_admin_setting_cells(
         ws=ws,
@@ -333,7 +384,7 @@ def set_admin_setting_value(
     except Exception:
         pass
 
-    return {"ok": True, "key": normalize(key).replace(" ", "_"), "value": value}
+    return {"ok": True, "key": normalize(key).replace(" ", "_"), "value": value, "created": False}
 
 
 def set_admin_setting_bool(
