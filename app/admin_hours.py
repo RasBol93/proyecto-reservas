@@ -1,4 +1,4 @@
-# app/admin_hours.py — UX nueva para días/horarios habituales y acciones del día
+# app/admin_hours.py — UX nueva para días/horarios habituales y acciones del día + intervalo pickup configurable
 
 from typing import Any, Dict, List, Tuple
 
@@ -27,12 +27,24 @@ DAY_LABELS = {
     "dom": "Dom",
 }
 
+DEFAULT_PICKUP_INTERVAL_MINUTES = 15
+
 
 def compact_to_hhmm(v: str) -> str:
     s = str(v or "").strip()
     if len(s) == 4 and s.isdigit():
         return f"{s[:2]}:{s[2:]}"
     return s
+
+
+def _safe_int(v: Any, default: int) -> int:
+    try:
+        n = int(str(v or "").strip())
+        if n <= 0:
+            return default
+        return n
+    except Exception:
+        return default
 
 
 def _hour_rows(prefix: str) -> List[List[Tuple[str, str]]]:
@@ -73,15 +85,38 @@ def _days_summary(settings_map: Dict[str, Dict[str, Any]]) -> str:
     return ", ".join(labels) if labels else "No definido"
 
 
+def _pickup_interval_value(settings_map: Dict[str, Dict[str, Any]]) -> int:
+    return _safe_int(
+        get_admin_setting_value(settings_map, "pickup_interval_minutes", str(DEFAULT_PICKUP_INTERVAL_MINUTES)),
+        DEFAULT_PICKUP_INTERVAL_MINUTES,
+    )
+
+
+def _pickup_interval_label(settings_map: Dict[str, Dict[str, Any]]) -> str:
+    return f"{_pickup_interval_value(settings_map)} min"
+
+
 def _hours_root_kb() -> Dict[str, Any]:
     return kb([
         [("📅 Días habituales", "admhrs|days")],
         [("🕒 Horarios habituales", "admhrs|hours")],
+        [("⏱ Intervalo recojo", "admhrs|pickup_interval")],
         [("🟢 Abrir ahora", "admhrs|open_now")],
         [("🔴 Cerrar ahora", "admhrs|close_now")],
         [("⛔ No abrir hoy", "admhrs|closed_today")],
         [("♻️ Volver a lo habitual", "admhrs|restore")],
         [("⬅️ Volver", "admin_panel")],
+        [("🧭 Panel admin", "admin_panel")],
+    ])
+
+
+def _pickup_interval_menu_kb() -> Dict[str, Any]:
+    return kb([
+        [("10 min", "admhrs|pickupset|10"), ("15 min", "admhrs|pickupset|15")],
+        [("20 min", "admhrs|pickupset|20"), ("30 min", "admhrs|pickupset|30")],
+        [("45 min", "admhrs|pickupset|45"), ("60 min", "admhrs|pickupset|60")],
+        [("✍️ Escribir otro valor", "admhrs|pickupcustom")],
+        [("⬅️ Volver", "admhrs|menu")],
         [("🧭 Panel admin", "admin_panel")],
     ])
 
@@ -93,6 +128,7 @@ def send_admin_hours_menu(bot_token: str, chat_id: int, tenant_id: str, orders_s
     current_mode = str(bs.get("today_mode") or "habitual")
     slots_txt = _format_slots_for_admin(settings)
     days_txt = _days_summary(settings)
+    pickup_interval_txt = _pickup_interval_label(settings)
 
     mode_label = {
         "habitual": "Habitual",
@@ -105,6 +141,7 @@ def send_admin_hours_menu(bot_token: str, chat_id: int, tenant_id: str, orders_s
         "⚙️ CONFIG DÍAS Y HORARIOS\n\n"
         f"Días habituales: {days_txt}\n"
         f"Horarios habituales:\n{slots_txt}\n\n"
+        f"Intervalo de recojo: {pickup_interval_txt}\n\n"
         f"Estado de hoy: {mode_label}"
     )
 
@@ -155,6 +192,25 @@ def send_admin_hours_mode_menu(bot_token: str, chat_id: int, tenant_id: str) -> 
             [("⬅️ Volver", "admhrs|menu")],
             [("🧭 Panel admin", "admin_panel")],
         ]),
+    )
+
+
+def send_pickup_interval_menu(bot_token: str, chat_id: int, orders_sh) -> bool:
+    settings = load_admin_settings(orders_sh)
+    current_value = _pickup_interval_value(settings)
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        (
+            "⏱ INTERVALO DE RECOJO\n\n"
+            "Este valor se usa para dos cosas:\n"
+            "1) “Lo antes posible” = ahora + X minutos\n"
+            "2) Las demás opciones = bloques siguientes de X en X\n\n"
+            f"Valor actual: {current_value} min\n\n"
+            "Elige un valor o escribe uno manualmente:"
+        ),
+        reply_markup=_pickup_interval_menu_kb(),
     )
 
 
@@ -264,6 +320,34 @@ def handle_admin_hours_callback(
         tmp.pop("slot2_open", None)
         tmp.pop("slot2_close", None)
         return {"ok": send_admin_hours_mode_menu(bot_token, chat_id, tenant_id)}
+
+    if data == "admhrs|pickup_interval":
+        return {"ok": send_pickup_interval_menu(bot_token, chat_id, orders_sh)}
+
+    if data.startswith("admhrs|pickupset|"):
+        value_raw = data.split("|", 2)[2].strip()
+        interval = _safe_int(value_raw, DEFAULT_PICKUP_INTERVAL_MINUTES)
+        set_admin_setting_value(
+            orders_sh,
+            "pickup_interval_minutes",
+            str(interval),
+            updated_by=updated_by,
+        )
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            f"✅ Intervalo de recojo actualizado a {interval} min.",
+        )
+        return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
+
+    if data == "admhrs|pickupcustom":
+        tmp["admin_hours_mode_input"] = "pickup_interval_custom"
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            "Escribe el nuevo intervalo en minutos.\nEjemplos: 12, 15, 20, 30",
+        )
+        return {"ok": True}
 
     if data.startswith("admhrs|hmode|"):
         mode = data.split("|", 2)[2].strip()
