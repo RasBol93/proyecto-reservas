@@ -781,20 +781,33 @@ def handle_admin_callback_impl(
 
             if order_after:
                 customer_name = _safe_str(order_after.get("customer_name"))
-                final_hhmm = _extract_slot_hhmm(order_after.get("requested_time"))
+                customer_contact = _safe_str(order_after.get("customer_contact"))
+                requested_time = _safe_str(order_after.get("requested_time"))
 
-                if final_hhmm:
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        f"✅ El pedido de {customer_name}, con código de pedido {order_id}, ha sido confirmado.\nHora de recojo: {final_hhmm}.",
-                    )
-                else:
-                    telegram_send_text(
-                        bot_token,
-                        chat_id,
-                        f"✅ El pedido de {customer_name}, con código de pedido {order_id}, ha sido confirmado.",
-                    )
+                items_snapshot = order_after.get("items_snapshot") or []
+                detail_lines, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
+
+                recap = build_order_recap_text(
+                    order_id=order_id,
+                    customer_name=customer_name,
+                    customer_contact=customer_contact,
+                    requested_time=requested_time,
+                    detail_lines=detail_lines,
+                    total_qty=total_qty,
+                    total=total_amount,
+                )
+
+                admin_msg = (
+                    "✅ *Pago confirmado correctamente.*\n\n"
+                    f"{recap}"
+                )
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    admin_msg,
+                    parse_mode="Markdown",
+                )
             else:
                 telegram_send_text(
                     bot_token,
@@ -868,10 +881,15 @@ def handle_admin_callback_impl(
                             total=total_amount,
                         )
 
+                        owner_msg = (
+                            "✅ *Pedido confirmado por el administrador.*\n\n"
+                            f"{owner_recap}"
+                        )
+
                         telegram_send_text(
                             owner_token,
                             int(owner_chat),
-                            owner_recap,
+                            owner_msg,
                             parse_mode="Markdown",
                         )
                 except Exception as e:
