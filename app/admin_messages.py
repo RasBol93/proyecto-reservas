@@ -1,4 +1,4 @@
-# app/admin_messages.py — admin por texto "panel", pedido manual mejorado y sin teclado persistente inferior
+# app/admin_messages.py — admin por texto con botón fijo inferior "Panel"
 
 from typing import Any, Dict, Optional
 
@@ -31,6 +31,7 @@ from app.webhook_helpers import (
     extract_first_number,
     fmt_snapshot_lines,
     build_order_recap_text,
+    admin_fixed_kb,
 )
 from app.admin_hours import send_admin_hours_menu
 from app.admin_menu import (
@@ -70,6 +71,53 @@ def _is_owner_bot(tenant: Dict[str, Any]) -> bool:
     return bool(tenant.get("_is_owner_bot"))
 
 
+def _send_admin_panel(bot_token: str, chat_id: int, is_owner: bool) -> bool:
+    ok1 = telegram_send_text(
+        bot_token,
+        chat_id,
+        "🧭 PANEL ADMIN\n\nElige una opción:",
+        reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
+    )
+    # Reforzamos que el teclado reply inferior quede siempre visible
+    ok2 = telegram_send_text(
+        bot_token,
+        chat_id,
+        "Botón fijo activo abajo: Panel",
+        reply_markup=admin_fixed_kb(),
+    )
+    return bool(ok1 or ok2)
+
+
+def _send_admin_ready(bot_token: str, chat_id: int, is_owner: bool) -> bool:
+    msg = (
+        "Bot propietario listo ✅\n\nUsa el botón inferior *Panel*."
+        if is_owner
+        else "Admin bot listo ✅\n\nUsa el botón inferior *Panel*."
+    )
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=admin_fixed_kb(),
+        parse_mode="Markdown",
+    )
+
+
+def _send_admin_idle_hint(bot_token: str, chat_id: int, is_owner: bool) -> bool:
+    msg = (
+        "OK propietario ✅\n\nUsa el botón inferior *Panel*."
+        if is_owner
+        else "OK admin ✅\n\nUsa el botón inferior *Panel*."
+    )
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=admin_fixed_kb(),
+        parse_mode="Markdown",
+    )
+
+
 def _finalize_admin_manual_order(
     tenant_id: str,
     bot_token: str,
@@ -88,6 +136,7 @@ def _finalize_admin_manual_order(
             bot_token,
             chat_id,
             "⚠️ Faltaban datos del pedido manual. Empecemos de nuevo.",
+            reply_markup=admin_fixed_kb(),
         )
         return {"ok": True}
 
@@ -126,6 +175,7 @@ def _finalize_admin_manual_order(
             bot_token,
             chat_id,
             "⚠️ Error guardando el pedido manual.",
+            reply_markup=admin_fixed_kb(),
         )
         return {"ok": True}
 
@@ -152,6 +202,7 @@ def _finalize_admin_manual_order(
         chat_id,
         "✅ *Pedido manual registrado como pagado.*\nYa cuenta para estadísticas y base de consumidores.",
         parse_mode="Markdown",
+        reply_markup=admin_fixed_kb(),
     )
     return {"ok": True}
 
@@ -293,15 +344,10 @@ def handle_admin_message_impl(
         sess = get_sess(tenant_id, chat_id)
         tmp = sess.setdefault("tmp", {})
 
-        if txt_norm == "panel":
+        # Soporte oficial: botón reply "Panel"
+        if txt_norm in ("panel", "🧭paneladmin", "🧭 panel admin"):
             assert_admin_authorized(tenant, chat_id, tenant_id)
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                "🧭 PANEL ADMIN\n\nElige una opción:",
-                reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
-            )
-            return {"ok": True}
+            return {"ok": _send_admin_panel(bot_token, chat_id, is_owner)}
 
         admin_hours_mode_input = str(tmp.get("admin_hours_mode_input") or "").strip()
 
@@ -315,6 +361,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "No pude leer un número válido.\nEscribe algo como: 12, 15, 20 o 30",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -324,6 +371,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El intervalo debe ser mayor que 0. Intenta otra vez.",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -332,6 +380,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "Ese valor es demasiado alto. Usa un intervalo más razonable, por ejemplo 10, 15, 20, 30, 45 o 60.",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -347,6 +396,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     f"✅ Intervalo de recojo actualizado a {interval} min.",
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
 
@@ -362,6 +412,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "🚫 Como propietario no puedes crear pedidos.",
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -372,6 +423,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El nombre no puede estar vacío. Escribe el nombre del cliente:",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -381,6 +433,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "Escribe el contacto del cliente (teléfono o referencia):",
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -391,6 +444,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El contacto no puede estar vacío. Escribe el contacto del cliente:",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -411,6 +465,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "Escribe una hora válida.\nEjemplos: 19:30, 20h",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -445,6 +500,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El password no puede estar vacío. Escríbelo otra vez:",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -467,6 +523,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "⚠️ No pude guardar el nuevo password.",
+                        reply_markup=admin_fixed_kb(),
                     )
                 return {"ok": True}
 
@@ -477,6 +534,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "La recompensa no puede estar vacía. Escríbela otra vez:",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -499,6 +557,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "⚠️ No pude guardar la nueva recompensa.",
+                        reply_markup=admin_fixed_kb(),
                     )
                 return {"ok": True}
 
@@ -509,6 +568,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "La pregunta no puede estar vacía. Escríbela otra vez:",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -533,6 +593,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "Selecciona el tipo usando los botones: ⭐ Estrellas o ✍️ Texto.",
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -547,6 +608,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "⚠️ No encontré la pregunta a editar. Vuelve a entrar.",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -555,6 +617,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El nuevo texto no puede estar vacío. Escríbelo otra vez:",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -578,6 +641,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "⚠️ No pude actualizar el texto de esa pregunta.",
+                        reply_markup=admin_fixed_kb(),
                     )
 
                 return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
@@ -597,6 +661,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El nombre no puede estar vacío. Escribe el nombre del producto:",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -625,6 +690,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "Selecciona una categoría usando los botones o toca 'Nueva categoría'.",
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -635,6 +701,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "La categoría no puede estar vacía. Escríbela:",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -644,6 +711,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "Escribe el precio del producto.\nEjemplos: 25, 25 bs",
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -654,6 +722,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "La categoría no puede estar vacía. Escríbela:",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -663,6 +732,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "Escribe el precio del producto.\nEjemplos: 25, 25 bs",
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -673,6 +743,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "No pude leer un precio válido.\nEscribe algo como: 25 o 25 bs",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -681,6 +752,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El precio no puede ser negativo. Intenta otra vez.",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -714,6 +786,7 @@ def handle_admin_message_impl(
                         f"Precio: Bs {fmt_price_short(result.get('price', 0))}\n\n"
                         "Ahora puedes enviar una foto del producto."
                     ),
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -746,6 +819,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "No pude subir la foto al storage configurado.",
+                        reply_markup=admin_fixed_kb(),
                     )
                     log_event("admin_product_photo_storage_upload_failed", tenant_id=tenant_id, sku=input_sku, error=str(e))
                     alert_photo_upload_failed(tenant_id=tenant_id, sku=input_sku, error=str(e))
@@ -759,6 +833,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         f"No encontré el producto SKU {input_sku} en la hoja Menu.",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -771,6 +846,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "✅ Foto guardada correctamente y vinculada al producto.",
+                    reply_markup=admin_fixed_kb(),
                 )
 
                 return {
@@ -783,6 +859,7 @@ def handle_admin_message_impl(
                 bot_token,
                 chat_id,
                 "📷 Estoy esperando una foto del producto. Envíala como imagen de Telegram.",
+                reply_markup=admin_fixed_kb(),
             )
             return {"ok": True}
 
@@ -796,6 +873,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El nombre no puede estar vacío. Escribe el nuevo nombre del producto:",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -808,6 +886,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     f"✅ Nombre actualizado.\nNuevo nombre: {result.get('name', '')}",
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
 
@@ -818,6 +897,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "La categoría no puede estar vacía. Escríbela otra vez:",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -831,6 +911,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     f"✅ Categoría actualizada.\nNueva categoría: {result.get('category', '')}",
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
 
@@ -844,12 +925,14 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "No pude leer un número válido.\nEscribe solo el precio o algo como: 25 bs",
+                        reply_markup=admin_fixed_kb(),
                     )
                 elif input_mode == "discount_pct":
                     telegram_send_text(
                         bot_token,
                         chat_id,
                         "No pude leer un porcentaje válido.\nEscribe algo como: 10 o 15%",
+                        reply_markup=admin_fixed_kb(),
                     )
                 return {"ok": True}
 
@@ -859,6 +942,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El precio no puede ser negativo. Intenta otra vez.",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -871,6 +955,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     f"✅ Precio actualizado.\nSKU: {input_sku}\nNuevo precio: Bs {fmt_price_short(result.get('price', 0))}",
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
 
@@ -880,6 +965,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El descuento no puede ser negativo. Intenta otra vez.",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
                 if n > 100:
@@ -887,6 +973,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         "El descuento no puede ser mayor a 100%. Intenta otra vez.",
+                        reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
 
@@ -909,6 +996,7 @@ def handle_admin_message_impl(
                         f"Precio anterior: Bs {fmt_price_short(current_price)}\n"
                         f"Nuevo precio: Bs {fmt_price_short(result.get('price', 0))}"
                     ),
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": send_admin_menu_product_detail(bot_token, chat_id, tenant_id, orders_sh, sess, input_sku)}
 
@@ -921,7 +1009,7 @@ def handle_admin_message_impl(
                 "📊 Elige el período:",
                 reply_markup=admin_periods_inline_kb(tenant_id, periods),
             )
-            telegram_send_text(bot_token, chat_id, "Escribe 'panel' cuando quieras volver al panel admin.")
+            telegram_send_text(bot_token, chat_id, "Usa el botón inferior Panel cuando quieras volver.", reply_markup=admin_fixed_kb())
             return {"ok": True}
 
         if (
@@ -935,6 +1023,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "🚫 Como propietario no puedes crear pedidos.",
+                    reply_markup=admin_fixed_kb(),
                 )
                 return {"ok": True}
 
@@ -988,37 +1077,13 @@ def handle_admin_message_impl(
                     [("🧭 Panel admin", "admin_panel")],
                 ]),
             )
+            telegram_send_text(bot_token, chat_id, "Usa el botón inferior Panel cuando quieras volver.", reply_markup=admin_fixed_kb())
             return {"ok": True}
 
         if txt_norm in ("start", "/start", "hola"):
-            if is_owner:
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    "Bot propietario listo ✅\n\nEscribe 'panel' para abrir el panel.",
-                )
-            else:
-                telegram_send_text(
-                    bot_token,
-                    chat_id,
-                    "Admin bot listo ✅\n\nEscribe 'panel' para abrir el panel admin.",
-                )
-            return {"ok": True}
+            return {"ok": _send_admin_ready(bot_token, chat_id, is_owner)}
 
-        if is_owner:
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                "OK propietario ✅\n\nEscribe 'panel' para abrir el panel.",
-            )
-        else:
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                "OK admin ✅\n\nEscribe 'panel' para abrir el panel admin.",
-            )
-
-        return {"ok": True}
+        return {"ok": _send_admin_idle_hint(bot_token, chat_id, is_owner)}
 
     except Exception as e:
         log_event(
@@ -1033,5 +1098,6 @@ def handle_admin_message_impl(
             bot_token,
             chat_id,
             "⚠️ Ocurrió un error en el panel admin.",
+            reply_markup=admin_fixed_kb(),
         )
         return {"ok": True}
