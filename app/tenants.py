@@ -114,6 +114,43 @@ def _build_row_getter(headers_norm: List[str]):
     return get
 
 
+def _get_tenants_ws(gc=None):
+    if gc is None:
+        gc = get_gspread_client()
+
+    sh = open_config_spreadsheet(gc)
+
+    try:
+        ws = sh.worksheet(TENANTS_SHEET_NAME)
+    except Exception as e:
+        log_event("tenants_sheet_missing", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Missing worksheet '{TENANTS_SHEET_NAME}': {e}")
+
+    return ws
+
+
+def _get_tenants_values_and_header(ws) -> Tuple[List[List[str]], int, List[str], List[str]]:
+    values = ws.get_all_values()
+    if not values:
+        return values, 0, [], []
+
+    header_idx = _detect_header_row(
+        values,
+        required_headers=["tenant_id", "orders_sheet_id", "active"]
+    )
+    headers_raw = values[header_idx]
+    headers_norm = [normalize(h) for h in headers_raw]
+    return values, header_idx, headers_raw, headers_norm
+
+
+def _find_header_col(headers_norm: List[str], key: str) -> Optional[int]:
+    target = normalize(key)
+    for i, h in enumerate(headers_norm):
+        if h == target:
+            return i
+    return None
+
+
 # -------------------------
 # Main API
 # -------------------------
@@ -334,6 +371,78 @@ def resolve_bot_by_secret(tenant: Dict[str, Any], secret: str) -> Tuple[str, str
         return ("admin", token)
 
     raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+
+# =========================================================
+# QR updater (NUEVO)
+# =========================================================
+
+def update_tenant_payment_qr(tenant_id: str, file_id: str, gc=None) -> bool:
+    """
+    Actualiza payment_qr_file_id para un tenant en la hoja TENANTS
+    y refresca cache en memoria.
+    """
+    tid = _norm_tenant_id(tenant_id)
+    file_id = _safe_str(file_id).strip()
+
+    if not tid or not file_id:
+        return False
+
+    try:
+        ws = _get_tenants_ws(gc=gc)
+        values, header_idx, headers_raw, headers_norm = _get_tenants_values_and_header(ws)
+
+        if not values or not headers_raw:
+            return False
+
+        tenant_col = _find_header_col(headers_norm, "tenant_id")
+        qr_col = _find_header_col(headers_norm, "payment_qr_file_id")
+
+        if tenant_col is None or qr_col is None:
+            log_event(
+                "tenant_payment_qr_update_missing_column",
+                tenant_id=tid,
+                has_tenant_col=(tenant_col is not None),
+                has_qr_col=(qr_col is not None),
+            )
+            return False
+
+        target_sheet_row: Optional[int] = None
+
+        for row_idx_0b, row in enumerate(values[header_idx + 1:], start=header_idx + 1):
+            raw_tid = row[tenant_col] if tenant_col < len(row) else ""
+            if _norm_tenant_id(raw_tid) == tid:
+                target_sheet_row = row_idx_0b + 1  # gspread is 1-based
+                break
+
+        if target_sheet_row is None:
+            log_event("tenant_payment_qr_update_not_found", tenant_id=tid)
+            return False
+
+        ws.update_cell(target_sheet_row, qr_col + 1, file_id)
+
+        # Refrescar cache
+        load_tenants(gc=gc, force=True)
+
+        try:
+            log_event(
+                "tenant_payment_qr_updated",
+                tenant_id=tid,
+                sheet_row=target_sheet_row,
+            )
+        except Exception:
+            pass
+
+        return True
+
+    except Exception as e:
+        log_event(
+            "tenant_payment_qr_update_error",
+            tenant_id=tid,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        return False
 
 
 # =========================================================
