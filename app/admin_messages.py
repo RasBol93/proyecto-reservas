@@ -307,7 +307,7 @@ def handle_admin_message_impl(
             return {"ok": True}
 
         # =========================
-        # QR de pagos (NUEVO)
+        # QR de pagos
         # =========================
         admin_payment_mode = str(tmp.get("admin_payment_mode") or "").strip()
 
@@ -317,9 +317,27 @@ def handle_admin_message_impl(
             if msg.get("photo"):
                 file_id = msg["photo"][-1]["file_id"]
 
+                try:
+                    file_path = telegram_get_file_path(bot_token, file_id)
+                except Exception as e:
+                    log_event(
+                        "admin_payment_qr_get_file_path_error",
+                        tenant_id=tenant_id,
+                        error=str(e),
+                    )
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No pude procesar el archivo del QR. Intenta nuevamente.",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                qr_url = f"https://api.telegram.org/file/bot{bot_token}/{file_path}"
+
                 ok = update_tenant_payment_qr(
                     tenant_id=tenant_id,
-                    file_id=file_id,
+                    qr_url=qr_url,
                 )
 
                 tmp.pop("admin_payment_mode", None)
