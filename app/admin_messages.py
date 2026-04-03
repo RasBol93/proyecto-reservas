@@ -1,4 +1,4 @@
-# app/admin_messages.py — admin por texto "panel", pedido manual mejorado, QR de pagos y comprobante manual
+# app/admin_messages.py — admin por texto "panel", pedido manual mejorado, QR de pagos y encuesta runtime
 
 from typing import Any, Dict, Optional
 
@@ -58,6 +58,11 @@ from app.survey import (
     save_survey_reward,
     add_survey_question,
     load_survey_questions,
+    get_runtime_survey_questions,
+    get_survey_reward_text,
+    create_survey_coupon,
+    save_survey_answers,
+    has_answered_survey_today,
 )
 from app.sheets import get_ws
 from app.tenants import update_tenant_payment_qr
@@ -307,6 +312,215 @@ def handle_admin_message_impl(
             return {"ok": True}
 
         # =========================
+        # SURVEY RUNTIME (ADMIN)
+        # =========================
+        if bool(tmp.get("admin_survey_runtime")):
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+
+            step = str(tmp.get("admin_survey_step") or "").strip()
+
+            if step == "phone":
+                phone = text.strip()
+                if not phone:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "📱 Ingresa un número válido:",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                if has_answered_survey_today(orders_sh, tenant_tz, phone):
+                    tmp.pop("admin_survey_runtime", None)
+                    tmp.pop("admin_survey_step", None)
+                    tmp.pop("admin_survey_answers", None)
+                    tmp.pop("admin_survey_phone", None)
+                    tmp.pop("admin_survey_name", None)
+
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ Este cliente ya respondió una encuesta hoy.",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                tmp["admin_survey_phone"] = phone
+                tmp["admin_survey_step"] = "name"
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "👤 Nombre del cliente:",
+                    reply_markup=admin_fixed_kb(),
+                )
+                return {"ok": True}
+
+            if step == "name":
+                customer_name = text.strip()
+                if not customer_name:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "👤 Ingresa un nombre válido:",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                questions = get_runtime_survey_questions(orders_sh)
+                if not questions:
+                    tmp.pop("admin_survey_runtime", None)
+                    tmp.pop("admin_survey_step", None)
+                    tmp.pop("admin_survey_answers", None)
+                    tmp.pop("admin_survey_phone", None)
+                    tmp.pop("admin_survey_name", None)
+
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No hay preguntas configuradas.",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                tmp["admin_survey_name"] = customer_name
+                tmp["admin_survey_step"] = "q_0"
+
+                q = questions[0]
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    f"❓ {q['question_text']}",
+                    reply_markup=admin_fixed_kb(),
+                )
+                return {"ok": True}
+
+            if step.startswith("q_"):
+                questions = get_runtime_survey_questions(orders_sh)
+                if not questions:
+                    tmp.pop("admin_survey_runtime", None)
+                    tmp.pop("admin_survey_step", None)
+                    tmp.pop("admin_survey_answers", None)
+                    tmp.pop("admin_survey_phone", None)
+                    tmp.pop("admin_survey_name", None)
+
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No hay preguntas configuradas.",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                try:
+                    idx = int(step.split("_")[1])
+                except Exception:
+                    idx = -1
+
+                if idx < 0 or idx >= len(questions):
+                    tmp.pop("admin_survey_runtime", None)
+                    tmp.pop("admin_survey_step", None)
+                    tmp.pop("admin_survey_answers", None)
+                    tmp.pop("admin_survey_phone", None)
+                    tmp.pop("admin_survey_name", None)
+
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ Error en el flujo de encuesta.",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                current_q = questions[idx]
+                answers = tmp.setdefault("admin_survey_answers", [])
+
+                answers.append({
+                    "question_id": str(current_q.get("question_id") or ""),
+                    "question_order": int(current_q.get("order", 0) or 0),
+                    "question_text": str(current_q.get("question_text") or ""),
+                    "answer_type": str(current_q.get("type") or ""),
+                    "answer_value": text.strip(),
+                })
+
+                next_idx = idx + 1
+
+                if next_idx < len(questions):
+                    tmp["admin_survey_step"] = f"q_{next_idx}"
+                    next_q = questions[next_idx]
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"❓ {next_q['question_text']}",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                phone = str(tmp.get("admin_survey_phone") or "").strip()
+                customer_name = str(tmp.get("admin_survey_name") or "").strip()
+                reward_text = get_survey_reward_text(orders_sh)
+
+                coupon_res = create_survey_coupon(
+                    orders_sh=orders_sh,
+                    tenant_id=tenant_id,
+                    phone=phone,
+                    reward_text=reward_text,
+                )
+
+                coupon_code = ""
+                if coupon_res.get("ok"):
+                    coupon_code = str(coupon_res.get("coupon_code") or "").strip()
+
+                save_res = save_survey_answers(
+                    orders_sh=orders_sh,
+                    tenant_id=tenant_id,
+                    tenant_tz=tenant_tz,
+                    customer_phone=phone,
+                    customer_name=customer_name,
+                    answers=answers,
+                    coupon_code=coupon_code,
+                )
+
+                tmp.pop("admin_survey_runtime", None)
+                tmp.pop("admin_survey_step", None)
+                tmp.pop("admin_survey_answers", None)
+                tmp.pop("admin_survey_phone", None)
+                tmp.pop("admin_survey_name", None)
+
+                if not save_res.get("ok"):
+                    error_code = str(save_res.get("error") or "").strip()
+                    if error_code == "already_answered_today":
+                        telegram_send_text(
+                            bot_token,
+                            chat_id,
+                            "⚠️ Este cliente ya respondió una encuesta hoy.",
+                            reply_markup=admin_fixed_kb(),
+                        )
+                        return {"ok": True}
+
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No pude guardar la encuesta.",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                final_msg = "✅ Encuesta completada y guardada correctamente."
+                if coupon_code:
+                    final_msg += f"\n🎁 Cupón generado: {coupon_code}"
+                elif reward_text:
+                    final_msg += "\n🎁 La encuesta se guardó, pero no pude generar el cupón."
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    final_msg,
+                    reply_markup=admin_fixed_kb(),
+                )
+                return {"ok": True}
+
+        # =========================
         # QR de pagos
         # =========================
         admin_payment_mode = str(tmp.get("admin_payment_mode") or "").strip()
@@ -383,7 +597,7 @@ def handle_admin_message_impl(
             return {"ok": True}
 
         # =========================
-        # NUEVO: comprobante de pedido manual
+        # comprobante de pedido manual
         # =========================
         if bool(tmp.get("admin_order_waiting_proof")):
             assert_admin_authorized(tenant, chat_id, tenant_id)
