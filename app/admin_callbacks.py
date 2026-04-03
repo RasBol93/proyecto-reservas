@@ -161,6 +161,11 @@ def _finalize_admin_manual_order_from_tmp(
 
     _admin_order_reset(tmp)
 
+    # Estado mínimo para flujo de comprobante + encuesta
+    tmp["admin_order_last_id"] = order_id
+    tmp["admin_order_waiting_proof"] = False
+    tmp["admin_order_proof_received"] = False
+
     recap = build_order_recap_text(
         order_id=order_id,
         customer_name=customer_name,
@@ -180,8 +185,12 @@ def _finalize_admin_manual_order_from_tmp(
     telegram_send_text(
         bot_token,
         chat_id,
-        "✅ *Pedido manual registrado como pagado.*\nYa cuenta para estadísticas y base de consumidores.",
+        "✅ *Pedido manual registrado como pagado.*\nAhora puedes fotografiar el comprobante.",
         parse_mode="Markdown",
+        reply_markup=kb([
+            [("📷 Fotografiar comprobante", f"admord|{tenant_id}|proof")],
+            [("🧭 Panel admin", "admin_panel")],
+        ]),
     )
 
     try:
@@ -496,7 +505,7 @@ def handle_admin_callback_impl(
             return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
         # =========================
-        # PAGOS / QR (NUEVO)
+        # PAGOS / QR
         # =========================
 
         if data == "admin_payments":
@@ -725,8 +734,6 @@ def handle_admin_callback_impl(
                         "⚠️ Tipo inválido.",
                     )
                     return {"ok": True}
-
-                from app.survey import add_survey_question
 
                 result = add_survey_question(orders_sh, pending_qtext, qtype)
 
@@ -1160,6 +1167,54 @@ def handle_admin_callback_impl(
                     "Escribe la hora solicitada.\nEjemplos: 19:30, 20h",
                 )
                 return {"ok": True}
+
+            # =========================
+            # NUEVO: comprobante + encuesta
+            # =========================
+
+            if action == "proof":
+                last_order_id = str(tmp.get("admin_order_last_id") or "").strip()
+                if not last_order_id:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No encontré el pedido recién creado.",
+                    )
+                    return {"ok": True}
+
+                tmp["admin_order_waiting_proof"] = True
+                tmp["admin_order_proof_received"] = False
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    f"📷 Envía la foto del comprobante para el pedido {last_order_id}.",
+                )
+                return {"ok": True}
+
+            if action == "proof_ok":
+                if not bool(tmp.get("admin_order_proof_received")):
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ Aún no recibí la foto del comprobante.",
+                    )
+                    return {"ok": True}
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "✅ Fotografía confirmada. Ahora puedes abrir la encuesta.",
+                    reply_markup=kb([
+                        [("📝 Encuesta", f"admord|{tenant_id}|survey")],
+                        [("🧭 Panel admin", "admin_panel")],
+                    ]),
+                )
+                return {"ok": True}
+
+            if action == "survey":
+                # Reutilizamos el módulo existente sin inventar una runtime nueva
+                return {"ok": _send_admin_surveys_home(bot_token, chat_id, tenant_id, orders_sh)}
 
             return {"ok": True}
 
