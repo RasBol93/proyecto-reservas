@@ -86,6 +86,8 @@ from app.survey import (
     build_survey_analytics_text,
     load_survey_questions,
     survey_period_options,
+    add_survey_question,
+    get_runtime_survey_questions,
 )
 from app.sheets import get_ws
 
@@ -1213,8 +1215,33 @@ def handle_admin_callback_impl(
                 return {"ok": True}
 
             if action == "survey":
-                # Reutilizamos el módulo existente sin inventar una runtime nueva
-                return {"ok": _send_admin_surveys_home(bot_token, chat_id, tenant_id, orders_sh)}
+                questions = get_runtime_survey_questions(orders_sh)
+                if not questions:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ No hay preguntas activas configuradas para la encuesta.",
+                    )
+                    return {"ok": True}
+
+                reward_text = get_survey_reward_text(orders_sh)
+                tmp["admin_survey_runtime"] = True
+                tmp["admin_survey_step"] = "phone"
+                tmp["admin_survey_answers"] = []
+                tmp["admin_survey_phone"] = ""
+                tmp["admin_survey_name"] = ""
+
+                intro = "📝 Iniciaremos la encuesta del cliente."
+                if reward_text:
+                    intro += f"\n🎁 Recompensa configurada: {reward_text}"
+                intro += "\n\n📱 Ingresa el número del cliente:"
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    intro,
+                )
+                return {"ok": True}
 
             return {"ok": True}
 
