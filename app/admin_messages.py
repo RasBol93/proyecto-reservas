@@ -1,4 +1,4 @@
-# app/admin_messages.py — admin por texto "panel", pedido manual mejorado y soporte de QR de pagos
+# app/admin_messages.py — admin por texto "panel", pedido manual mejorado, QR de pagos y comprobante manual
 
 from typing import Any, Dict, Optional
 
@@ -378,6 +378,40 @@ def handle_admin_message_impl(
                 bot_token,
                 chat_id,
                 "📷 Estoy esperando una imagen del QR.",
+                reply_markup=admin_fixed_kb(),
+            )
+            return {"ok": True}
+
+        # =========================
+        # NUEVO: comprobante de pedido manual
+        # =========================
+        if bool(tmp.get("admin_order_waiting_proof")):
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+
+            if msg.get("photo"):
+                tmp["admin_order_waiting_proof"] = False
+                tmp["admin_order_proof_received"] = True
+
+                last_order_id = str(tmp.get("admin_order_last_id") or "").strip()
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    (
+                        "✅ Comprobante recibido correctamente.\n"
+                        f"Pedido: {last_order_id or '(sin referencia)'}"
+                    ),
+                    reply_markup=kb([
+                        [("✅ Fotografía OK", f"admord|{tenant_id}|proof_ok")],
+                        [("🧭 Panel admin", "admin_panel")],
+                    ]),
+                )
+                return {"ok": True}
+
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                "📷 Estoy esperando la foto del comprobante.",
                 reply_markup=admin_fixed_kb(),
             )
             return {"ok": True}
