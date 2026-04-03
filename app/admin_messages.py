@@ -1,4 +1,5 @@
-# app/admin_messages.py — admin por texto "panel", pedido manual mejorado, QR de pagos y encuesta runtime
+# app/admin_messages.py — admin por texto "panel", pedido manual mejorado, QR de pagos,
+# comprobante manual y encuesta runtime
 
 from typing import Any, Dict, Optional
 
@@ -150,15 +151,10 @@ def _finalize_admin_survey_runtime(
         )
         return {"ok": True}
 
-    final_msg = (
-        "✅ Gracias por responder nuestra encuesta.\n"
-        "Te daremos tu tarjeta de descuento."
-    )
-
     telegram_send_text(
         bot_token,
         chat_id,
-        final_msg,
+        "✅ Gracias por responder nuestra encuesta.\nTe daremos tu tarjeta de descuento.",
         reply_markup=admin_fixed_kb(),
     )
     return {"ok": True}
@@ -227,7 +223,7 @@ def _finalize_admin_manual_order(
 
     _admin_order_reset(tmp)
 
-    # Guardamos datos del último pedido para reusar en encuesta
+    # Guardamos datos del último pedido para reutilizarlos después
     tmp["admin_order_last_id"] = order_id
     tmp["admin_order_waiting_proof"] = False
     tmp["admin_order_proof_received"] = False
@@ -253,9 +249,12 @@ def _finalize_admin_manual_order(
     telegram_send_text(
         bot_token,
         chat_id,
-        "✅ *Pedido manual registrado como pagado.*\nYa cuenta para estadísticas y base de consumidores.",
+        "✅ *Pedido manual registrado como pagado.*\nAhora puedes fotografiar el comprobante.",
         parse_mode="Markdown",
-        reply_markup=admin_fixed_kb(),
+        reply_markup=kb([
+            [("📷 Fotografiar comprobante", f"admord|{tenant_id}|proof")],
+            [("🧭 Panel admin", "admin_panel")],
+        ]),
     )
     return {"ok": True}
 
@@ -536,7 +535,7 @@ def handle_admin_message_impl(
 
             step = str(tmp.get("admin_survey_step") or "").strip()
 
-            # Paso inicial: usar datos ya capturados del pedido
+            # modo correcto nuevo: usa teléfono/nombre del pedido ya creado
             if step == "start":
                 phone = str(tmp.get("admin_order_last_phone") or "").strip()
                 customer_name = str(tmp.get("admin_order_last_name") or "").strip()
@@ -546,7 +545,7 @@ def handle_admin_message_impl(
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        "⚠️ No encontré el número del cliente en el pedido.",
+                        "⚠️ No encontré el número del cliente del pedido.",
                         reply_markup=admin_fixed_kb(),
                     )
                     return {"ok": True}
@@ -566,9 +565,9 @@ def handle_admin_message_impl(
                 tmp["admin_survey_step"] = "q_0"
 
                 first_q = questions[0]
-                qtype = str(first_q.get("type") or "").strip().lower()
+                first_qtype = str(first_q.get("type") or "").strip().lower()
 
-                if qtype == "stars":
+                if first_qtype == "stars":
                     telegram_send_text(
                         bot_token,
                         chat_id,
@@ -584,7 +583,72 @@ def handle_admin_message_impl(
                     )
                 return {"ok": True}
 
-            # Respuestas de texto
+            # compatibilidad si todavía algún callback viejo usa phone/name
+            if step == "phone":
+                phone = text.strip()
+                if not phone:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "📱 Ingresa un número válido:",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                if has_answered_survey_today(orders_sh, tenant_tz, phone):
+                    _clear_admin_survey_runtime(tmp)
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ Este cliente ya respondió una encuesta hoy.",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                tmp["admin_survey_phone"] = phone
+                tmp["admin_survey_step"] = "name"
+
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    "👤 Nombre del cliente:",
+                    reply_markup=admin_fixed_kb(),
+                )
+                return {"ok": True}
+
+            if step == "name":
+                customer_name = text.strip()
+                if not customer_name:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "👤 Ingresa un nombre válido:",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                    return {"ok": True}
+
+                tmp["admin_survey_name"] = customer_name
+                tmp["admin_survey_step"] = "q_0"
+
+                first_q = questions[0]
+                first_qtype = str(first_q.get("type") or "").strip().lower()
+
+                if first_qtype == "stars":
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"❓ {first_q.get('question_text', '')}",
+                        reply_markup=_survey_runtime_stars_kb(tenant_id, 0),
+                    )
+                else:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        f"❓ {first_q.get('question_text', '')}",
+                        reply_markup=admin_fixed_kb(),
+                    )
+                return {"ok": True}
+
             if step.startswith("q_"):
                 try:
                     idx = int(step.split("_")[1])
