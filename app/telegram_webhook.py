@@ -8,7 +8,7 @@ from app.tenants import get_tenant_or_404, resolve_bot_by_secret
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
 from app.telegram_api import telegram_answer_callback, telegram_send_text
 from app.utils import normalize, log_event
-from app.webhook_helpers import safe_int
+from app.webhook_helpers import safe_int, admin_fixed_kb
 from app.client_flow import handle_client_callback, handle_client_message
 from app.admin_flow import handle_admin_callback, handle_admin_message
 from app.alerts import alert_webhook_error, alert_tenant_error, alert_sheet_error
@@ -26,6 +26,27 @@ def _get_orders_sheet_cached(gc, sheet_id):
     sh = open_spreadsheet_by_key(gc, sheet_id)
     _SHEET_CACHE[sheet_id] = sh
     return sh
+
+
+def _ensure_admin_fixed_keyboard(bot_token: str, chat_id: int) -> None:
+    """
+    Reinyecta el teclado reply fijo del admin/owner.
+    Telegram no ofrece una forma de 'setear solo keyboard' sin mensaje,
+    así que usamos un carácter invisible para minimizar ruido visual.
+    """
+    try:
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            "\u2060",
+            reply_markup=admin_fixed_kb(),
+        )
+    except Exception as e:
+        log_event(
+            "ensure_admin_fixed_keyboard_failed",
+            chat_id=chat_id,
+            error=str(e),
+        )
 
 
 @router.post("/telegram/webhook/{tenant_id}/{secret}")
@@ -110,7 +131,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 )
 
             if mode == "admin":
-                return handle_admin_callback(
+                result = handle_admin_callback(
                     tenant=tenant,
                     tenant_id=tenant_id,
                     bot_token=bot_token,
@@ -119,6 +140,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     orders_sh=orders_sh,
                     tenant_tz=tenant_tz,
                 )
+                _ensure_admin_fixed_keyboard(bot_token, chat_id)
+                return result
 
             return {"ok": True}
 
@@ -149,7 +172,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 )
 
             if mode == "admin":
-                return handle_admin_message(
+                result = handle_admin_message(
                     tenant=tenant,
                     tenant_id=tenant_id,
                     bot_token=bot_token,
@@ -158,6 +181,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     orders_sh=orders_sh,
                     tenant_tz=tenant_tz,
                 )
+                _ensure_admin_fixed_keyboard(bot_token, chat_id)
+                return result
 
             return {"ok": True}
 
