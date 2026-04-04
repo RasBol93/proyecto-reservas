@@ -54,15 +54,17 @@ from app.admin_manual_order import (
 from app.admin_nav import (
     admin_panel_kb,
 )
+from app.admin_survey_runtime import (
+    survey_runtime_stars_kb,
+    clear_admin_survey_runtime,
+    finalize_admin_survey_runtime,
+)
 from app.survey import (
     save_survey_password,
     save_survey_reward,
     add_survey_question,
     load_survey_questions,
     get_runtime_survey_questions,
-    get_survey_reward_text,
-    create_survey_coupon,
-    save_survey_answers,
     has_answered_survey_today,
 )
 from app.sheets import get_ws
@@ -74,90 +76,6 @@ SURVEY_CONFIG_WS = "Survey_Config"
 
 def _is_owner_bot(tenant: Dict[str, Any]) -> bool:
     return bool(tenant.get("_is_owner_bot"))
-
-
-def _survey_runtime_stars_kb(tenant_id: str, q_idx: int):
-    return kb([
-        [("1⭐", f"admord|{tenant_id}|sstar|{q_idx}|1")],
-        [("2⭐", f"admord|{tenant_id}|sstar|{q_idx}|2")],
-        [("3⭐", f"admord|{tenant_id}|sstar|{q_idx}|3")],
-        [("4⭐", f"admord|{tenant_id}|sstar|{q_idx}|4")],
-        [("5⭐", f"admord|{tenant_id}|sstar|{q_idx}|5")],
-        [("🧭 Panel admin", "admin_panel")],
-    ])
-
-
-def _clear_admin_survey_runtime(tmp: Dict[str, Any]) -> None:
-    tmp.pop("admin_survey_runtime", None)
-    tmp.pop("admin_survey_step", None)
-    tmp.pop("admin_survey_answers", None)
-    tmp.pop("admin_survey_phone", None)
-    tmp.pop("admin_survey_name", None)
-
-
-def _finalize_admin_survey_runtime(
-    tenant_id: str,
-    bot_token: str,
-    chat_id: int,
-    orders_sh,
-    tenant_tz: str,
-    tmp: Dict[str, Any],
-) -> Dict[str, Any]:
-    phone = str(tmp.get("admin_survey_phone") or "").strip()
-    customer_name = str(tmp.get("admin_survey_name") or "").strip()
-    answers = tmp.get("admin_survey_answers") or []
-
-    reward_text = get_survey_reward_text(orders_sh)
-    coupon_code = ""
-
-    if reward_text:
-        coupon_res = create_survey_coupon(
-            orders_sh=orders_sh,
-            tenant_id=tenant_id,
-            phone=phone,
-            reward_text=reward_text,
-        )
-        if coupon_res.get("ok"):
-            coupon_code = str(coupon_res.get("coupon_code") or "").strip()
-
-    save_res = save_survey_answers(
-        orders_sh=orders_sh,
-        tenant_id=tenant_id,
-        tenant_tz=tenant_tz,
-        customer_phone=phone,
-        customer_name=customer_name,
-        answers=answers,
-        coupon_code=coupon_code,
-    )
-
-    _clear_admin_survey_runtime(tmp)
-
-    if not save_res.get("ok"):
-        err = str(save_res.get("error") or "").strip()
-        if err == "already_answered_today":
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                "⚠️ Este cliente ya respondió una encuesta hoy.",
-                reply_markup=admin_fixed_kb(),
-            )
-            return {"ok": True}
-
-        telegram_send_text(
-            bot_token,
-            chat_id,
-            "⚠️ No pude guardar la encuesta.",
-            reply_markup=admin_fixed_kb(),
-        )
-        return {"ok": True}
-
-    telegram_send_text(
-        bot_token,
-        chat_id,
-        "✅ Gracias por responder nuestra encuesta.\nTe daremos tu tarjeta de descuento.",
-        reply_markup=admin_fixed_kb(),
-    )
-    return {"ok": True}
 
 
 def _finalize_admin_manual_order(
@@ -223,7 +141,6 @@ def _finalize_admin_manual_order(
 
     _admin_order_reset(tmp)
 
-    # Guardamos datos del último pedido para reutilizarlos después
     tmp["admin_order_last_id"] = order_id
     tmp["admin_order_waiting_proof"] = False
     tmp["admin_order_proof_received"] = False
@@ -406,9 +323,6 @@ def handle_admin_message_impl(
             )
             return {"ok": True}
 
-        # =========================
-        # QR de pagos
-        # =========================
         admin_payment_mode = str(tmp.get("admin_payment_mode") or "").strip()
 
         if admin_payment_mode == "awaiting_qr":
@@ -482,9 +396,6 @@ def handle_admin_message_impl(
             )
             return {"ok": True}
 
-        # =========================
-        # comprobante de pedido manual
-        # =========================
         if bool(tmp.get("admin_order_waiting_proof")):
             assert_admin_authorized(tenant, chat_id, tenant_id)
 
@@ -516,15 +427,12 @@ def handle_admin_message_impl(
             )
             return {"ok": True}
 
-        # =========================
-        # SURVEY RUNTIME (ADMIN)
-        # =========================
         if bool(tmp.get("admin_survey_runtime")):
             assert_admin_authorized(tenant, chat_id, tenant_id)
 
             questions = get_runtime_survey_questions(orders_sh)
             if not questions:
-                _clear_admin_survey_runtime(tmp)
+                clear_admin_survey_runtime(tmp)
                 telegram_send_text(
                     bot_token,
                     chat_id,
@@ -535,13 +443,12 @@ def handle_admin_message_impl(
 
             step = str(tmp.get("admin_survey_step") or "").strip()
 
-            # modo correcto nuevo: usa teléfono/nombre del pedido ya creado
             if step == "start":
                 phone = str(tmp.get("admin_order_last_phone") or "").strip()
                 customer_name = str(tmp.get("admin_order_last_name") or "").strip()
 
                 if not phone:
-                    _clear_admin_survey_runtime(tmp)
+                    clear_admin_survey_runtime(tmp)
                     telegram_send_text(
                         bot_token,
                         chat_id,
@@ -551,7 +458,7 @@ def handle_admin_message_impl(
                     return {"ok": True}
 
                 if has_answered_survey_today(orders_sh, tenant_tz, phone):
-                    _clear_admin_survey_runtime(tmp)
+                    clear_admin_survey_runtime(tmp)
                     telegram_send_text(
                         bot_token,
                         chat_id,
@@ -572,7 +479,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         f"❓ {first_q.get('question_text', '')}",
-                        reply_markup=_survey_runtime_stars_kb(tenant_id, 0),
+                        reply_markup=survey_runtime_stars_kb(tenant_id, 0),
                     )
                 else:
                     telegram_send_text(
@@ -583,7 +490,6 @@ def handle_admin_message_impl(
                     )
                 return {"ok": True}
 
-            # compatibilidad si todavía algún callback viejo usa phone/name
             if step == "phone":
                 phone = text.strip()
                 if not phone:
@@ -596,7 +502,7 @@ def handle_admin_message_impl(
                     return {"ok": True}
 
                 if has_answered_survey_today(orders_sh, tenant_tz, phone):
-                    _clear_admin_survey_runtime(tmp)
+                    clear_admin_survey_runtime(tmp)
                     telegram_send_text(
                         bot_token,
                         chat_id,
@@ -638,7 +544,7 @@ def handle_admin_message_impl(
                         bot_token,
                         chat_id,
                         f"❓ {first_q.get('question_text', '')}",
-                        reply_markup=_survey_runtime_stars_kb(tenant_id, 0),
+                        reply_markup=survey_runtime_stars_kb(tenant_id, 0),
                     )
                 else:
                     telegram_send_text(
@@ -656,7 +562,7 @@ def handle_admin_message_impl(
                     idx = -1
 
                 if idx < 0 or idx >= len(questions):
-                    _clear_admin_survey_runtime(tmp)
+                    clear_admin_survey_runtime(tmp)
                     telegram_send_text(
                         bot_token,
                         chat_id,
@@ -697,7 +603,7 @@ def handle_admin_message_impl(
                             bot_token,
                             chat_id,
                             f"❓ {next_q.get('question_text', '')}",
-                            reply_markup=_survey_runtime_stars_kb(tenant_id, next_idx),
+                            reply_markup=survey_runtime_stars_kb(tenant_id, next_idx),
                         )
                     else:
                         telegram_send_text(
@@ -708,7 +614,7 @@ def handle_admin_message_impl(
                         )
                     return {"ok": True}
 
-                return _finalize_admin_survey_runtime(
+                return finalize_admin_survey_runtime(
                     tenant_id=tenant_id,
                     bot_token=bot_token,
                     chat_id=chat_id,
