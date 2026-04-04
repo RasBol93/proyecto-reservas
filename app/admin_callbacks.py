@@ -18,6 +18,9 @@ from app.menu import (
 from app.orders import (
     get_order_by_id,
     update_order_status,
+    parse_items_field if False else None,
+)
+from app.orders import (
     append_order_row,
     gen_order_id,
     build_items_snapshot,
@@ -51,7 +54,6 @@ from app.admin_menu import (
 )
 from app.alerts import (
     alert_order_status_failed,
-    alert_order_failed,
     alert_system_error,
 )
 from app.admin_helpers import (
@@ -80,10 +82,12 @@ from app.admin_nav import (
     admin_panel_kb,
 )
 from app.admin_survey_runtime import (
-    survey_runtime_stars_kb,
     clear_admin_survey_runtime,
     send_admin_survey_runtime_question,
     finalize_admin_survey_runtime,
+)
+from app.admin_order_runtime import (
+    finalize_admin_manual_order_from_tmp,
 )
 from app.survey import (
     survey_is_enabled,
@@ -106,125 +110,6 @@ def _effective_admin_role(tenant: Dict[str, Any], chat_id: int) -> str:
     if bool(tenant.get("_is_owner_bot")):
         return "owner"
     return get_user_role(tenant, chat_id)
-
-
-def _finalize_admin_manual_order_from_tmp(
-    tenant_id: str,
-    bot_token: str,
-    chat_id: int,
-    orders_sh,
-    tmp: Dict[str, Any],
-    tenant: Dict[str, Any],
-) -> Dict[str, Any]:
-    requested_time = str(tmp.get("admin_order_requested_time") or "").strip() or "ahora"
-    cart = tmp.get("admin_order_cart") or []
-    customer_name = str(tmp.get("admin_order_name") or "").strip()
-    customer_contact = str(tmp.get("admin_order_contact") or "").strip()
-
-    if not cart or not customer_name or not customer_contact:
-        _admin_order_reset(tmp)
-        telegram_send_text(
-            bot_token,
-            chat_id,
-            "⚠️ Faltaban datos del pedido manual. Empecemos de nuevo.",
-        )
-        return {"ok": True}
-
-    menu_idx = load_menu_admin_index(orders_sh, force=False)
-    items_snapshot = build_items_snapshot(cart, menu_idx)
-    lines_txt, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
-
-    order_id = gen_order_id()
-
-    result = append_order_row(
-        orders_sh=orders_sh,
-        tenant_id=tenant_id,
-        order_id=order_id,
-        customer_name=customer_name,
-        customer_contact=customer_contact,
-        customer_telegram_chat_id="",
-        items=cart,
-        items_snapshot=items_snapshot,
-        currency="BOB",
-        pricing_version="v1",
-        notes="",
-        delivery_type="pickup",
-        requested_time=requested_time,
-        status="PAID",
-        source="admin_manual",
-        total_amount=total_amount,
-    )
-
-    if not result.get("ok"):
-        alert_order_failed(
-            tenant_id=tenant_id,
-            order_id=order_id,
-            error=result.get("error") or "append_order_row failed",
-        )
-        telegram_send_text(
-            bot_token,
-            chat_id,
-            "⚠️ Error guardando el pedido manual.",
-        )
-        return {"ok": True}
-
-    _admin_order_reset(tmp)
-
-    # Estado mínimo para flujo de comprobante + encuesta
-    tmp["admin_order_last_id"] = order_id
-    tmp["admin_order_waiting_proof"] = False
-    tmp["admin_order_proof_received"] = False
-    tmp["admin_order_last_phone"] = customer_contact
-    tmp["admin_order_last_name"] = customer_name
-
-    recap = build_order_recap_text(
-        order_id=order_id,
-        customer_name=customer_name,
-        customer_contact=customer_contact,
-        requested_time=requested_time,
-        detail_lines=lines_txt,
-        total_qty=total_qty,
-        total=total_amount,
-    )
-
-    telegram_send_text(
-        bot_token,
-        chat_id,
-        recap,
-        parse_mode="Markdown",
-    )
-    telegram_send_text(
-        bot_token,
-        chat_id,
-        "✅ *Pedido manual registrado como pagado.*\nAhora puedes fotografiar el comprobante.",
-        parse_mode="Markdown",
-        reply_markup=kb([
-            [("📷 Fotografiar comprobante", f"admord|{tenant_id}|proof")],
-            [("🧭 Panel admin", "admin_panel")],
-        ]),
-    )
-
-    try:
-        owner_enabled = str(tenant.get("owner_enabled") or "").strip().lower() == "true"
-        owner_chat = str(tenant.get("owner_chat_id") or "").strip()
-        owner_token = str(tenant.get("owner_bot_token") or "").strip()
-
-        if owner_enabled and owner_chat and owner_token:
-            telegram_send_text(
-                owner_token,
-                int(owner_chat),
-                recap,
-                parse_mode="Markdown",
-            )
-    except Exception as e:
-        log_event(
-            "notify_owner_manual_order_failed",
-            tenant_id=tenant_id,
-            order_id=order_id,
-            error=str(e),
-        )
-
-    return {"ok": True}
 
 
 def _survey_type_label(qtype: str) -> str:
@@ -514,10 +399,6 @@ def handle_admin_callback_impl(
             assert_admin_authorized(tenant, chat_id, tenant_id)
             sess = get_sess(tenant_id, chat_id)
             return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
-
-        # =========================
-        # PAGOS / QR
-        # =========================
 
         if data == "admin_payments":
             assert_admin_authorized(tenant, chat_id, tenant_id)
@@ -1161,7 +1042,7 @@ def handle_admin_callback_impl(
 
             if action == "timenow":
                 tmp["admin_order_requested_time"] = "ahora"
-                return _finalize_admin_manual_order_from_tmp(
+                return finalize_admin_manual_order_from_tmp(
                     tenant_id=tenant_id,
                     bot_token=bot_token,
                     chat_id=chat_id,
