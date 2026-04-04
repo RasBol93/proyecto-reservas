@@ -13,11 +13,6 @@ from app.menu import (
     create_menu_product,
     get_menu_categories,
 )
-from app.orders import (
-    append_order_row,
-    gen_order_id,
-    build_items_snapshot,
-)
 from app.telegram_api import telegram_send_text, telegram_get_file_path, telegram_download_file_bytes
 from app.telegram_keyboard import kb
 from app.utils import normalize, log_event
@@ -30,8 +25,6 @@ from app.webhook_helpers import (
     admin_periods_inline_kb,
     fmt_price_short,
     extract_first_number,
-    fmt_snapshot_lines,
-    build_order_recap_text,
     admin_fixed_kb,
 )
 from app.admin_hours import send_admin_hours_menu
@@ -40,7 +33,6 @@ from app.admin_menu import (
     send_admin_menu_product_detail,
 )
 from app.alerts import (
-    alert_order_failed,
     alert_menu_error,
     alert_photo_upload_failed,
     alert_system_error,
@@ -59,10 +51,12 @@ from app.admin_survey_runtime import (
     clear_admin_survey_runtime,
     finalize_admin_survey_runtime,
 )
+from app.admin_order_runtime import (
+    finalize_admin_manual_order,
+)
 from app.survey import (
     save_survey_password,
     save_survey_reward,
-    add_survey_question,
     load_survey_questions,
     get_runtime_survey_questions,
     has_answered_survey_today,
@@ -76,104 +70,6 @@ SURVEY_CONFIG_WS = "Survey_Config"
 
 def _is_owner_bot(tenant: Dict[str, Any]) -> bool:
     return bool(tenant.get("_is_owner_bot"))
-
-
-def _finalize_admin_manual_order(
-    tenant_id: str,
-    bot_token: str,
-    chat_id: int,
-    orders_sh,
-    tmp: Dict[str, Any],
-) -> Dict[str, Any]:
-    requested_time = str(tmp.get("admin_order_requested_time") or "").strip() or "ahora"
-    cart = tmp.get("admin_order_cart") or []
-    customer_name = str(tmp.get("admin_order_name") or "").strip()
-    customer_contact = str(tmp.get("admin_order_contact") or "").strip()
-
-    if not cart or not customer_name or not customer_contact:
-        _admin_order_reset(tmp)
-        telegram_send_text(
-            bot_token,
-            chat_id,
-            "⚠️ Faltaban datos del pedido manual. Empecemos de nuevo.",
-            reply_markup=admin_fixed_kb(),
-        )
-        return {"ok": True}
-
-    menu_idx = load_menu_admin_index(orders_sh, force=False)
-    items_snapshot = build_items_snapshot(cart, menu_idx)
-    lines_txt, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
-
-    order_id = gen_order_id()
-
-    result = append_order_row(
-        orders_sh=orders_sh,
-        tenant_id=tenant_id,
-        order_id=order_id,
-        customer_name=customer_name,
-        customer_contact=customer_contact,
-        customer_telegram_chat_id="",
-        items=cart,
-        items_snapshot=items_snapshot,
-        currency="BOB",
-        pricing_version="v1",
-        notes="",
-        delivery_type="pickup",
-        requested_time=requested_time,
-        status="PAID",
-        source="admin_manual",
-        total_amount=total_amount,
-    )
-
-    if not result.get("ok"):
-        alert_order_failed(
-            tenant_id=tenant_id,
-            order_id=order_id,
-            error=result.get("error") or "append_order_row failed",
-        )
-        telegram_send_text(
-            bot_token,
-            chat_id,
-            "⚠️ Error guardando el pedido manual.",
-            reply_markup=admin_fixed_kb(),
-        )
-        return {"ok": True}
-
-    _admin_order_reset(tmp)
-
-    tmp["admin_order_last_id"] = order_id
-    tmp["admin_order_waiting_proof"] = False
-    tmp["admin_order_proof_received"] = False
-    tmp["admin_order_last_phone"] = customer_contact
-    tmp["admin_order_last_name"] = customer_name
-
-    recap = build_order_recap_text(
-        order_id=order_id,
-        customer_name=customer_name,
-        customer_contact=customer_contact,
-        requested_time=requested_time,
-        detail_lines=lines_txt,
-        total_qty=total_qty,
-        total=total_amount,
-    )
-
-    telegram_send_text(
-        bot_token,
-        chat_id,
-        recap,
-        parse_mode="Markdown",
-    )
-    telegram_send_text(
-        bot_token,
-        chat_id,
-        "✅ *Pedido manual registrado como pagado.*\nAhora puedes fotografiar el comprobante.",
-        parse_mode="Markdown",
-        reply_markup=kb([
-            [("📷 Fotografiar comprobante", f"admord|{tenant_id}|proof")],
-            [("🧭 Panel admin", "admin_panel")],
-        ]),
-    )
-    return {"ok": True}
 
 
 def _survey_type_label(qtype: str) -> str:
@@ -694,7 +590,7 @@ def handle_admin_message_impl(
 
                 tmp["admin_order_requested_time"] = requested_time
                 tmp["admin_order_step"] = "finalize_manual_order"
-                return _finalize_admin_manual_order(
+                return finalize_admin_manual_order(
                     tenant_id=tenant_id,
                     bot_token=bot_token,
                     chat_id=chat_id,
@@ -703,7 +599,7 @@ def handle_admin_message_impl(
                 )
 
             if admin_order_step == "finalize_manual_order":
-                return _finalize_admin_manual_order(
+                return finalize_admin_manual_order(
                     tenant_id=tenant_id,
                     bot_token=bot_token,
                     chat_id=chat_id,
