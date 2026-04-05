@@ -2,6 +2,7 @@
 # hardened incremental: misma estructura, mismos contratos, más robustez
 
 import json
+import time
 from typing import Any, Dict, List, Tuple
 
 import gspread
@@ -18,6 +19,84 @@ from app.alerts import alert_system_error, alert_sheet_error
 _GSPREAD_CLIENT_CACHE: gspread.Client | None = None
 _SPREADSHEET_CACHE: Dict[str, gspread.Spreadsheet] = {}
 _WORKSHEET_CACHE: Dict[Tuple[str, str], gspread.Worksheet] = {}
+
+
+# ----------------------------------------
+# Retry policy simple
+# ----------------------------------------
+
+_SHEETS_RETRY_ATTEMPTS = 3
+_SHEETS_RETRY_SLEEP_SECONDS = 0.35
+
+
+def _sleep_before_retry(attempt_index: int) -> None:
+    try:
+        # backoff simple y corto: 0.35, 0.70, 1.05...
+        time.sleep(_SHEETS_RETRY_SLEEP_SECONDS * max(1, attempt_index))
+    except Exception:
+        pass
+
+
+def _should_retry_exception(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+
+    retry_signals = (
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "remote end closed connection",
+        "service unavailable",
+        "internal error",
+        "bad gateway",
+        "gateway timeout",
+        "rate limit",
+        "quota",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+    )
+
+    return any(signal in msg for signal in retry_signals)
+
+
+def _call_with_retry(fn, *, op_name: str, log_fields: Dict[str, Any] | None = None):
+    last_exc: Exception | None = None
+    extra = dict(log_fields or {})
+
+    for attempt in range(1, _SHEETS_RETRY_ATTEMPTS + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+
+            try:
+                log_event(
+                    "sheets_retryable_error",
+                    op_name=op_name,
+                    attempt=attempt,
+                    max_attempts=_SHEETS_RETRY_ATTEMPTS,
+                    retry=bool(attempt < _SHEETS_RETRY_ATTEMPTS and _should_retry_exception(e)),
+                    error_type=type(e).__name__,
+                    error=str(e),
+                    **extra,
+                )
+            except Exception:
+                pass
+
+            if attempt >= _SHEETS_RETRY_ATTEMPTS or not _should_retry_exception(e):
+                break
+
+            _sleep_before_retry(attempt)
+
+    if last_exc is not None:
+        raise last_exc
+
+    raise RuntimeError(f"{op_name} failed without exception")
 
 
 # ----------------------------------------
@@ -48,7 +127,14 @@ def get_gspread_client() -> gspread.Client:
             "https://www.googleapis.com/auth/drive",
         ]
 
-        client = gspread.service_account_from_dict(info, scopes=scopes)
+        def _create_client():
+            return gspread.service_account_from_dict(info, scopes=scopes)
+
+        client = _call_with_retry(
+            _create_client,
+            op_name="gspread.service_account_from_dict",
+        )
+
         _GSPREAD_CLIENT_CACHE = client
         return _GSPREAD_CLIENT_CACHE
 
@@ -82,7 +168,15 @@ def open_spreadsheet_by_key(gc: gspread.Client, spreadsheet_id: str) -> gspread.
         if cached is not None:
             return cached
 
-        sh = gc.open_by_key(sid)
+        def _open():
+            return gc.open_by_key(sid)
+
+        sh = _call_with_retry(
+            _open,
+            op_name="gc.open_by_key",
+            log_fields={"spreadsheet_id": sid},
+        )
+
         if sh is None:
             raise RuntimeError(f"Spreadsheet not found: {sid}")
 
@@ -118,7 +212,15 @@ def open_config_spreadsheet(gc: gspread.Client) -> gspread.Spreadsheet:
         if cached is not None:
             return cached
 
-        sh = gc.open_by_key(config_id)
+        def _open():
+            return gc.open_by_key(config_id)
+
+        sh = _call_with_retry(
+            _open,
+            op_name="gc.open_by_key_config",
+            log_fields={"spreadsheet_id": config_id},
+        )
+
         if sh is None:
             raise RuntimeError("Config spreadsheet not found")
 
@@ -168,7 +270,15 @@ def get_ws(spreadsheet: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
         if cached is not None:
             return cached
 
-        ws = spreadsheet.worksheet(t)
+        def _get():
+            return spreadsheet.worksheet(t)
+
+        ws = _call_with_retry(
+            _get,
+            op_name="spreadsheet.worksheet",
+            log_fields={"worksheet_title": t, "spreadsheet_key": s_key},
+        )
+
         if ws is None:
             raise RuntimeError(f"Worksheet not found: {t}")
 
@@ -212,6 +322,15 @@ def invalidate_sheet_caches(spreadsheet_id: str | None = None) -> None:
     keys_to_delete = [k for k in _WORKSHEET_CACHE.keys() if k[0] == sid]
     for k in keys_to_delete:
         _WORKSHEET_CACHE.pop(k, None)
+
+
+def invalidate_all_sheet_caches() -> None:
+    """
+    Alias explícito para invalidación global.
+    No rompe contratos existentes y hace el código más legible
+    cuando queramos invalidar TODO el layer de sheets.
+    """
+    invalidate_sheet_caches(None)
 
 
 # ----------------------------------------
@@ -265,7 +384,15 @@ def read_records_manual(ws: gspread.Worksheet, required_headers: List[str]) -> L
     Devuelve lista de dicts con keys normalizadas (lower, sin tildes, etc.).
     """
     try:
-        values = ws.get_all_values()
+        def _get_values():
+            return ws.get_all_values()
+
+        values = _call_with_retry(
+            _get_values,
+            op_name="worksheet.get_all_values",
+            log_fields={"worksheet_title": getattr(ws, "title", "")},
+        )
+
         if not values:
             return []
 
