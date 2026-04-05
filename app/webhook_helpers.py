@@ -27,6 +27,16 @@ _SESSION_TTL_SECONDS = 6 * 60 * 60  # 6 horas
 _SESSION_CLEANUP_EVERY = 200
 _SESSION_OPS = 0
 
+# rate limit simple en memoria para hardening futuro
+_RATE_LIMIT_STATE: Dict[Tuple[str, int, str], List[float]] = {}
+_RATE_LIMIT_TTL_SECONDS = 15 * 60
+_RATE_LIMIT_CLEANUP_EVERY = 200
+_RATE_LIMIT_OPS = 0
+
+
+# -------------------------
+# Session internals
+# -------------------------
 
 def _safe_session_key(tenant_id: str, chat_id: int) -> Tuple[str, int]:
     try:
@@ -55,22 +65,38 @@ def _cleanup_sessions_if_needed() -> None:
         _SESSION_LAST_TOUCH.pop(k, None)
 
 
-def get_sess(tenant_id: str, chat_id: int) -> Dict[str, Any]:
-    key = _safe_session_key(tenant_id, chat_id)
-    if key not in SESSIONS or not isinstance(SESSIONS.get(key), dict):
-        SESSIONS[key] = {"cart": [], "stage": "idle", "tmp": {}}
-
-    sess = SESSIONS[key]
+def _ensure_session_shape(sess: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(sess, dict):
+        sess = {}
 
     if not isinstance(sess.get("cart"), list):
         sess["cart"] = []
-    if not isinstance(sess.get("stage"), str):
+
+    if not isinstance(sess.get("stage"), str) or not str(sess.get("stage") or "").strip():
         sess["stage"] = "idle"
+
     if not isinstance(sess.get("tmp"), dict):
         sess["tmp"] = {}
 
+    return sess
+
+
+# -------------------------
+# Public session helpers
+# -------------------------
+
+def get_sess(tenant_id: str, chat_id: int) -> Dict[str, Any]:
+    key = _safe_session_key(tenant_id, chat_id)
+
+    if key not in SESSIONS:
+        SESSIONS[key] = {"cart": [], "stage": "idle", "tmp": {}}
+
+    sess = _ensure_session_shape(SESSIONS.get(key) or {})
+    SESSIONS[key] = sess
+
     _touch_session_key(key)
     _cleanup_sessions_if_needed()
+    _cleanup_rate_limit_if_needed()
     return sess
 
 
@@ -79,7 +105,96 @@ def clear_sess(tenant_id: str, chat_id: int) -> None:
     SESSIONS[key] = {"cart": [], "stage": "idle", "tmp": {}}
     _touch_session_key(key)
     _cleanup_sessions_if_needed()
+    _cleanup_rate_limit_if_needed()
 
+
+def delete_sess(tenant_id: str, chat_id: int) -> None:
+    key = _safe_session_key(tenant_id, chat_id)
+    SESSIONS.pop(key, None)
+    _SESSION_LAST_TOUCH.pop(key, None)
+
+
+def session_cache_info() -> Dict[str, Any]:
+    return {
+        "sessions_count": len(SESSIONS),
+        "ttl_seconds": _SESSION_TTL_SECONDS,
+        "cleanup_every_ops": _SESSION_CLEANUP_EVERY,
+        "last_touch_count": len(_SESSION_LAST_TOUCH),
+    }
+
+
+# -------------------------
+# Rate limiting helpers
+# -------------------------
+
+def _safe_rate_limit_key(tenant_id: str, chat_id: int, bucket: str) -> Tuple[str, int, str]:
+    try:
+        return (str(tenant_id or ""), int(chat_id), str(bucket or "").strip())
+    except Exception:
+        return (str(tenant_id or ""), 0, str(bucket or "").strip())
+
+
+def _cleanup_rate_limit_if_needed() -> None:
+    global _RATE_LIMIT_OPS
+    _RATE_LIMIT_OPS += 1
+
+    if _RATE_LIMIT_OPS % _RATE_LIMIT_CLEANUP_EVERY != 0:
+        return
+
+    now = time.time()
+    stale_before = now - _RATE_LIMIT_TTL_SECONDS
+
+    stale_keys = []
+    for k, values in _RATE_LIMIT_STATE.items():
+        if not values:
+            stale_keys.append(k)
+            continue
+        if max(values) < stale_before:
+            stale_keys.append(k)
+
+    for k in stale_keys:
+        _RATE_LIMIT_STATE.pop(k, None)
+
+
+def rate_limit_allow(
+    tenant_id: str,
+    chat_id: int,
+    bucket: str,
+    limit: int,
+    window_seconds: int,
+) -> bool:
+    key = _safe_rate_limit_key(tenant_id, chat_id, bucket)
+    now = time.time()
+    window_start = now - max(1, int(window_seconds))
+
+    values = _RATE_LIMIT_STATE.get(key) or []
+    values = [ts for ts in values if ts >= window_start]
+
+    allowed = len(values) < max(1, int(limit))
+    if allowed:
+        values.append(now)
+
+    _RATE_LIMIT_STATE[key] = values
+    _cleanup_rate_limit_if_needed()
+    return allowed
+
+
+def rate_limit_reset(tenant_id: str, chat_id: int, bucket: str) -> None:
+    key = _safe_rate_limit_key(tenant_id, chat_id, bucket)
+    _RATE_LIMIT_STATE.pop(key, None)
+
+
+def rate_limit_cache_info() -> Dict[str, Any]:
+    return {
+        "entries_count": len(_RATE_LIMIT_STATE),
+        "ttl_seconds": _RATE_LIMIT_TTL_SECONDS,
+        "cleanup_every_ops": _RATE_LIMIT_CLEANUP_EVERY,
+    }
+
+
+# -------------------------
+# Bot / chat helpers
+# -------------------------
 
 def get_admin_bot_token(tenant: Dict[str, Any]) -> str:
     return (tenant.get("admin_bot_token") or tenant.get("bot_token_admin") or "").strip()
@@ -100,7 +215,7 @@ def get_admin_chat_id(tenant: Dict[str, Any]) -> Optional[int]:
 
 
 # =========================
-# 🔴 NUEVO — OWNER SUPPORT
+# OWNER SUPPORT
 # =========================
 
 def get_owner_bot_token(tenant: Dict[str, Any]) -> str:
@@ -136,7 +251,7 @@ def get_user_role(tenant: Dict[str, Any], chat_id: int) -> str:
 
 
 # =========================
-# 🔴 MODIFICADO — AUTH
+# AUTH
 # =========================
 
 def assert_admin_authorized(tenant: Dict[str, Any], chat_id: int, tenant_id: str) -> None:
@@ -162,6 +277,10 @@ def assert_admin_authorized(tenant: Dict[str, Any], chat_id: int, tenant_id: str
 def get_admin_username(tenant: Dict[str, Any]) -> str:
     return (tenant.get("admin_username") or "").strip().lstrip("@")
 
+
+# -------------------------
+# Payment QR helpers
+# -------------------------
 
 def get_payment_qr_file_id(tenant: Dict[str, Any]) -> str:
     return (tenant.get("payment_qr_file_id") or "").strip()
@@ -194,15 +313,21 @@ def get_payment_qr_url(tenant: Dict[str, Any]) -> str:
     return _normalize_public_qr_url(raw)
 
 
+# -------------------------
+# Order / cart formatting
+# -------------------------
+
 def parse_items_field(items_field: Any) -> List[Dict[str, Any]]:
     if isinstance(items_field, list):
         return items_field
+
     if isinstance(items_field, str) and items_field.strip():
         try:
             v = json.loads(items_field)
             return v if isinstance(v, list) else []
         except Exception:
             return []
+
     return []
 
 
@@ -313,6 +438,30 @@ def extract_first_number(text: str) -> Optional[float]:
         return None
 
 
+# -------------------------
+# Business status helpers
+# -------------------------
+
+def _default_business_status(tenant_tz: str) -> Dict[str, Any]:
+    return {
+        "tenant_tz": tenant_tz,
+        "now_local_iso": "",
+        "today_weekday_code": "",
+        "is_open_today": True,
+        "accepts_orders_now": True,
+        "open_time": "",
+        "close_time": "",
+        "last_order_time": "",
+        "weekly_open_days": [],
+        "today_closed": False,
+        "today_open_force": False,
+        "has_open_override": False,
+        "has_close_override": False,
+        "has_last_order_override": False,
+        "public_message": "",
+    }
+
+
 def get_business_status_safe(orders_sh, tenant_tz: str) -> Dict[str, Any]:
     try:
         res = resolve_business_status(orders_sh=orders_sh, tenant_tz=tenant_tz)
@@ -320,42 +469,10 @@ def get_business_status_safe(orders_sh, tenant_tz: str) -> Dict[str, Any]:
             return res.__dict__
         if isinstance(res, dict):
             return res
-        return {
-            "tenant_tz": tenant_tz,
-            "now_local_iso": "",
-            "today_weekday_code": "",
-            "is_open_today": True,
-            "accepts_orders_now": True,
-            "open_time": "",
-            "close_time": "",
-            "last_order_time": "",
-            "weekly_open_days": [],
-            "today_closed": False,
-            "today_open_force": False,
-            "has_open_override": False,
-            "has_close_override": False,
-            "has_last_order_override": False,
-            "public_message": "",
-        }
+        return _default_business_status(tenant_tz)
     except Exception as e:
         log_event("business_status_resolve_failed", error=str(e), tenant_tz=tenant_tz)
-        return {
-            "tenant_tz": tenant_tz,
-            "now_local_iso": "",
-            "today_weekday_code": "",
-            "is_open_today": True,
-            "accepts_orders_now": True,
-            "open_time": "",
-            "close_time": "",
-            "last_order_time": "",
-            "weekly_open_days": [],
-            "today_closed": False,
-            "today_open_force": False,
-            "has_open_override": False,
-            "has_close_override": False,
-            "has_last_order_override": False,
-            "public_message": "",
-        }
+        return _default_business_status(tenant_tz)
 
 
 def business_block_message(bs: Dict[str, Any]) -> str:
@@ -378,6 +495,10 @@ def send_business_blocked_text(bs: Dict[str, Any]) -> str:
     msg = business_block_message(bs)
     return f"⛔ {msg}"
 
+
+# -------------------------
+# Misc helpers
+# -------------------------
 
 def safe_int(v: Any) -> Optional[int]:
     try:
@@ -435,7 +556,10 @@ def set_menu_photo_url(orders_sh, sku: str, photo_url: str) -> bool:
     photo_col = _find_col(header_norm, "photo_url")
     if photo_col is None:
         photo_col = len(header) + 1
-        ws.update_cell(header_row_1based, photo_col, "photo_url")
+        try:
+            ws.update_cell(header_row_1based, photo_col, "photo_url")
+        except Exception:
+            return False
         header.append("photo_url")
         header_norm.append("photo_url")
 
@@ -444,12 +568,19 @@ def set_menu_photo_url(orders_sh, sku: str, photo_url: str) -> bool:
         row = values[i - 1]
         sku_val = row[sku_col - 1] if len(row) >= sku_col else ""
         if str(sku_val).strip() == sku:
-            ws.update_cell(i, photo_col, str(photo_url or "").strip())
+            try:
+                ws.update_cell(i, photo_col, str(photo_url or "").strip())
+            except Exception:
+                return False
             found = True
             break
 
     return found
 
+
+# -------------------------
+# Keyboard builders
+# -------------------------
 
 def client_home_kb() -> Dict[str, Any]:
     return kb([
