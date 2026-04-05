@@ -1,4 +1,5 @@
 # app/orders.py — versión optimizada simple y escalable para ORDERS
+# hardened incremental: misma estructura, mismos contratos, más robustez
 
 import json
 from datetime import datetime, timezone
@@ -135,6 +136,20 @@ def _row_to_dict(header: List[str], row: List[Any]) -> Dict[str, Any]:
     return d
 
 
+def _safe_row_values(ws, row_index: int) -> List[Any]:
+    try:
+        return ws.row_values(row_index)
+    except Exception:
+        return []
+
+
+def _safe_col_values(ws, col_index_1based: int) -> List[Any]:
+    try:
+        return ws.col_values(col_index_1based)
+    except Exception:
+        return []
+
+
 # ----------------------------------------
 # ID generator
 # ----------------------------------------
@@ -226,22 +241,26 @@ def append_order_row(
         if not header:
             raise RuntimeError("ORDERS header row missing")
 
+        clean_order_id = str(order_id or "").strip()
+        if not clean_order_id:
+            raise RuntimeError("order_id missing")
+
         data = {
-            "order_id": order_id,
+            "order_id": clean_order_id,
             "created_at": _now_iso_utc(),
-            "tenant_id": tenant_id,
-            "customer_name": customer_name,
-            "customer_contact": customer_contact,
-            "customer_telegram_chat_id": customer_telegram_chat_id,
-            "items": items,
+            "tenant_id": str(tenant_id or "").strip(),
+            "customer_name": str(customer_name or "").strip(),
+            "customer_contact": str(customer_contact or "").strip(),
+            "customer_telegram_chat_id": str(customer_telegram_chat_id or "").strip(),
+            "items": items or [],
             "items_snapshot": items_snapshot or "",
-            "currency": currency,
-            "pricing_version": pricing_version,
-            "notes": notes,
-            "delivery_type": delivery_type,
-            "requested_time": requested_time,
-            "status": status,
-            "source": source,
+            "currency": str(currency or "BOB").strip() or "BOB",
+            "pricing_version": str(pricing_version or "v1").strip() or "v1",
+            "notes": str(notes or "").strip(),
+            "delivery_type": str(delivery_type or "").strip(),
+            "requested_time": str(requested_time or "").strip(),
+            "status": str(status or "").strip(),
+            "source": str(source or "").strip(),
             "total_amount": total_amount,
             "payment_proof_file_id": "",
             "payment_confirmed_at": "",
@@ -255,7 +274,7 @@ def append_order_row(
         log_event(
             "order_appended",
             tenant_id=tenant_id,
-            order_id=order_id,
+            order_id=clean_order_id,
             status=status,
             source=source,
             total_amount=total_amount,
@@ -263,7 +282,7 @@ def append_order_row(
             customer_telegram_chat_id=customer_telegram_chat_id,
         )
 
-        return {"ok": True, "order_id": order_id}
+        return {"ok": True, "order_id": clean_order_id}
 
     except Exception as e:
         log_event(
@@ -307,8 +326,10 @@ def _find_row_index_by_order_id(ws, order_id: str) -> Optional[int]:
     if oid_col is None:
         return None
 
-    col_values = ws.col_values(oid_col + 1)
+    col_values = _safe_col_values(ws, oid_col + 1)
     target = (order_id or "").strip()
+    if not target:
+        return None
 
     # fila 1 = header
     for i in range(1, len(col_values)):
@@ -328,7 +349,9 @@ def get_order_by_id(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
     if ridx is None:
         return None
 
-    row = ws.row_values(ridx)
+    row = _safe_row_values(ws, ridx)
+    if not row:
+        return None
     return _row_to_dict(header, row)
 
 
@@ -352,12 +375,14 @@ def find_latest_pending_order_for_contact(
     if i_contact is None or i_status is None or i_order_id is None:
         return None
 
-    contact_vals = ws.col_values(i_contact + 1)
-    status_vals = ws.col_values(i_status + 1)
-    order_vals = ws.col_values(i_order_id + 1)
+    contact_vals = _safe_col_values(ws, i_contact + 1)
+    status_vals = _safe_col_values(ws, i_status + 1)
+    order_vals = _safe_col_values(ws, i_order_id + 1)
 
     contact = (customer_contact or "").strip()
     wanted_status = (status or "").strip()
+    if not contact or not wanted_status:
+        return None
 
     max_len = max(len(contact_vals), len(status_vals), len(order_vals))
 
@@ -388,6 +413,9 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
     try:
         ws = _get_orders_ws(orders_sh)
         header = _get_header(ws)
+        if not header:
+            raise RuntimeError("ORDERS header row missing")
+
         ridx = _find_row_index_by_order_id(ws, order_id)
 
         if ridx is None:
@@ -399,15 +427,19 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
 
         tenant_col = _find_col_idx(header, "tenant_id")
         if tenant_col is not None:
-            row = ws.row_values(ridx)
+            row = _safe_row_values(ws, ridx)
             if tenant_col < len(row):
                 tenant_id_for_alert = str(row[tenant_col] or "").strip()
 
+        clean_status = str(new_status or "").strip()
+        if not clean_status:
+            raise RuntimeError("new_status missing")
+
         updates = [
-            {"row": ridx, "col": status_col + 1, "value": str(new_status).strip()},
+            {"row": ridx, "col": status_col + 1, "value": clean_status},
         ]
 
-        if str(new_status).strip() == "PAID":
+        if clean_status == "PAID":
             paid_col = _find_col_idx(header, "payment_confirmed_at")
             if paid_col is not None:
                 updates.append({
@@ -422,7 +454,7 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
             "order_status_updated",
             tenant_id=tenant_id_for_alert,
             order_id=order_id,
-            status=new_status,
+            status=clean_status,
         )
 
         return {"ok": True, "found": True}
@@ -461,6 +493,9 @@ def update_order_payment_proof(
     try:
         ws = _get_orders_ws(orders_sh)
         header = _get_header(ws)
+        if not header:
+            raise RuntimeError("ORDERS header row missing")
+
         ridx = _find_row_index_by_order_id(ws, order_id)
 
         if ridx is None:
@@ -468,7 +503,7 @@ def update_order_payment_proof(
 
         tenant_col = _find_col_idx(header, "tenant_id")
         if tenant_col is not None:
-            row = ws.row_values(ridx)
+            row = _safe_row_values(ws, ridx)
             if tenant_col < len(row):
                 tenant_id_for_alert = str(row[tenant_col] or "").strip()
 
@@ -479,16 +514,25 @@ def update_order_payment_proof(
         if fcol is None or tcol is None:
             raise RuntimeError("Missing payment proof columns")
 
+        clean_file_id = str(proof_file_id or "").strip()
+        clean_proof_type = str(proof_type or "").strip()
+        clean_caption = str(proof_caption or "").strip()
+
+        if not clean_file_id:
+            raise RuntimeError("proof_file_id missing")
+        if not clean_proof_type:
+            raise RuntimeError("proof_type missing")
+
         updates = [
-            {"row": ridx, "col": fcol + 1, "value": str(proof_file_id or "").strip()},
-            {"row": ridx, "col": tcol + 1, "value": str(proof_type or "").strip()},
+            {"row": ridx, "col": fcol + 1, "value": clean_file_id},
+            {"row": ridx, "col": tcol + 1, "value": clean_proof_type},
         ]
 
         if ccol is not None:
             updates.append({
                 "row": ridx,
                 "col": ccol + 1,
-                "value": str(proof_caption or "").strip(),
+                "value": clean_caption,
             })
 
         _batch_write_cells(ws, updates)
@@ -497,7 +541,7 @@ def update_order_payment_proof(
             "order_proof_updated",
             tenant_id=tenant_id_for_alert,
             order_id=order_id,
-            proof_type=proof_type,
+            proof_type=clean_proof_type,
         )
 
         return {"ok": True, "found": True}
