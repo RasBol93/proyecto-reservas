@@ -56,6 +56,170 @@ from app.survey import (
 )
 
 
+def _safe_send_text(
+    bot_token: str,
+    chat_id: int,
+    text: str,
+    parse_mode: Optional[str] = None,
+    reply_markup: Optional[Dict[str, Any]] = None,
+) -> bool:
+    try:
+        return telegram_send_text(
+            bot_token,
+            chat_id,
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    except Exception:
+        return False
+
+
+def _build_paid_recap_from_order(order_id: str, order_after: Dict[str, Any]) -> Dict[str, Any]:
+    customer_name = _safe_str(order_after.get("customer_name"))
+    customer_contact = _safe_str(order_after.get("customer_contact"))
+    requested_time = _safe_str(order_after.get("requested_time"))
+
+    items_snapshot = parse_items_field(order_after.get("items_snapshot"))
+    detail_lines, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
+
+    recap = build_order_recap_text(
+        order_id=order_id,
+        customer_name=customer_name,
+        customer_contact=customer_contact,
+        requested_time=requested_time,
+        detail_lines=detail_lines,
+        total_qty=total_qty,
+        total=total_amount,
+    )
+
+    return {
+        "customer_name": customer_name,
+        "customer_contact": customer_contact,
+        "requested_time": requested_time,
+        "detail_lines": detail_lines,
+        "total_amount": total_amount,
+        "total_qty": total_qty,
+        "recap": recap,
+    }
+
+
+def _notify_client_order_paid(
+    tenant: Dict[str, Any],
+    tenant_id: str,
+    order_id: str,
+    order_after: Dict[str, Any],
+) -> None:
+    client_token = get_client_bot_token(tenant)
+    client_chat = _safe_client_chat_id_from_order(order_after)
+
+    if not client_token or not client_chat:
+        log_event(
+            "notify_client_paid_skipped",
+            tenant_id=tenant_id,
+            order_id=order_id,
+            reason="missing_client_token_or_chat_id",
+        )
+        return
+
+    try:
+        final_slot_for_msg = _safe_str(_extract_slot_hhmm(order_after.get("requested_time")))
+        if final_slot_for_msg:
+            msg_client = (
+                f"✅ Tu pedido ha sido confirmado.\n"
+                f"Código de pedido: {order_id}\n\n"
+                f"Hora de recojo: *{final_slot_for_msg}*."
+            )
+        else:
+            msg_client = (
+                f"✅ Tu pedido ha sido confirmado.\n"
+                f"Código de pedido: {order_id}\n\n"
+                "¡Gracias!"
+            )
+
+        _safe_send_text(
+            client_token,
+            int(client_chat),
+            msg_client,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        log_event(
+            "notify_client_paid_failed",
+            tenant_id=tenant_id,
+            order_id=order_id,
+            client_chat=client_chat,
+            error=str(e),
+        )
+
+
+def _notify_owner_order_paid(
+    tenant: Dict[str, Any],
+    tenant_id: str,
+    order_id: str,
+    order_after: Dict[str, Any],
+) -> None:
+    try:
+        owner_enabled = str(tenant.get("owner_enabled") or "").strip().lower() == "true"
+        owner_chat = str(tenant.get("owner_chat_id") or "").strip()
+        owner_token = str(tenant.get("owner_bot_token") or "").strip()
+
+        if not (owner_enabled and owner_chat and owner_token):
+            return
+
+        recap_data = _build_paid_recap_from_order(order_id, order_after)
+        owner_msg = (
+            "✅ *Pedido confirmado por el administrador.*\n\n"
+            f"{recap_data['recap']}"
+        )
+
+        _safe_send_text(
+            owner_token,
+            int(owner_chat),
+            owner_msg,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        log_event(
+            "notify_owner_paid_validated_failed",
+            tenant_id=tenant_id,
+            order_id=order_id,
+            error=str(e),
+        )
+
+
+def _send_admin_paid_confirmation(
+    bot_token: str,
+    chat_id: int,
+    order_id: str,
+    order_after: Optional[Dict[str, Any]],
+    already_paid: bool = False,
+) -> None:
+    if order_after:
+        recap_data = _build_paid_recap_from_order(order_id, order_after)
+        prefix = "✅ *Este pedido ya estaba confirmado.*" if already_paid else "✅ *Pago confirmado correctamente.*"
+        admin_msg = f"{prefix}\n\n{recap_data['recap']}"
+        _safe_send_text(
+            bot_token,
+            chat_id,
+            admin_msg,
+            parse_mode="Markdown",
+        )
+    else:
+        if already_paid:
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                f"✅ El pedido con código de pedido {order_id} ya estaba confirmado.",
+            )
+        else:
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                f"✅ El pedido con código de pedido {order_id} ha sido confirmado.",
+            )
+
+
 def handle_admin_orders_callback(
     tenant: Dict[str, Any],
     tenant_id: str,
@@ -71,7 +235,7 @@ def handle_admin_orders_callback(
 
         user_role = get_effective_admin_role(tenant, chat_id)
         if user_role == "owner":
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "🚫 Esta opción no está disponible para el propietario.",
@@ -97,6 +261,50 @@ def handle_admin_orders_callback(
 
         assert_admin_authorized(tenant, chat_id, tenant_id)
 
+        if not order_id:
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                "⚠️ No llegó el código de pedido.",
+            )
+            return {"ok": True}
+
+        order_before = get_order_by_id(orders_sh, order_id)
+        if not order_before:
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                f"⚠️ Pedido {order_id} no encontrado en Sheets.",
+            )
+            return {"ok": True}
+
+        status_before = _safe_str(order_before.get("status")).upper()
+        already_paid = status_before == "PAID"
+
+        if already_paid:
+            order_after = order_before
+            _send_admin_paid_confirmation(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                order_id=order_id,
+                order_after=order_after,
+                already_paid=True,
+            )
+
+            _notify_client_order_paid(
+                tenant=tenant,
+                tenant_id=tenant_id,
+                order_id=order_id,
+                order_after=order_after,
+            )
+            _notify_owner_order_paid(
+                tenant=tenant,
+                tenant_id=tenant_id,
+                order_id=order_id,
+                order_after=order_after,
+            )
+            return {"ok": True}
+
         res = update_order_status(orders_sh, order_id, "PAID")
         if not res.get("ok"):
             alert_order_status_failed(
@@ -105,7 +313,7 @@ def handle_admin_orders_callback(
                 new_status="PAID",
                 error=res.get("error") or "update_order_status failed",
             )
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "⚠️ Error actualizando el estado.",
@@ -113,7 +321,7 @@ def handle_admin_orders_callback(
             return {"ok": True}
 
         if not res.get("found"):
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 f"⚠️ Pedido {order_id} no encontrado en Sheets.",
@@ -122,126 +330,27 @@ def handle_admin_orders_callback(
 
         order_after = get_order_by_id(orders_sh, order_id)
 
+        _send_admin_paid_confirmation(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            order_id=order_id,
+            order_after=order_after,
+            already_paid=False,
+        )
+
         if order_after:
-            customer_name = _safe_str(order_after.get("customer_name"))
-            customer_contact = _safe_str(order_after.get("customer_contact"))
-            requested_time = _safe_str(order_after.get("requested_time"))
-
-            items_snapshot = parse_items_field(order_after.get("items_snapshot"))
-            detail_lines, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
-
-            recap = build_order_recap_text(
+            _notify_client_order_paid(
+                tenant=tenant,
+                tenant_id=tenant_id,
                 order_id=order_id,
-                customer_name=customer_name,
-                customer_contact=customer_contact,
-                requested_time=requested_time,
-                detail_lines=detail_lines,
-                total_qty=total_qty,
-                total=total_amount,
+                order_after=order_after,
             )
-
-            admin_msg = (
-                "✅ *Pago confirmado correctamente.*\n\n"
-                f"{recap}"
+            _notify_owner_order_paid(
+                tenant=tenant,
+                tenant_id=tenant_id,
+                order_id=order_id,
+                order_after=order_after,
             )
-
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                admin_msg,
-                parse_mode="Markdown",
-            )
-        else:
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                f"✅ El pedido con código de pedido {order_id} ha sido confirmado.",
-            )
-
-        if order_after:
-            client_token = get_client_bot_token(tenant)
-            client_chat = _safe_client_chat_id_from_order(order_after)
-
-            if client_token and client_chat:
-                try:
-                    final_slot_for_msg = _safe_str(_extract_slot_hhmm(order_after.get("requested_time")))
-                    if final_slot_for_msg:
-                        msg_client = (
-                            f"✅ Tu pedido ha sido confirmado.\n"
-                            f"Código de pedido: {order_id}\n\n"
-                            f"Hora de recojo: *{final_slot_for_msg}*."
-                        )
-                    else:
-                        msg_client = (
-                            f"✅ Tu pedido ha sido confirmado.\n"
-                            f"Código de pedido: {order_id}\n\n"
-                            "¡Gracias!"
-                        )
-
-                    telegram_send_text(
-                        client_token,
-                        int(client_chat),
-                        msg_client,
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    log_event(
-                        "notify_client_paid_failed",
-                        tenant_id=tenant_id,
-                        order_id=order_id,
-                        client_chat=client_chat,
-                        error=str(e),
-                    )
-            else:
-                log_event(
-                    "notify_client_paid_skipped",
-                    tenant_id=tenant_id,
-                    order_id=order_id,
-                    reason="missing_client_token_or_chat_id",
-                )
-
-        if order_after:
-            try:
-                owner_enabled = str(tenant.get("owner_enabled") or "").strip().lower() == "true"
-                owner_chat = str(tenant.get("owner_chat_id") or "").strip()
-                owner_token = str(tenant.get("owner_bot_token") or "").strip()
-
-                if owner_enabled and owner_chat and owner_token:
-                    customer_name = _safe_str(order_after.get("customer_name"))
-                    customer_contact = _safe_str(order_after.get("customer_contact"))
-                    requested_time = _safe_str(order_after.get("requested_time"))
-
-                    items_snapshot = parse_items_field(order_after.get("items_snapshot"))
-                    detail_lines, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
-
-                    owner_recap = build_order_recap_text(
-                        order_id=order_id,
-                        customer_name=customer_name,
-                        customer_contact=customer_contact,
-                        requested_time=requested_time,
-                        detail_lines=detail_lines,
-                        total_qty=total_qty,
-                        total=total_amount,
-                    )
-
-                    owner_msg = (
-                        "✅ *Pedido confirmado por el administrador.*\n\n"
-                        f"{owner_recap}"
-                    )
-
-                    telegram_send_text(
-                        owner_token,
-                        int(owner_chat),
-                        owner_msg,
-                        parse_mode="Markdown",
-                    )
-            except Exception as e:
-                log_event(
-                    "notify_owner_paid_validated_failed",
-                    tenant_id=tenant_id,
-                    order_id=order_id,
-                    error=str(e),
-                )
 
         return {"ok": True}
 
@@ -252,7 +361,7 @@ def handle_admin_orders_callback(
 
     user_role = get_effective_admin_role(tenant, chat_id)
     if user_role == "owner":
-        telegram_send_text(
+        _safe_send_text(
             bot_token,
             chat_id,
             "🚫 Esta opción no está disponible para el propietario.",
@@ -282,7 +391,7 @@ def handle_admin_orders_callback(
     if action == "panel":
         _admin_order_reset(tmp)
         user_role = get_effective_admin_role(tenant, chat_id)
-        telegram_send_text(
+        _safe_send_text(
             bot_token,
             chat_id,
             "🧭 PANEL ADMIN\n\nElige una opción:",
@@ -327,7 +436,7 @@ def handle_admin_orders_callback(
         item = get_menu_product_or_404(orders_sh, sku)
         _admin_order_add_to_cart(tmp, sku, qty)
 
-        telegram_send_text(
+        _safe_send_text(
             bot_token,
             chat_id,
             f"✅ Agregado al pedido: {qty} x {item.get('name', '')}",
@@ -354,7 +463,7 @@ def handle_admin_orders_callback(
 
     if action == "clear":
         tmp["admin_order_cart"] = []
-        telegram_send_text(
+        _safe_send_text(
             bot_token,
             chat_id,
             "🧹 Carrito manual vaciado.",
@@ -364,7 +473,7 @@ def handle_admin_orders_callback(
     if action == "confirm":
         cart = tmp.get("admin_order_cart") or []
         if not cart:
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "⚠️ El carrito está vacío.",
@@ -372,7 +481,7 @@ def handle_admin_orders_callback(
             return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
         tmp["admin_order_step"] = "awaiting_name"
-        telegram_send_text(
+        _safe_send_text(
             bot_token,
             chat_id,
             "Escribe el nombre del cliente:",
@@ -392,7 +501,7 @@ def handle_admin_orders_callback(
 
     if action == "timelater":
         tmp["admin_order_step"] = "awaiting_time_manual"
-        telegram_send_text(
+        _safe_send_text(
             bot_token,
             chat_id,
             "Escribe la hora solicitada.\nEjemplos: 19:30, 20h",
@@ -402,7 +511,7 @@ def handle_admin_orders_callback(
     if action == "proof":
         last_order_id = str(tmp.get("admin_order_last_id") or "").strip()
         if not last_order_id:
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "⚠️ No encontré el pedido recién creado.",
@@ -412,7 +521,7 @@ def handle_admin_orders_callback(
         tmp["admin_order_waiting_proof"] = True
         tmp["admin_order_proof_received"] = False
 
-        telegram_send_text(
+        _safe_send_text(
             bot_token,
             chat_id,
             f"📷 Envía la foto del comprobante para el pedido {last_order_id}.",
@@ -421,14 +530,14 @@ def handle_admin_orders_callback(
 
     if action == "proof_ok":
         if not bool(tmp.get("admin_order_proof_received")):
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "⚠️ Aún no recibí la foto del comprobante.",
             )
             return {"ok": True}
 
-        telegram_send_text(
+        _safe_send_text(
             bot_token,
             chat_id,
             "✅ Fotografía confirmada. Ahora puedes abrir la encuesta.",
@@ -442,7 +551,7 @@ def handle_admin_orders_callback(
     if action == "survey":
         questions = get_runtime_survey_questions(orders_sh)
         if not questions:
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "⚠️ No hay preguntas activas configuradas para la encuesta.",
@@ -453,7 +562,7 @@ def handle_admin_orders_callback(
         customer_name = str(tmp.get("admin_order_last_name") or "").strip()
 
         if not customer_phone:
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "⚠️ No encontré el número del cliente del pedido.",
@@ -472,7 +581,7 @@ def handle_admin_orders_callback(
             intro += f"\n🎁 Recompensa configurada: {reward_text}"
         intro += "\n\nUsaremos los datos del pedido ya registrado."
 
-        telegram_send_text(
+        _safe_send_text(
             bot_token,
             chat_id,
             intro,
@@ -484,7 +593,7 @@ def handle_admin_orders_callback(
             q_idx = int(parts[3].strip())
             stars_value = int(parts[4].strip())
         except Exception:
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "⚠️ No pude leer esa calificación.",
@@ -493,7 +602,7 @@ def handle_admin_orders_callback(
             return {"ok": True}
 
         if stars_value < 1 or stars_value > 5:
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "⚠️ La calificación debe estar entre 1 y 5.",
@@ -502,7 +611,7 @@ def handle_admin_orders_callback(
             return {"ok": True}
 
         if not bool(tmp.get("admin_survey_runtime")):
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "⚠️ No hay una encuesta activa en este momento.",
@@ -513,7 +622,7 @@ def handle_admin_orders_callback(
         questions = get_runtime_survey_questions(orders_sh)
         if not questions or q_idx < 0 or q_idx >= len(questions):
             clear_admin_survey_runtime(tmp)
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "⚠️ Error en el flujo de encuesta.",
@@ -524,7 +633,7 @@ def handle_admin_orders_callback(
         current_q = questions[q_idx]
         qtype = str(current_q.get("type") or "").strip().lower()
         if qtype != "stars":
-            telegram_send_text(
+            _safe_send_text(
                 bot_token,
                 chat_id,
                 "⚠️ Esta pregunta no es de estrellas.",
