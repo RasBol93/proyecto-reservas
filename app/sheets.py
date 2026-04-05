@@ -1,4 +1,4 @@
-# app/sheets.py — versión optimizada con caché simple de client, spreadsheet y worksheet
+# app/sheets.py — versión hardened (robustez + seguridad sin romper compatibilidad)
 
 import json
 from typing import Any, Dict, List, Tuple
@@ -24,10 +24,6 @@ _WORKSHEET_CACHE: Dict[Tuple[str, str], gspread.Worksheet] = {}
 # ----------------------------------------
 
 def get_gspread_client() -> gspread.Client:
-    """
-    Crea (o reutiliza) un cliente de gspread usando el JSON de service account guardado en env.
-    Env esperado: GCP_CREDENTIALS_JSON (string JSON completo)
-    """
     global _GSPREAD_CLIENT_CACHE
 
     if _GSPREAD_CLIENT_CACHE is not None:
@@ -41,8 +37,11 @@ def get_gspread_client() -> gspread.Client:
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
-        _GSPREAD_CLIENT_CACHE = gspread.service_account_from_dict(info, scopes=scopes)
-        return _GSPREAD_CLIENT_CACHE
+
+        client = gspread.service_account_from_dict(info, scopes=scopes)
+
+        _GSPREAD_CLIENT_CACHE = client
+        return client
 
     except Exception as e:
         log_event(
@@ -62,9 +61,6 @@ def get_gspread_client() -> gspread.Client:
 # ----------------------------------------
 
 def open_spreadsheet_by_key(gc: gspread.Client, spreadsheet_id: str) -> gspread.Spreadsheet:
-    """
-    Abre cualquier spreadsheet por ID (key), con caché simple en memoria.
-    """
     try:
         sid = (spreadsheet_id or "").strip()
         if not sid:
@@ -74,6 +70,10 @@ def open_spreadsheet_by_key(gc: gspread.Client, spreadsheet_id: str) -> gspread.
             return _SPREADSHEET_CACHE[sid]
 
         sh = gc.open_by_key(sid)
+
+        if sh is None:
+            raise RuntimeError("Spreadsheet not found")
+
         _SPREADSHEET_CACHE[sid] = sh
         return sh
 
@@ -93,10 +93,6 @@ def open_spreadsheet_by_key(gc: gspread.Client, spreadsheet_id: str) -> gspread.
 
 
 def open_config_spreadsheet(gc: gspread.Client) -> gspread.Spreadsheet:
-    """
-    Abre el spreadsheet de configuración (Tenants, etc.)
-    Env esperado: RESERVACIONES_CONFIG (spreadsheet id)
-    """
     try:
         config_id = env_required(ENV_CONFIG_SPREADSHEET_ID).strip()
         if not config_id:
@@ -106,6 +102,10 @@ def open_config_spreadsheet(gc: gspread.Client) -> gspread.Spreadsheet:
             return _SPREADSHEET_CACHE[config_id]
 
         sh = gc.open_by_key(config_id)
+
+        if sh is None:
+            raise RuntimeError("Config spreadsheet not found")
+
         _SPREADSHEET_CACHE[config_id] = sh
         return sh
 
@@ -137,9 +137,6 @@ def _spreadsheet_cache_key(spreadsheet: gspread.Spreadsheet) -> str:
 
 
 def get_ws(spreadsheet: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
-    """
-    Obtiene una worksheet por título, con caché simple por spreadsheet+title.
-    """
     try:
         t = (title or "").strip()
         if not t:
@@ -152,6 +149,10 @@ def get_ws(spreadsheet: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
             return _WORKSHEET_CACHE[cache_key]
 
         ws = spreadsheet.worksheet(t)
+
+        if ws is None:
+            raise RuntimeError(f"Worksheet '{t}' not found")
+
         _WORKSHEET_CACHE[cache_key] = ws
         return ws
 
@@ -171,11 +172,6 @@ def get_ws(spreadsheet: gspread.Spreadsheet, title: str) -> gspread.Worksheet:
 
 
 def invalidate_sheet_caches(spreadsheet_id: str | None = None) -> None:
-    """
-    Limpia cachés.
-    - Si no recibe spreadsheet_id: limpia todo.
-    - Si recibe spreadsheet_id: limpia spreadsheet + worksheets asociadas.
-    """
     global _GSPREAD_CLIENT_CACHE
 
     if spreadsheet_id is None:
@@ -199,14 +195,11 @@ def invalidate_sheet_caches(spreadsheet_id: str | None = None) -> None:
 # ----------------------------------------
 
 def detect_header_row(values: List[List[Any]], required_headers: List[str], max_scan: int = 10) -> int:
-    """
-    Soporta el patrón:
-      - fila 1: headers técnicos (EN)
-      - fila 2: traducción / etiquetas (ES)
-    Detecta la fila de headers técnicos buscando required_headers normalizados.
-    """
     try:
-        req = [normalize(h) for h in required_headers]
+        if not values:
+            return 1
+
+        req = [normalize(h) for h in required_headers if h]
         scan = values[:max_scan]
 
         for idx, row in enumerate(scan, start=1):
@@ -234,29 +227,36 @@ def detect_header_row(values: List[List[Any]], required_headers: List[str], max_
 # ----------------------------------------
 
 def read_records_manual(ws: gspread.Worksheet, required_headers: List[str]) -> List[Dict[str, Any]]:
-    """
-    Lee registros detectando automáticamente la fila de headers técnicos.
-    Devuelve lista de dicts con keys normalizadas (lower, sin tildes, etc.).
-    """
     try:
         values = ws.get_all_values()
         if not values:
             return []
 
         header_row = detect_header_row(values, required_headers=required_headers)
+
+        if header_row <= 0 or header_row > len(values):
+            return []
+
         headers = values[header_row - 1]
         headers_norm = [normalize(h) for h in headers]
 
         records: List[Dict[str, Any]] = []
+
         for row in values[header_row:]:
             if not any(str(x).strip() for x in row):
                 continue
 
             d: Dict[str, Any] = {}
+
             for i, h in enumerate(headers_norm):
                 if not h:
                     continue
-                d[h] = row[i] if i < len(row) else ""
+
+                try:
+                    d[h] = row[i] if i < len(row) else ""
+                except Exception:
+                    d[h] = ""
+
             records.append(d)
 
         return records
