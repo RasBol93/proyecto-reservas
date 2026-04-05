@@ -51,7 +51,10 @@ def _detect_header_row(values: List[List[str]], required_headers: List[str], max
     Encuentra la fila que contiene required_headers.
     Devuelve índice 0-based. Fallback: 0.
     """
-    req = [normalize(h) for h in required_headers]
+    if not values:
+        return 0
+
+    req = [normalize(h) for h in required_headers if h]
     scan = values[:max_scan]
 
     for idx, row in enumerate(scan):
@@ -90,7 +93,10 @@ def _cache_is_fresh() -> bool:
 
 
 def _safe_str(v: Any) -> str:
-    return str(v if v is not None else "")
+    try:
+        return str(v if v is not None else "")
+    except Exception:
+        return ""
 
 
 def _build_row_getter(headers_norm: List[str]):
@@ -138,7 +144,7 @@ def _get_tenants_values_and_header(ws) -> Tuple[List[List[str]], int, List[str],
         values,
         required_headers=["tenant_id", "orders_sheet_id", "active"]
     )
-    headers_raw = values[header_idx]
+    headers_raw = values[header_idx] if header_idx < len(values) else []
     headers_norm = [normalize(h) for h in headers_raw]
     return values, header_idx, headers_raw, headers_norm
 
