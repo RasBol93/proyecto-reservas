@@ -363,7 +363,6 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
             end_utc=_local_datetime_to_utc_naive(current_day_start),
         )
 
-    # Esta semana: lunes 00:00 hasta ahora
     if period_key == "this_week":
         start_local = _local_week_start(now_local)
         end_utc = now_utc
@@ -373,7 +372,6 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
             end_utc=end_utc,
         )
 
-    # Semana pasada: lunes 00:00 a lunes 00:00 siguiente
     if period_key == "last_week":
         current_week_start = _local_week_start(now_local)
         last_week_start = current_week_start - timedelta(days=7)
@@ -384,7 +382,6 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
             end_utc=_local_datetime_to_utc_naive(last_week_end),
         )
 
-    # Mes en curso: día 1 00:00 hasta ahora
     if period_key == "month_to_date":
         start_utc, _ = _local_month_range_utc(tenant_tz, now_local.year, now_local.month)
         return Period(
@@ -393,7 +390,6 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
             end_utc=now_utc,
         )
 
-    # Mes anterior: mes completo anterior
     if period_key == "last_month":
         y, m = _shift_year_month(now_local.year, now_local.month, -1)
         s, e = _local_month_range_utc(tenant_tz, y, m)
@@ -403,7 +399,6 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
             end_utc=e,
         )
 
-    # Hace 1 mes
     if period_key == "month_1_ago":
         y, m = _shift_year_month(now_local.year, now_local.month, -1)
         s, e = _local_month_range_utc(tenant_tz, y, m)
@@ -413,7 +408,6 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
             end_utc=e,
         )
 
-    # Hace 2 meses
     if period_key == "month_2_ago":
         y, m = _shift_year_month(now_local.year, now_local.month, -2)
         s, e = _local_month_range_utc(tenant_tz, y, m)
@@ -423,7 +417,6 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
             end_utc=e,
         )
 
-    # Hace 3 meses
     if period_key == "month_3_ago":
         y, m = _shift_year_month(now_local.year, now_local.month, -3)
         s, e = _local_month_range_utc(tenant_tz, y, m)
@@ -433,10 +426,8 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
             end_utc=e,
         )
 
-    # Trimestre en curso: inicio trimestre hasta ahora
     if period_key == "quarter_to_date":
         q_start_month = _quarter_start_month(now_local.month)
-        q_num = _quarter_number(now_local.month)
         tzinfo = now_local.tzinfo
         start_local = datetime(now_local.year, q_start_month, 1, 0, 0, 0, tzinfo=tzinfo)
         return Period(
@@ -445,7 +436,6 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
             end_utc=now_utc,
         )
 
-    # Último trimestre: trimestre completo anterior
     if period_key == "last_quarter":
         current_q_start_month = _quarter_start_month(now_local.month)
         current_q_start_local = datetime(now_local.year, current_q_start_month, 1, 0, 0, 0, tzinfo=now_local.tzinfo)
@@ -466,7 +456,6 @@ def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] 
             end_utc=_local_datetime_to_utc_naive(prev_q_end_local),
         )
 
-    # Año en curso: 1 enero hasta ahora
     if period_key == "year_to_date":
         s, _ = _local_year_range_utc(tenant_tz, now_local.year)
         return Period(
@@ -520,7 +509,12 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
             raise HTTPException(status_code=500, detail=f"Cannot read Orders: {e}")
 
     if not values:
-        return f"📊 ESTADÍSTICAS\n\n📅 {_period_range_text_local(period, tenant_tz)}\n\nSin datos."
+        return (
+            "📊 *ESTADÍSTICAS*\n\n"
+            f"📅 *Período:* {period.label}\n"
+            f"🗓 *Rango:* {_period_range_text_local(period, tenant_tz)}\n\n"
+            "No hay datos disponibles para este período."
+        )
 
     hdr_idx = _detect_header_row(values, required_headers=["order_id", "created_at", "status"], max_scan=30)
     headers_raw = values[hdr_idx]
@@ -537,7 +531,12 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
     i_contact = cidx("customer_contact")
 
     if i_created is None or i_status is None:
-        return f"📊 ESTADÍSTICAS\n\n📅 {_period_range_text_local(period, tenant_tz)}\n\nLa hoja Orders no tiene las columnas requeridas."
+        return (
+            "📊 *ESTADÍSTICAS*\n\n"
+            f"📅 *Período:* {period.label}\n"
+            f"🗓 *Rango:* {_period_range_text_local(period, tenant_tz)}\n\n"
+            "La hoja Orders no tiene las columnas requeridas."
+        )
 
     try:
         menu_idx = load_menu_index(orders_sh)
@@ -686,14 +685,15 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
 
     lines: List[str] = []
 
-    lines.append("📊 ESTADÍSTICAS")
+    lines.append("📊 *ESTADÍSTICAS*")
     lines.append("")
-    lines.append(f"📅 {_period_range_text_local(period, tenant_tz)}")
+    lines.append(f"🏷 *Período:* {period.label}")
+    lines.append(f"🗓 *Rango:* {_period_range_text_local(period, tenant_tz)}")
     lines.append("")
 
-    lines.append("🧠 RESUMEN EJECUTIVO")
+    lines.append("🧠 *RESUMEN EJECUTIVO*")
     if orders_paid == 0:
-        lines.append("No hubo pedidos pagados en este período.")
+        lines.append("• No hubo pedidos pagados en este período.")
     else:
         summary_parts = [
             f"{orders_paid} pedidos pagados",
@@ -707,24 +707,24 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
         lines.append("• " + " | ".join(summary_parts))
     lines.append("")
 
-    lines.append("🔹 RESUMEN")
-    lines.append(f"Pedidos pagados: {orders_paid}")
-    lines.append(f"Ventas: Bs {paid_total_sales:.2f}")
-    lines.append(f"Ticket promedio: Bs {ticket_avg:.2f}")
-    lines.append(f"Unidades promedio: {units_avg:.1f}")
-    lines.append(f"Clientes únicos aprox.: {len(paid_customers)}")
+    lines.append("🔹 *KPIs CLAVE*")
+    lines.append(f"💳 Pedidos pagados: {orders_paid}")
+    lines.append(f"💰 Ventas totales: Bs {paid_total_sales:.2f}")
+    lines.append(f"🧾 Ticket promedio: Bs {ticket_avg:.2f}")
+    lines.append(f"📦 Unidades promedio: {units_avg:.1f}")
+    lines.append(f"👥 Clientes únicos aprox.: {len(paid_customers)}")
     lines.append("")
 
-    lines.append("🔹 EMBUDO")
-    lines.append(f"Conversaciones iniciadas: {conversations}")
-    lines.append(f"Pedidos creados: {orders_created}")
-    lines.append(f"Pedidos pagados: {orders_paid}")
-    lines.append(f"Conversación → pedido: {conv_to_order:.1f}%")
-    lines.append(f"Pedido → pagado: {order_to_paid:.1f}%")
-    lines.append(f"Pedidos no pagados: {unpaid}")
+    lines.append("🔹 *EMBUDO COMERCIAL*")
+    lines.append(f"💬 Conversaciones iniciadas: {conversations}")
+    lines.append(f"🛒 Pedidos creados: {orders_created}")
+    lines.append(f"✅ Pedidos pagados: {orders_paid}")
+    lines.append(f"📈 Conversación → pedido: {conv_to_order:.1f}%")
+    lines.append(f"📈 Pedido → pagado: {order_to_paid:.1f}%")
+    lines.append(f"⏳ Pedidos no pagados: {unpaid}")
     lines.append("")
 
-    lines.append("🔹 VENTAS POR DÍA")
+    lines.append("🔹 *VENTAS POR DÍA*")
     has_weekday_data = False
     for d in weekday_order:
         if d in weekday_stats:
@@ -735,7 +735,7 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
         lines.append("Sin datos")
     lines.append("")
 
-    lines.append("📈 GRÁFICO RÁPIDO DE VENTAS POR DÍA")
+    lines.append("📈 *MINI GRÁFICO — VENTAS POR DÍA*")
     if has_weekday_data and max_day_sales > 0:
         for d in weekday_order:
             sales = weekday_stats.get(d, {}).get("sales", 0.0)
@@ -745,16 +745,16 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
         lines.append("Sin datos")
     lines.append("")
 
-    lines.append("🔹 MEJORES HORAS")
+    lines.append("🔹 *MEJORES HORAS*")
     if top_hours:
         for h, s in top_hours:
             n_orders = hour_stats_orders.get(h, 0)
-            lines.append(f"{h} → Bs {s:.2f} | {n_orders} pedidos")
+            lines.append(f"⏰ {h} → Bs {s:.2f} | {n_orders} pedidos")
     else:
         lines.append("Sin datos")
     lines.append("")
 
-    lines.append("🔹 TOP PRODUCTOS POR VENTAS")
+    lines.append("🔹 *TOP PRODUCTOS POR VENTAS*")
     if top_sales:
         for i, (sku, s) in enumerate(top_sales, 1):
             share = (s / paid_total_sales * 100.0) if paid_total_sales > 0 else 0.0
@@ -763,7 +763,7 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
         lines.append("Sin datos")
     lines.append("")
 
-    lines.append("🔹 TOP PRODUCTOS POR UNIDADES")
+    lines.append("🔹 *TOP PRODUCTOS POR UNIDADES*")
     if top_units:
         for i, (sku, u) in enumerate(top_units, 1):
             lines.append(f"{i}. {sku_name(sku)} — {u}")
@@ -771,7 +771,7 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
         lines.append("Sin datos")
     lines.append("")
 
-    lines.append("🔹 CATEGORÍAS")
+    lines.append("🔹 *CATEGORÍAS*")
     if top_cat:
         for cat, s in top_cat:
             share = (s / paid_total_sales * 100.0) if paid_total_sales > 0 else 0.0
@@ -781,7 +781,7 @@ def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: P
         lines.append("Sin datos")
     lines.append("")
 
-    lines.append("💡 INSIGHTS")
+    lines.append("💡 *INSIGHTS*")
     if orders_paid == 0:
         lines.append("• Aún no hay suficiente información en este período.")
     else:
