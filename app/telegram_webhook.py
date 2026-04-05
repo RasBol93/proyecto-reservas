@@ -1,4 +1,5 @@
 # app/telegram_webhook.py — limpio SIN mensaje vacío
+# hardened incremental: misma estructura, mismos contratos, más robustez
 
 from typing import Any, Dict
 
@@ -20,21 +21,31 @@ _SHEET_CACHE = {}
 
 
 def _get_orders_sheet_cached(gc, sheet_id):
-    if sheet_id in _SHEET_CACHE:
-        return _SHEET_CACHE[sheet_id]
+    clean_sheet_id = str(sheet_id or "").strip()
+    if not clean_sheet_id:
+        raise RuntimeError("Missing sheet_id")
 
-    sh = open_spreadsheet_by_key(gc, sheet_id)
-    _SHEET_CACHE[sheet_id] = sh
+    if clean_sheet_id in _SHEET_CACHE:
+        return _SHEET_CACHE[clean_sheet_id]
+
+    sh = open_spreadsheet_by_key(gc, clean_sheet_id)
+    _SHEET_CACHE[clean_sheet_id] = sh
     return sh
 
 
 @router.post("/telegram/webhook/{tenant_id}/{secret}")
 async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
     mode = ""
+    bot_token = ""
+    tenant = {}
 
     try:
         tenant_id = (tenant_id or "").strip()
         if not tenant_id:
+            return {"ok": True}
+
+        if not isinstance(update, dict):
+            log_event("webhook_invalid_update_type", tenant_id=tenant_id, update_type=type(update).__name__)
             return {"ok": True}
 
         gc = get_gspread_client()
@@ -58,6 +69,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             return {"ok": True}
 
         if not bot_token:
+            log_event("webhook_missing_bot_token", tenant_id=tenant_id, mode=mode)
             return {"ok": True}
 
         # 🔴 detectar owner
@@ -85,15 +97,30 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         # -------------------------
         cb = update.get("callback_query")
         if cb:
+            if not isinstance(cb, dict):
+                log_event("webhook_invalid_callback_payload", tenant_id=tenant_id, mode=mode)
+                return {"ok": True}
+
             data = (cb.get("data") or "").strip()
             cb_id = cb.get("id")
 
             chat_id = safe_int(((cb.get("message") or {}).get("chat") or {}).get("id"))
             if chat_id is None:
+                log_event("webhook_callback_missing_chat_id", tenant_id=tenant_id, mode=mode, data=data)
                 return {"ok": True}
 
             if cb_id:
-                telegram_answer_callback(bot_token, cb_id, "OK")
+                try:
+                    telegram_answer_callback(bot_token, cb_id, "OK")
+                except Exception as e:
+                    log_event(
+                        "webhook_callback_answer_failed",
+                        tenant_id=tenant_id,
+                        mode=mode,
+                        chat_id=chat_id,
+                        error_type=type(e).__name__,
+                        error=str(e),
+                    )
 
             if mode == "client":
                 return handle_client_callback(
@@ -117,6 +144,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     tenant_tz=tenant_tz,
                 )
 
+            log_event("webhook_unknown_mode_callback", tenant_id=tenant_id, mode=mode, chat_id=chat_id)
             return {"ok": True}
 
         # -------------------------
@@ -124,14 +152,29 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         # -------------------------
         msg = update.get("message") or update.get("edited_message")
         if msg:
+            if not isinstance(msg, dict):
+                log_event("webhook_invalid_message_payload", tenant_id=tenant_id, mode=mode)
+                return {"ok": True}
+
             chat_id = safe_int((msg.get("chat") or {}).get("id"))
             if chat_id is None:
+                log_event("webhook_message_missing_chat_id", tenant_id=tenant_id, mode=mode)
                 return {"ok": True}
 
             text = (msg.get("text") or "").strip()
 
             if normalize(text) in ("/id", "id"):
-                telegram_send_text(bot_token, chat_id, f"chat_id = {chat_id}")
+                try:
+                    telegram_send_text(bot_token, chat_id, f"chat_id = {chat_id}")
+                except Exception as e:
+                    log_event(
+                        "webhook_send_id_failed",
+                        tenant_id=tenant_id,
+                        mode=mode,
+                        chat_id=chat_id,
+                        error_type=type(e).__name__,
+                        error=str(e),
+                    )
                 return {"ok": True}
 
             if mode == "client":
@@ -156,11 +199,19 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                     tenant_tz=tenant_tz,
                 )
 
+            log_event("webhook_unknown_mode_message", tenant_id=tenant_id, mode=mode, chat_id=chat_id)
             return {"ok": True}
 
+        log_event("webhook_ignored_update", tenant_id=tenant_id, mode=mode, keys=list(update.keys())[:10])
         return {"ok": True}
 
     except Exception as e:
-        log_event("webhook_unhandled_error", tenant_id=tenant_id, error=str(e))
+        log_event(
+            "webhook_unhandled_error",
+            tenant_id=tenant_id,
+            mode=mode,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
         alert_webhook_error(tenant_id=tenant_id, mode=mode, error=str(e))
         return {"ok": True}
