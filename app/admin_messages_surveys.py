@@ -32,6 +32,76 @@ def _survey_type_label(qtype: str) -> str:
     return qtype or ""
 
 
+def _surveys_home_text() -> str:
+    return (
+        "📝 *ENCUESTAS*\n\n"
+        "Gestiona la configuración, preguntas y resultados de este módulo.\n\n"
+        "_Elige una opción del panel inferior._"
+    )
+
+
+def _surveys_questions_text(questions) -> str:
+    lines = [
+        "❓ *GESTIONAR PREGUNTAS*",
+        "",
+    ]
+
+    if not questions:
+        lines.append("No hay preguntas activas configuradas.")
+        lines.append("")
+        lines.append("Puedes agregar una nueva pregunta desde el botón inferior.")
+        return "\n".join(lines)
+
+    lines.append("Preguntas activas:")
+    lines.append("")
+
+    for idx, q in enumerate(questions, start=1):
+        qid = str(q.get("question_id") or "").strip()
+        qtype = _survey_type_label(str(q.get("type") or "").strip())
+        qtext = str(q.get("question_text") or "").strip()
+
+        lines.append(f"{idx}. *{qtext}*")
+        lines.append(f"   ID: `{qid}`")
+        lines.append(f"   Tipo: {qtype}")
+        lines.append("")
+
+    lines.append("_Usa los botones para editar, cambiar tipo o eliminar._")
+    return "\n".join(lines)
+
+
+def _surveys_config_saved_password_text() -> str:
+    return (
+        "✅ *Password actualizado*\n\n"
+        "La contraseña de la encuesta fue guardada correctamente."
+    )
+
+
+def _surveys_config_saved_reward_text() -> str:
+    return (
+        "✅ *Recompensa actualizada*\n\n"
+        "La recompensa de la encuesta fue guardada correctamente."
+    )
+
+
+def _survey_runtime_intro_text(reward_text: str) -> str:
+    intro = (
+        "📝 *ENCUESTA DEL CLIENTE*\n\n"
+        "Iniciaremos la encuesta usando los datos del pedido ya registrado."
+    )
+    if reward_text:
+        intro += f"\n\n🎁 *Recompensa configurada:*\n{reward_text}"
+    return intro
+
+
+def _survey_runtime_question_text(question_text: str, step_text: str = "") -> str:
+    lines = []
+    if step_text:
+        lines.append(step_text)
+        lines.append("")
+    lines.append(f"❓ *{question_text}*")
+    return "\n".join(lines)
+
+
 def _send_admin_surveys_questions(
     bot_token: str,
     chat_id: int,
@@ -39,22 +109,6 @@ def _send_admin_surveys_questions(
     orders_sh,
 ) -> bool:
     questions = load_survey_questions(orders_sh)
-
-    lines = [
-        "❓ GESTIONAR PREGUNTAS",
-        "",
-    ]
-
-    if not questions:
-        lines.append("No hay preguntas activas.")
-    else:
-        for idx, q in enumerate(questions, start=1):
-            qid = str(q.get("question_id") or "").strip()
-            qtype = _survey_type_label(str(q.get("type") or "").strip())
-            qtext = str(q.get("question_text") or "").strip()
-            lines.append(f"{idx}. [{qid}] {qtext}")
-            lines.append(f"   {qtype}")
-            lines.append("")
 
     rows = []
     if questions:
@@ -78,8 +132,9 @@ def _send_admin_surveys_questions(
     telegram_send_text(
         bot_token,
         chat_id,
-        "\n".join(lines),
+        _surveys_questions_text(questions),
         reply_markup=kb(rows),
+        parse_mode="Markdown",
     )
     return True
 
@@ -162,8 +217,9 @@ def handle_admin_surveys_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No hay preguntas activas configuradas para la encuesta.",
+                "⚠️ *Encuesta no disponible*\n\nNo hay preguntas activas configuradas para la encuesta.",
                 reply_markup=admin_fixed_kb(),
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -178,8 +234,9 @@ def handle_admin_surveys_message(
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "⚠️ No encontré el número del cliente del pedido.",
+                    "⚠️ *Datos incompletos*\n\nNo encontré el número del cliente del pedido.",
                     reply_markup=admin_fixed_kb(),
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -188,8 +245,9 @@ def handle_admin_surveys_message(
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "⚠️ Este cliente ya respondió una encuesta hoy.",
+                    "⚠️ *Encuesta ya respondida*\n\nEste cliente ya respondió una encuesta hoy.",
                     reply_markup=admin_fixed_kb(),
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -204,15 +262,23 @@ def handle_admin_surveys_message(
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    f"❓ {first_q.get('question_text', '')}",
+                    _survey_runtime_question_text(
+                        str(first_q.get("question_text", "") or "").strip(),
+                        "Pregunta 1",
+                    ),
                     reply_markup=survey_runtime_stars_kb(tenant_id, 0),
+                    parse_mode="Markdown",
                 )
             else:
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    f"❓ {first_q.get('question_text', '')}",
+                    _survey_runtime_question_text(
+                        str(first_q.get("question_text", "") or "").strip(),
+                        "Pregunta 1",
+                    ),
                     reply_markup=admin_fixed_kb(),
+                    parse_mode="Markdown",
                 )
             return {"ok": True}
 
@@ -222,8 +288,9 @@ def handle_admin_surveys_message(
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "📱 Ingresa un número válido:",
+                    "📱 *Número requerido*\n\nIngresa un número válido:",
                     reply_markup=admin_fixed_kb(),
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -232,8 +299,9 @@ def handle_admin_surveys_message(
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "⚠️ Este cliente ya respondió una encuesta hoy.",
+                    "⚠️ *Encuesta ya respondida*\n\nEste cliente ya respondió una encuesta hoy.",
                     reply_markup=admin_fixed_kb(),
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -243,8 +311,9 @@ def handle_admin_surveys_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "👤 Nombre del cliente:",
+                "👤 *Datos del cliente*\n\nIngresa el nombre del cliente:",
                 reply_markup=admin_fixed_kb(),
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -254,8 +323,9 @@ def handle_admin_surveys_message(
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "👤 Ingresa un nombre válido:",
+                    "👤 *Nombre requerido*\n\nIngresa un nombre válido:",
                     reply_markup=admin_fixed_kb(),
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -269,15 +339,23 @@ def handle_admin_surveys_message(
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    f"❓ {first_q.get('question_text', '')}",
+                    _survey_runtime_question_text(
+                        str(first_q.get("question_text", "") or "").strip(),
+                        "Pregunta 1",
+                    ),
                     reply_markup=survey_runtime_stars_kb(tenant_id, 0),
+                    parse_mode="Markdown",
                 )
             else:
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    f"❓ {first_q.get('question_text', '')}",
+                    _survey_runtime_question_text(
+                        str(first_q.get("question_text", "") or "").strip(),
+                        "Pregunta 1",
+                    ),
                     reply_markup=admin_fixed_kb(),
+                    parse_mode="Markdown",
                 )
             return {"ok": True}
 
@@ -292,8 +370,9 @@ def handle_admin_surveys_message(
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "⚠️ Error en el flujo de encuesta.",
+                    "⚠️ *Error de flujo*\n\nSe perdió el estado de la encuesta.",
                     reply_markup=admin_fixed_kb(),
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -304,8 +383,9 @@ def handle_admin_surveys_message(
                 telegram_send_text(
                     bot_token,
                     chat_id,
-                    "⭐ Esta pregunta se responde tocando una estrella en pantalla.",
+                    "⭐ *Respuesta requerida en pantalla*\n\nEsta pregunta se responde tocando una estrella.",
                     reply_markup=admin_fixed_kb(),
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -328,15 +408,23 @@ def handle_admin_surveys_message(
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        f"❓ {next_q.get('question_text', '')}",
+                        _survey_runtime_question_text(
+                            str(next_q.get("question_text", "") or "").strip(),
+                            f"Pregunta {next_idx + 1}",
+                        ),
                         reply_markup=survey_runtime_stars_kb(tenant_id, next_idx),
+                        parse_mode="Markdown",
                     )
                 else:
                     telegram_send_text(
                         bot_token,
                         chat_id,
-                        f"❓ {next_q.get('question_text', '')}",
+                        _survey_runtime_question_text(
+                            str(next_q.get("question_text", "") or "").strip(),
+                            f"Pregunta {next_idx + 1}",
+                        ),
                         reply_markup=admin_fixed_kb(),
+                        parse_mode="Markdown",
                     )
                 return {"ok": True}
 
@@ -362,7 +450,8 @@ def handle_admin_surveys_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "El password no puede estar vacío. Escríbelo otra vez:",
+                "🔒 *Password requerido*\n\nEl password no puede estar vacío. Escríbelo otra vez:",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -373,18 +462,20 @@ def handle_admin_surveys_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "✅ Password de encuesta actualizado.",
+                _surveys_config_saved_password_text(),
                 reply_markup=kb([
                     [("⚙️ Configuración", f"admsurv|{tenant_id}|config")],
                     [("📝 Volver a encuestas", "admin_surveys")],
                     [("🧭 Panel admin", "admin_panel")],
                 ]),
+                parse_mode="Markdown",
             )
         else:
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No pude guardar el nuevo password.",
+                "⚠️ *No guardado*\n\nNo pude guardar el nuevo password.",
+                parse_mode="Markdown",
             )
         return {"ok": True}
 
@@ -394,7 +485,8 @@ def handle_admin_surveys_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "La recompensa no puede estar vacía. Escríbela otra vez:",
+                "🎁 *Recompensa requerida*\n\nLa recompensa no puede estar vacía. Escríbela otra vez:",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -405,18 +497,20 @@ def handle_admin_surveys_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "✅ Recompensa de encuesta actualizada.",
+                _surveys_config_saved_reward_text(),
                 reply_markup=kb([
                     [("⚙️ Configuración", f"admsurv|{tenant_id}|config")],
                     [("📝 Volver a encuestas", "admin_surveys")],
                     [("🧭 Panel admin", "admin_panel")],
                 ]),
+                parse_mode="Markdown",
             )
         else:
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No pude guardar la nueva recompensa.",
+                "⚠️ *No guardado*\n\nNo pude guardar la nueva recompensa.",
+                parse_mode="Markdown",
             )
         return {"ok": True}
 
@@ -426,7 +520,8 @@ def handle_admin_surveys_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "La pregunta no puede estar vacía. Escríbela otra vez:",
+                "❓ *Texto requerido*\n\nLa pregunta no puede estar vacía. Escríbela otra vez:",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -436,13 +531,17 @@ def handle_admin_surveys_message(
         telegram_send_text(
             bot_token,
             chat_id,
-            "Elige el tipo de la nueva pregunta:",
+            (
+                "➕ *NUEVA PREGUNTA*\n\n"
+                "Paso 2: Elige el tipo de respuesta."
+            ),
             reply_markup=kb([
                 [("⭐ Estrellas", f"admsurv|{tenant_id}|settype|stars")],
                 [("✍️ Texto", f"admsurv|{tenant_id}|settype|text")],
                 [("⬅️ Volver a preguntas", f"admsurv|{tenant_id}|questions")],
                 [("🧭 Panel admin", "admin_panel")],
             ]),
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -450,7 +549,8 @@ def handle_admin_surveys_message(
         telegram_send_text(
             bot_token,
             chat_id,
-            "Selecciona el tipo usando los botones: ⭐ Estrellas o ✍️ Texto.",
+            "⭐ *Tipo pendiente*\n\nSelecciona el tipo usando los botones: Estrellas o Texto.",
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -464,7 +564,8 @@ def handle_admin_surveys_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No encontré la pregunta a editar. Vuelve a entrar.",
+                "⚠️ *Pregunta no encontrada*\n\nNo encontré la pregunta a editar. Vuelve a entrar.",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -472,7 +573,8 @@ def handle_admin_surveys_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "El nuevo texto no puede estar vacío. Escríbelo otra vez:",
+                "✏️ *Texto requerido*\n\nEl nuevo texto no puede estar vacío. Escríbelo otra vez:",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -489,13 +591,15 @@ def handle_admin_surveys_message(
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "✅ Texto de pregunta actualizado.",
+                "✅ *Pregunta actualizada*\n\nEl texto de la pregunta fue actualizado correctamente.",
+                parse_mode="Markdown",
             )
         else:
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No pude actualizar el texto de esa pregunta.",
+                "⚠️ *No actualizado*\n\nNo pude actualizar el texto de esa pregunta.",
+                parse_mode="Markdown",
             )
 
         return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
