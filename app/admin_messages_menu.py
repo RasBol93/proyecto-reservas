@@ -1,3 +1,5 @@
+# app/admin_messages_menu.py
+
 from typing import Any, Dict, Optional
 
 from app.menu import (
@@ -72,14 +74,6 @@ def handle_admin_menu_message(
                 chat_id,
                 "Elige una categoría para el producto:",
                 reply_markup=kb(rows),
-            )
-            return {"ok": True}
-
-        if create_step == "awaiting_category_SELECTION":
-            telegram_send_text(
-                bot_token,
-                chat_id,
-                "Selecciona una categoría usando los botones o toca 'Nueva categoría'.",
             )
             return {"ok": True}
 
