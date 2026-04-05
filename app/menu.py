@@ -34,8 +34,8 @@ def _ws_has_required_headers(ws, required_headers: List[str], max_scan_rows: int
     if not values:
         return False
 
-    req = [normalize(h) for h in required_headers]
-    scan = values[:max_scan_rows]
+    req = [normalize(h) for h in required_headers if str(h or "").strip()]
+    scan = values[:max_scan_rows] if max_scan_rows > 0 else values
 
     for row in scan:
         row_norm = [normalize(x) for x in row]
@@ -171,6 +171,9 @@ def _get_menu_context(orders_sh) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Menu worksheet is empty")
 
     header_row_1based = detect_header_row(values, required_headers=REQUIRED_MENU_HEADERS, max_scan=10)
+    if header_row_1based < 1 or header_row_1based > len(values):
+        raise HTTPException(status_code=500, detail="Invalid Menu header row")
+
     headers_raw = values[header_row_1based - 1]
     headers_norm = [normalize(h) for h in headers_raw]
 
