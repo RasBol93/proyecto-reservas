@@ -10,26 +10,60 @@ def admin_root_kb():
 
 
 def admin_panel_kb(user_role: str = "admin"):
-    rows = [
-        [("📊 Estadísticas", "admin_stats")],
-        [("👥 Base de consumidores", "admin_consumers")],
-        [("📝 Encuestas", "admin_surveys")],
-    ]
+    """
+    Panel rediseñado tipo "mini app":
+    - agrupación lógica
+    - máximo 2 botones por fila
+    - jerarquía visual clara
+    - misma lógica / mismos callbacks
+    """
 
-    if str(user_role or "").strip().lower() != "owner":
-        rows.append([("➕ Crear pedido manual", "admin_order")])
+    user_role = str(user_role or "").strip().lower()
+    is_owner = user_role == "owner"
 
-    rows.extend([
-        [("⚙️ Config días y horarios", "admin_hours")],
-        [("🍔 Config menú y precios", "admin_menu")],
-        [("💳 Pagos", "admin_payments")],
+    rows = []
+
+    # ---------------------------
+    # BLOQUE 1: OPERACIÓN
+    # ---------------------------
+    if not is_owner:
+        rows.append([
+            ("📦 Pedidos", "admin_order"),
+            ("💳 Pagos", "admin_payments"),
+        ])
+    else:
+        rows.append([
+            ("💳 Pagos", "admin_payments"),
+        ])
+
+    # ---------------------------
+    # BLOQUE 2: ANÁLISIS
+    # ---------------------------
+    rows.append([
+        ("📊 Estadísticas", "admin_stats"),
+        ("👥 Clientes", "admin_consumers"),
+    ])
+
+    rows.append([
+        ("📝 Encuestas", "admin_surveys"),
+    ])
+
+    # ---------------------------
+    # BLOQUE 3: CONFIGURACIÓN
+    # ---------------------------
+    rows.append([
+        ("🍔 Menú", "admin_menu"),
+        ("⏰ Horarios", "admin_hours"),
     ])
 
     return kb(rows)
 
 
 def admin_back_panel_kb(back_data: str):
+    """
+    Navegación consistente tipo app
+    """
     return kb([
         [("⬅️ Volver", back_data)],
-        [("⚙️ Panel", "admin_panel")],
+        [("🧭 Panel", "admin_panel")],
     ])
