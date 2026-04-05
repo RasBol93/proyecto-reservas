@@ -18,12 +18,6 @@ from app.menu import (
 from app.orders import (
     get_order_by_id,
     update_order_status,
-    parse_items_field if False else None,
-)
-from app.orders import (
-    append_order_row,
-    gen_order_id,
-    build_items_snapshot,
 )
 from app.telegram_api import telegram_send_text
 from app.telegram_keyboard import kb
