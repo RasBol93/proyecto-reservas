@@ -17,47 +17,15 @@ _ALERT_LAST_SENT_AT: Dict[str, float] = {}
 # cooldown por evento-clave
 ALERT_COOLDOWN_SECONDS = 60
 
+# housekeeping simple para evitar crecimiento infinito del cache
+_ALERT_CACHE_CLEANUP_EVERY = 200
+_ALERT_CACHE_STALE_AFTER_SECONDS = max(ALERT_COOLDOWN_SECONDS * 10, 3600)
+_alert_cache_ops_count = 0
+
 
 def _now_ts() -> float:
     return time.time()
 
-
-def _build_alert_key(event: str, tenant_id: str = "", order_id: str = "", extra_key: str = "") -> str:
-    return "|".join([
-        str(event or "").strip(),
-        str(tenant_id or "").strip(),
-        str(order_id or "").strip(),
-        str(extra_key or "").strip(),
-    ])
-
-
-def _should_send_alert(key: str, cooldown_seconds: int = ALERT_COOLDOWN_SECONDS) -> bool:
-    now = _now_ts()
-    last = _ALERT_LAST_SENT_AT.get(key)
-
-    if last is not None and (now - last) < cooldown_seconds:
-        return False
-
-    _ALERT_LAST_SENT_AT[key] = now
-    return True
-
-
-def alerts_cache_info() -> Dict[str, Any]:
-    return {
-        "tracked_keys": len(_ALERT_LAST_SENT_AT),
-        "cooldown_seconds": ALERT_COOLDOWN_SECONDS,
-        "keys": list(_ALERT_LAST_SENT_AT.keys())[:100],
-    }
-
-
-def reset_alerts_cache() -> Dict[str, Any]:
-    _ALERT_LAST_SENT_AT.clear()
-    return {"ok": True, "cleared": True}
-
-
-# =========================================================
-# FORMATTERS
-# =========================================================
 
 def _safe_str(v: Any) -> str:
     if v is None:
@@ -72,6 +40,67 @@ def _compact_error(error: Any, max_len: int = 500) -> str:
     return s[:max_len] + "..."
 
 
+def _build_alert_key(event: str, tenant_id: str = "", order_id: str = "", extra_key: str = "") -> str:
+    return "|".join([
+        _safe_str(event),
+        _safe_str(tenant_id),
+        _safe_str(order_id),
+        _safe_str(extra_key),
+    ])
+
+
+def _cleanup_alert_cache_if_needed() -> None:
+    global _alert_cache_ops_count
+
+    _alert_cache_ops_count += 1
+    if _alert_cache_ops_count % _ALERT_CACHE_CLEANUP_EVERY != 0:
+        return
+
+    now = _now_ts()
+    stale_before = now - _ALERT_CACHE_STALE_AFTER_SECONDS
+
+    stale_keys = [
+        key for key, ts in _ALERT_LAST_SENT_AT.items()
+        if ts < stale_before
+    ]
+    for key in stale_keys:
+        _ALERT_LAST_SENT_AT.pop(key, None)
+
+
+def _should_send_alert(key: str, cooldown_seconds: int = ALERT_COOLDOWN_SECONDS) -> bool:
+    _cleanup_alert_cache_if_needed()
+
+    now = _now_ts()
+    last = _ALERT_LAST_SENT_AT.get(key)
+
+    if last is not None and (now - last) < cooldown_seconds:
+        return False
+
+    _ALERT_LAST_SENT_AT[key] = now
+    return True
+
+
+def alerts_cache_info() -> Dict[str, Any]:
+    return {
+        "tracked_keys": len(_ALERT_LAST_SENT_AT),
+        "cooldown_seconds": ALERT_COOLDOWN_SECONDS,
+        "stale_after_seconds": _ALERT_CACHE_STALE_AFTER_SECONDS,
+        "cleanup_every_ops": _ALERT_CACHE_CLEANUP_EVERY,
+        "keys": list(_ALERT_LAST_SENT_AT.keys())[:100],
+    }
+
+
+def reset_alerts_cache() -> Dict[str, Any]:
+    global _alert_cache_ops_count
+    _ALERT_LAST_SENT_AT.clear()
+    _alert_cache_ops_count = 0
+    return {"ok": True, "cleared": True}
+
+
+# =========================================================
+# FORMATTERS
+# =========================================================
+
 def _format_extra_lines(**kwargs: Any) -> str:
     lines = []
     for k, v in kwargs.items():
@@ -85,7 +114,7 @@ def _format_extra_lines(**kwargs: Any) -> str:
 
 
 def _build_alert_text(title: str, message: str = "", **kwargs: Any) -> str:
-    parts = [f"🚨 {title}".strip()]
+    parts = [f"🚨 {_safe_str(title)}".strip()]
 
     msg = _safe_str(message)
     if msg:
@@ -117,13 +146,18 @@ def send_alert(
     No lanza excepción.
     """
 
+    safe_event = _safe_str(event)
+    safe_tenant_id = _safe_str(tenant_id)
+    safe_order_id = _safe_str(order_id)
+    safe_extra_key = _safe_str(extra_key)
+
     cfg = get_alert_config()
     if not cfg.get("enabled"):
         log_event(
             "alert_skipped_not_enabled",
-            event_name=event,
-            tenant_id=tenant_id,
-            order_id=order_id,
+            event_name=safe_event,
+            tenant_id=safe_tenant_id,
+            order_id=safe_order_id,
         )
         return {"ok": False, "reason": "alerts_not_enabled"}
 
@@ -133,25 +167,25 @@ def send_alert(
     if not bot_token or not chat_id:
         log_event(
             "alert_skipped_missing_config",
-            event_name=event,
-            tenant_id=tenant_id,
-            order_id=order_id,
+            event_name=safe_event,
+            tenant_id=safe_tenant_id,
+            order_id=safe_order_id,
         )
         return {"ok": False, "reason": "missing_alert_config"}
 
     key = _build_alert_key(
-        event=event,
-        tenant_id=tenant_id,
-        order_id=order_id,
-        extra_key=extra_key,
+        event=safe_event,
+        tenant_id=safe_tenant_id,
+        order_id=safe_order_id,
+        extra_key=safe_extra_key,
     )
 
     if not _should_send_alert(key, cooldown_seconds=cooldown_seconds):
         log_event(
             "alert_suppressed_cooldown",
-            event_name=event,
-            tenant_id=tenant_id,
-            order_id=order_id,
+            event_name=safe_event,
+            tenant_id=safe_tenant_id,
+            order_id=safe_order_id,
             alert_key=key,
         )
         return {"ok": False, "reason": "cooldown"}
@@ -160,9 +194,9 @@ def send_alert(
         text = _build_alert_text(
             title=title,
             message=message,
-            event=event,
-            tenant_id=tenant_id,
-            order_id=order_id,
+            event=safe_event,
+            tenant_id=safe_tenant_id,
+            order_id=safe_order_id,
             **kwargs,
         )
 
@@ -175,18 +209,18 @@ def send_alert(
         if sent:
             log_event(
                 "alert_sent",
-                event_name=event,
-                tenant_id=tenant_id,
-                order_id=order_id,
+                event_name=safe_event,
+                tenant_id=safe_tenant_id,
+                order_id=safe_order_id,
                 alert_key=key,
             )
             return {"ok": True, "sent": True}
 
         log_event(
             "alert_send_failed",
-            event_name=event,
-            tenant_id=tenant_id,
-            order_id=order_id,
+            event_name=safe_event,
+            tenant_id=safe_tenant_id,
+            order_id=safe_order_id,
             alert_key=key,
         )
         return {"ok": False, "reason": "telegram_send_failed"}
@@ -194,9 +228,9 @@ def send_alert(
     except Exception as e:
         log_event(
             "alert_send_exception",
-            event_name=event,
-            tenant_id=tenant_id,
-            order_id=order_id,
+            event_name=safe_event,
+            tenant_id=safe_tenant_id,
+            order_id=safe_order_id,
             error_type=type(e).__name__,
             error=_compact_error(e),
         )
