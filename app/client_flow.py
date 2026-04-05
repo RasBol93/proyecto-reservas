@@ -1,5 +1,6 @@
 # app/client_flow.py
 
+import json
 import time
 from typing import Any, Dict, List
 
@@ -69,6 +70,84 @@ from app.survey import (
     has_answered_survey_today,
     _normalize_phone,
 )
+
+
+# -------------------------------------------------
+# Anti-duplicación de pedidos
+# -------------------------------------------------
+
+_ORDER_DUPLICATION_GUARD_SECONDS = 120
+
+
+def _safe_json_dumps(v: Any) -> str:
+    try:
+        return json.dumps(v, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return ""
+
+
+def _build_order_creation_signature(
+    tenant_id: str,
+    chat_id: int,
+    customer_name: str,
+    customer_phone: str,
+    requested_time: str,
+    items_snapshot: List[Dict[str, Any]],
+) -> str:
+    payload = {
+        "tenant_id": str(tenant_id or "").strip(),
+        "chat_id": str(chat_id),
+        "customer_name": str(customer_name or "").strip(),
+        "customer_phone": str(customer_phone or "").strip(),
+        "requested_time": str(requested_time or "").strip(),
+        "items_snapshot": items_snapshot or [],
+    }
+    return _safe_json_dumps(payload)
+
+
+def _get_pending_order_from_session(sess: Dict[str, Any]) -> str:
+    tmp = sess.get("tmp") or {}
+    return str(tmp.get("pending_order_id") or "").strip()
+
+
+def _remember_created_order(
+    sess: Dict[str, Any],
+    order_id: str,
+    signature: str,
+) -> None:
+    tmp = sess.setdefault("tmp", {})
+    now_ts = int(time.time())
+
+    tmp["pending_order_id"] = str(order_id or "").strip()
+    tmp["last_created_order_id"] = str(order_id or "").strip()
+    tmp["last_created_order_signature"] = str(signature or "").strip()
+    tmp["last_created_order_ts"] = now_ts
+
+
+def _is_recent_duplicate_attempt(sess: Dict[str, Any], signature: str) -> bool:
+    tmp = sess.get("tmp") or {}
+    last_sig = str(tmp.get("last_created_order_signature") or "").strip()
+    last_ts = int(tmp.get("last_created_order_ts") or 0)
+    now_ts = int(time.time())
+
+    if not last_sig or not signature:
+        return False
+
+    if last_sig != signature:
+        return False
+
+    if last_ts <= 0:
+        return False
+
+    return (now_ts - last_ts) <= _ORDER_DUPLICATION_GUARD_SECONDS
+
+
+def _get_existing_pending_order_message(order_id: str) -> str:
+    return (
+        "⚠️ Ya tienes un pedido en proceso.\n\n"
+        f"Código de pedido: {order_id}\n\n"
+        "Primero envía el comprobante de ese pedido o vuelve a /start si deseas reiniciar."
+    )
 
 
 def build_dynamic_home_kb(content_map: Dict[str, str], orders_sh=None):
@@ -1240,6 +1319,51 @@ def handle_client_message(
             order_id = gen_order_id()
             requested_time = pickup_time_label or pickup_time_hhmm
 
+            # ---------------------------------
+            # Anti-duplicación de pedido
+            # ---------------------------------
+            pending_order_id = _get_pending_order_from_session(sess)
+            if pending_order_id:
+                existing_order = get_order_by_id(orders_sh, pending_order_id)
+                existing_status = str((existing_order or {}).get("status") or "").strip().upper()
+
+                if existing_order and existing_status in ("PENDING_PAYMENT", "PAID"):
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        _get_existing_pending_order_message(pending_order_id),
+                    )
+                    return {"ok": True}
+
+            creation_signature = _build_order_creation_signature(
+                tenant_id=tenant_id,
+                chat_id=chat_id,
+                customer_name=customer_name,
+                customer_phone=customer_phone,
+                requested_time=requested_time,
+                items_snapshot=items_snapshot,
+            )
+
+            if _is_recent_duplicate_attempt(sess, creation_signature):
+                duplicate_order_id = str((sess.get("tmp") or {}).get("last_created_order_id") or "").strip()
+                if duplicate_order_id:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        (
+                            "⚠️ Detecté que este pedido ya fue creado hace un momento.\n\n"
+                            f"Código de pedido: {duplicate_order_id}\n\n"
+                            "Para evitar duplicados, no volveré a crearlo."
+                        ),
+                    )
+                else:
+                    telegram_send_text(
+                        bot_token,
+                        chat_id,
+                        "⚠️ Detecté un intento duplicado de creación de pedido. No lo volveré a crear.",
+                    )
+                return {"ok": True}
+
             result = append_order_row(
                 orders_sh=orders_sh,
                 tenant_id=tenant_id,
@@ -1270,9 +1394,9 @@ def handle_client_message(
 
             sess["stage"] = "awaiting_proof"
             sess["tmp"] = sess.get("tmp") or {}
-            sess["tmp"]["pending_order_id"] = order_id
             sess["tmp"]["customer_name"] = customer_name
             sess["tmp"]["customer_phone"] = customer_phone
+            _remember_created_order(sess, order_id, creation_signature)
 
             recap = build_order_recap_text(
                 order_id=order_id,
