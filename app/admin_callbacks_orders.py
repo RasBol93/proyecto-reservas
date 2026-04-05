@@ -157,17 +157,19 @@ def _notify_client_order_paid(
 
     try:
         final_slot_for_msg = _safe_str(_extract_slot_hhmm(order_after.get("requested_time")))
+
         if final_slot_for_msg:
             msg_client = (
-                f"✅ Tu pedido ha sido confirmado.\n"
-                f"Código de pedido: {order_id}\n\n"
-                f"Hora de recojo: *{final_slot_for_msg}*."
+                "🟢 *PAGO CONFIRMADO*\n\n"
+                f"📦 Pedido: *{order_id}*\n"
+                f"⏰ Hora de recojo: *{final_slot_for_msg}*\n\n"
+                "Gracias por tu compra 🙌"
             )
         else:
             msg_client = (
-                f"✅ Tu pedido ha sido confirmado.\n"
-                f"Código de pedido: {order_id}\n\n"
-                "¡Gracias!"
+                "🟢 *PAGO CONFIRMADO*\n\n"
+                f"📦 Pedido: *{order_id}*\n\n"
+                "Gracias por tu compra 🙌"
             )
 
         _safe_send_text(
@@ -202,8 +204,9 @@ def _notify_owner_order_paid(
 
         recap_data = _build_paid_recap_from_order(order_id, order_after)
         owner_msg = (
-            "✅ *Pedido confirmado por el administrador.*\n\n"
-            f"{recap_data['recap']}"
+            "🟢 *VENTA CONFIRMADA*\n\n"
+            f"{recap_data['recap']}\n\n"
+            "💰 Pago validado correctamente."
         )
 
         _safe_send_text(
@@ -230,8 +233,21 @@ def _send_admin_paid_confirmation(
 ) -> None:
     if order_after:
         recap_data = _build_paid_recap_from_order(order_id, order_after)
-        prefix = "✅ *Este pedido ya estaba confirmado.*" if already_paid else "✅ *Pago confirmado correctamente.*"
-        admin_msg = f"{prefix}\n\n{recap_data['recap']}"
+
+        if already_paid:
+            header = "🟡 *PEDIDO YA CONFIRMADO*"
+            footer = "ℹ️ Este pedido ya había sido validado anteriormente."
+        else:
+            header = "🟢 *PAGO CONFIRMADO*"
+            footer = "✔️ Estado actualizado correctamente."
+
+        admin_msg = (
+            f"{header}\n\n"
+            f"📦 *Detalle del pedido*\n\n"
+            f"{recap_data['recap']}\n\n"
+            f"{footer}"
+        )
+
         _safe_send_text(
             bot_token,
             chat_id,
@@ -243,13 +259,15 @@ def _send_admin_paid_confirmation(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                f"✅ El pedido con código de pedido {order_id} ya estaba confirmado.",
+                f"🟡 Pedido *{order_id}* ya estaba confirmado.",
+                parse_mode="Markdown",
             )
         else:
             _safe_send_text(
                 bot_token,
                 chat_id,
-                f"✅ El pedido con código de pedido {order_id} ha sido confirmado.",
+                f"🟢 Pedido *{order_id}* confirmado correctamente.",
+                parse_mode="Markdown",
             )
 
 
@@ -285,7 +303,8 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "🚫 Esta opción no está disponible para el propietario.",
+                "🚫 *Acceso restringido*\n\nEsta opción no está disponible para el propietario.",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -312,7 +331,8 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No llegó el código de pedido.",
+                "⚠️ *Pago no procesado*\n\nNo llegó el código de pedido.",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -321,7 +341,8 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⏳ Este pedido ya se está procesando. Intenta en unos segundos.",
+                "⏳ *Procesando pedido*\n\nEste pedido ya se está procesando. Intenta en unos segundos.",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -331,7 +352,8 @@ def handle_admin_orders_callback(
                 _safe_send_text(
                     bot_token,
                     chat_id,
-                    f"⚠️ Pedido {order_id} no encontrado en Sheets.",
+                    f"⚠️ *Pedido no encontrado*\n\nNo encontré el pedido *{order_id}* en Sheets.",
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -360,7 +382,12 @@ def handle_admin_orders_callback(
                 _safe_send_text(
                     bot_token,
                     chat_id,
-                    f"⚠️ No se puede confirmar el pago porque el pedido está en estado: {status_before or 'SIN ESTADO'}.",
+                    (
+                        "⚠️ *Pago no permitido*\n\n"
+                        "No se puede confirmar este pago porque el pedido está en el estado:\n"
+                        f"*{status_before or 'SIN ESTADO'}*."
+                    ),
+                    parse_mode="Markdown",
                 )
                 log_event(
                     "admin_paid_invalid_transition",
@@ -382,7 +409,8 @@ def handle_admin_orders_callback(
                 _safe_send_text(
                     bot_token,
                     chat_id,
-                    "⚠️ Error actualizando el estado.",
+                    "⚠️ *Pago no procesado*\n\nOcurrió un error actualizando el estado.",
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -390,7 +418,8 @@ def handle_admin_orders_callback(
                 _safe_send_text(
                     bot_token,
                     chat_id,
-                    f"⚠️ Pedido {order_id} no encontrado en Sheets.",
+                    f"⚠️ *Pedido no encontrado*\n\nNo encontré el pedido *{order_id}* en Sheets.",
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -408,7 +437,11 @@ def handle_admin_orders_callback(
                 _safe_send_text(
                     bot_token,
                     chat_id,
-                    "⚠️ El sistema no pudo verificar correctamente el estado final del pedido.",
+                    (
+                        "⚠️ *Verificación incompleta*\n\n"
+                        "El sistema no pudo verificar correctamente el estado final del pedido."
+                    ),
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -449,7 +482,8 @@ def handle_admin_orders_callback(
         _safe_send_text(
             bot_token,
             chat_id,
-            "🚫 Esta opción no está disponible para el propietario.",
+            "🚫 *Acceso restringido*\n\nEsta opción no está disponible para el propietario.",
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -479,8 +513,9 @@ def handle_admin_orders_callback(
         _safe_send_text(
             bot_token,
             chat_id,
-            "🧭 PANEL ADMIN\n\nElige una opción:",
+            "🧭 *PANEL ADMIN*\n\nGestiona tu negocio desde aquí.",
             reply_markup=admin_panel_kb(user_role=user_role),
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -524,7 +559,8 @@ def handle_admin_orders_callback(
         _safe_send_text(
             bot_token,
             chat_id,
-            f"✅ Agregado al pedido: {qty} x {item.get('name', '')}",
+            f"✅ *Producto agregado*\n\n{qty} x {item.get('name', '')}",
+            parse_mode="Markdown",
         )
         return {"ok": _send_admin_order_cart(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
@@ -551,7 +587,8 @@ def handle_admin_orders_callback(
         _safe_send_text(
             bot_token,
             chat_id,
-            "🧹 Carrito manual vaciado.",
+            "🧹 *Carrito vaciado correctamente.*",
+            parse_mode="Markdown",
         )
         return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
@@ -561,7 +598,8 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ El carrito está vacío.",
+                "⚠️ *Carrito vacío*\n\nAgrega productos antes de continuar.",
+                parse_mode="Markdown",
             )
             return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
@@ -569,7 +607,8 @@ def handle_admin_orders_callback(
         _safe_send_text(
             bot_token,
             chat_id,
-            "Escribe el nombre del cliente:",
+            "👤 *Paso 1 de 3*\n\nEscribe el nombre del cliente:",
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -589,7 +628,8 @@ def handle_admin_orders_callback(
         _safe_send_text(
             bot_token,
             chat_id,
-            "Escribe la hora solicitada.\nEjemplos: 19:30, 20h",
+            "⏰ *Paso final*\n\nEscribe la hora solicitada.\nEjemplos: 19:30, 20h",
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -599,7 +639,8 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No encontré el pedido recién creado.",
+                "⚠️ *Pedido no encontrado*\n\nNo encontré el pedido recién creado.",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -609,7 +650,8 @@ def handle_admin_orders_callback(
         _safe_send_text(
             bot_token,
             chat_id,
-            f"📷 Envía la foto del comprobante para el pedido {last_order_id}.",
+            f"📷 *Comprobante requerido*\n\nEnvía la foto del comprobante para el pedido *{last_order_id}*.",
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -618,18 +660,20 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ Aún no recibí la foto del comprobante.",
+                "⚠️ *Comprobante pendiente*\n\nAún no recibí la foto del comprobante.",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
         _safe_send_text(
             bot_token,
             chat_id,
-            "✅ Fotografía confirmada. Ahora puedes abrir la encuesta.",
+            "✅ *Comprobante validado*\n\nAhora puedes abrir la encuesta.",
             reply_markup=kb([
                 [("📝 Encuesta", f"admord|{tenant_id}|survey")],
                 [("🧭 Panel admin", "admin_panel")],
             ]),
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -639,7 +683,8 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No hay preguntas activas configuradas para la encuesta.",
+                "⚠️ *Encuesta no disponible*\n\nNo hay preguntas activas configuradas.",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -650,7 +695,8 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No encontré el número del cliente del pedido.",
+                "⚠️ *Datos incompletos*\n\nNo encontré el número del cliente del pedido.",
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -661,15 +707,15 @@ def handle_admin_orders_callback(
         tmp["admin_survey_phone"] = customer_phone
         tmp["admin_survey_name"] = customer_name
 
-        intro = "📝 Iniciaremos la encuesta del cliente."
+        intro = "📝 *ENCUESTA DEL CLIENTE*\n\nIniciaremos la encuesta con los datos del pedido ya registrado."
         if reward_text:
-            intro += f"\n🎁 Recompensa configurada: {reward_text}"
-        intro += "\n\nUsaremos los datos del pedido ya registrado."
+            intro += f"\n\n🎁 Recompensa configurada:\n{reward_text}"
 
         _safe_send_text(
             bot_token,
             chat_id,
             intro,
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -681,8 +727,9 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No pude leer esa calificación.",
+                "⚠️ *Respuesta inválida*\n\nNo pude leer esa calificación.",
                 reply_markup=admin_fixed_kb(),
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -690,8 +737,9 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ La calificación debe estar entre 1 y 5.",
+                "⚠️ *Calificación inválida*\n\nDebe estar entre 1 y 5.",
                 reply_markup=admin_fixed_kb(),
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -699,8 +747,9 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No hay una encuesta activa en este momento.",
+                "⚠️ *Encuesta inactiva*\n\nNo hay una encuesta activa en este momento.",
                 reply_markup=admin_fixed_kb(),
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -710,8 +759,9 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ Error en el flujo de encuesta.",
+                "⚠️ *Error de flujo*\n\nSe perdió el estado de la encuesta.",
                 reply_markup=admin_fixed_kb(),
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -721,8 +771,9 @@ def handle_admin_orders_callback(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ Esta pregunta no es de estrellas.",
+                "⚠️ *Tipo de pregunta inválido*\n\nEsta pregunta no es de estrellas.",
                 reply_markup=admin_fixed_kb(),
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
