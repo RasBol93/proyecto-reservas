@@ -2,6 +2,7 @@
 
 import json
 import re
+import time
 import urllib.parse
 from typing import Any, Dict, Optional, List, Tuple
 
@@ -20,17 +21,64 @@ SESSIONS: Dict[Tuple[str, int], Dict[str, Any]] = {}
 REMINDER_COOLDOWN_SECONDS = 5 * 60
 CONTACT_AFTER_SECONDS = 10 * 60  # 5 min cooldown + 5 min extra
 
+# housekeeping simple para evitar crecimiento infinito
+_SESSION_LAST_TOUCH: Dict[Tuple[str, int], float] = {}
+_SESSION_TTL_SECONDS = 6 * 60 * 60  # 6 horas
+_SESSION_CLEANUP_EVERY = 200
+_SESSION_OPS = 0
+
+
+def _safe_session_key(tenant_id: str, chat_id: int) -> Tuple[str, int]:
+    try:
+        return (str(tenant_id or ""), int(chat_id))
+    except Exception:
+        return (str(tenant_id or ""), 0)
+
+
+def _touch_session_key(key: Tuple[str, int]) -> None:
+    _SESSION_LAST_TOUCH[key] = time.time()
+
+
+def _cleanup_sessions_if_needed() -> None:
+    global _SESSION_OPS
+    _SESSION_OPS += 1
+
+    if _SESSION_OPS % _SESSION_CLEANUP_EVERY != 0:
+        return
+
+    now = time.time()
+    stale_before = now - _SESSION_TTL_SECONDS
+
+    stale_keys = [k for k, ts in _SESSION_LAST_TOUCH.items() if ts < stale_before]
+    for k in stale_keys:
+        SESSIONS.pop(k, None)
+        _SESSION_LAST_TOUCH.pop(k, None)
+
 
 def get_sess(tenant_id: str, chat_id: int) -> Dict[str, Any]:
-    key = (tenant_id, chat_id)
-    if key not in SESSIONS:
+    key = _safe_session_key(tenant_id, chat_id)
+    if key not in SESSIONS or not isinstance(SESSIONS.get(key), dict):
         SESSIONS[key] = {"cart": [], "stage": "idle", "tmp": {}}
-    return SESSIONS[key]
+
+    sess = SESSIONS[key]
+
+    if not isinstance(sess.get("cart"), list):
+        sess["cart"] = []
+    if not isinstance(sess.get("stage"), str):
+        sess["stage"] = "idle"
+    if not isinstance(sess.get("tmp"), dict):
+        sess["tmp"] = {}
+
+    _touch_session_key(key)
+    _cleanup_sessions_if_needed()
+    return sess
 
 
 def clear_sess(tenant_id: str, chat_id: int) -> None:
-    key = (tenant_id, chat_id)
+    key = _safe_session_key(tenant_id, chat_id)
     SESSIONS[key] = {"cart": [], "stage": "idle", "tmp": {}}
+    _touch_session_key(key)
+    _cleanup_sessions_if_needed()
 
 
 def get_admin_bot_token(tenant: Dict[str, Any]) -> str:
@@ -267,7 +315,28 @@ def extract_first_number(text: str) -> Optional[float]:
 
 def get_business_status_safe(orders_sh, tenant_tz: str) -> Dict[str, Any]:
     try:
-        return resolve_business_status(orders_sh=orders_sh, tenant_tz=tenant_tz).__dict__
+        res = resolve_business_status(orders_sh=orders_sh, tenant_tz=tenant_tz)
+        if hasattr(res, "__dict__"):
+            return res.__dict__
+        if isinstance(res, dict):
+            return res
+        return {
+            "tenant_tz": tenant_tz,
+            "now_local_iso": "",
+            "today_weekday_code": "",
+            "is_open_today": True,
+            "accepts_orders_now": True,
+            "open_time": "",
+            "close_time": "",
+            "last_order_time": "",
+            "weekly_open_days": [],
+            "today_closed": False,
+            "today_open_force": False,
+            "has_open_override": False,
+            "has_close_override": False,
+            "has_last_order_override": False,
+            "public_message": "",
+        }
     except Exception as e:
         log_event("business_status_resolve_failed", error=str(e), tenant_tz=tenant_tz)
         return {
@@ -328,8 +397,16 @@ def contact_link_for_admin(tenant: Dict[str, Any]) -> Optional[str]:
 
 
 def set_menu_photo_url(orders_sh, sku: str, photo_url: str) -> bool:
-    ws = orders_sh.worksheet("Menu")
-    values = ws.get_all_values()
+    try:
+        ws = orders_sh.worksheet("Menu")
+    except Exception:
+        return False
+
+    try:
+        values = ws.get_all_values()
+    except Exception:
+        return False
+
     if not values:
         return False
 
@@ -338,26 +415,36 @@ def set_menu_photo_url(orders_sh, sku: str, photo_url: str) -> bool:
         required_headers=["sku", "name", "price", "active", "category"],
         max_scan=10,
     )
-    header = values[header_row_1based - 1]
-
-    try:
-        sku_col = header.index("sku") + 1
-    except ValueError:
+    if header_row_1based < 1 or header_row_1based > len(values):
         return False
 
-    try:
-        photo_col = header.index("photo_url") + 1
-    except ValueError:
+    header = values[header_row_1based - 1]
+    header_norm = [normalize(h) for h in header]
+
+    def _find_col(header_norm_list: List[str], key: str) -> Optional[int]:
+        nk = normalize(key)
+        for idx, h in enumerate(header_norm_list):
+            if h == nk:
+                return idx + 1  # 1-based
+        return None
+
+    sku_col = _find_col(header_norm, "sku")
+    if sku_col is None:
+        return False
+
+    photo_col = _find_col(header_norm, "photo_url")
+    if photo_col is None:
         photo_col = len(header) + 1
         ws.update_cell(header_row_1based, photo_col, "photo_url")
         header.append("photo_url")
+        header_norm.append("photo_url")
 
     found = False
     for i in range(header_row_1based + 1, len(values) + 1):
         row = values[i - 1]
         sku_val = row[sku_col - 1] if len(row) >= sku_col else ""
         if str(sku_val).strip() == sku:
-            ws.update_cell(i, photo_col, photo_url)
+            ws.update_cell(i, photo_col, str(photo_url or "").strip())
             found = True
             break
 
