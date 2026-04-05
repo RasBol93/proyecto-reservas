@@ -6,7 +6,7 @@ import time
 from fastapi import HTTPException
 
 from app.config import TENANTS_SHEET_NAME
-from app.sheets import get_gspread_client, open_config_spreadsheet
+from app.sheets import get_gspread_client, open_config_spreadsheet, invalidate_sheet_caches
 from app.utils import now_iso_utc, to_bool, normalize, log_event
 
 
@@ -29,6 +29,22 @@ def tenants_cache_info() -> Dict[str, Any]:
         "tenant_ids": list(_TENANTS_CACHE.keys()),
         "ttl_seconds": TENANTS_CACHE_TTL_SECONDS,
     }
+
+
+def invalidate_tenants_cache() -> None:
+    global _TENANTS_CACHE, _TENANTS_CACHE_AT, _TENANTS_CACHE_AT_TS
+    _TENANTS_CACHE = {}
+    _TENANTS_CACHE_AT = None
+    _TENANTS_CACHE_AT_TS = None
+
+
+def invalidate_all_tenant_related_caches() -> None:
+    """
+    Invalida cache de tenants y también el layer de sheets/config.
+    Útil cuando cambia configuración viva.
+    """
+    invalidate_tenants_cache()
+    invalidate_sheet_caches(None)
 
 
 # -------------------------
@@ -55,7 +71,7 @@ def _detect_header_row(values: List[List[str]], required_headers: List[str], max
         return 0
 
     req = [normalize(h) for h in required_headers if h]
-    scan = values[:max_scan]
+    scan = values[:max_scan] if max_scan > 0 else values
 
     for idx, row in enumerate(scan):
         row_norm = [normalize(x) for x in row]
@@ -144,6 +160,9 @@ def _get_tenants_values_and_header(ws) -> Tuple[List[List[str]], int, List[str],
         values,
         required_headers=["tenant_id", "orders_sheet_id", "active"]
     )
+    if header_idx < 0 or header_idx >= len(values):
+        return values, 0, [], []
+
     headers_raw = values[header_idx] if header_idx < len(values) else []
     headers_norm = [normalize(h) for h in headers_raw]
     return values, header_idx, headers_raw, headers_norm
@@ -174,6 +193,9 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
     global _TENANTS_CACHE, _TENANTS_CACHE_AT, _TENANTS_CACHE_AT_TS
 
     try:
+        if force:
+            invalidate_tenants_cache()
+
         if not force and _cache_is_fresh():
             return _TENANTS_CACHE
 
@@ -199,6 +221,9 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
             values,
             required_headers=["tenant_id", "orders_sheet_id", "active"]
         )
+        if header_idx < 0 or header_idx >= len(values):
+            raise HTTPException(status_code=500, detail="Invalid TENANTS header row")
+
         headers_raw = values[header_idx]
         headers_norm = [normalize(h) for h in headers_raw]
         get = _build_row_getter(headers_norm)
@@ -427,7 +452,8 @@ def update_tenant_payment_qr(tenant_id: str, qr_url: str, gc=None) -> bool:
 
         ws.update_cell(target_sheet_row, qr_col + 1, qr_url)
 
-        # Refrescar cache
+        # Refrescar cache de configuración
+        invalidate_all_tenant_related_caches()
         load_tenants(gc=gc, force=True)
 
         try:
