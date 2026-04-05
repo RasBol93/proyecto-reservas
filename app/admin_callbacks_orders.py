@@ -1,6 +1,7 @@
 # app/admin_callbacks_orders.py
 
 from typing import Any, Dict, Optional
+import time
 
 from fastapi import HTTPException
 
@@ -54,6 +55,38 @@ from app.survey import (
     get_survey_reward_text,
     get_runtime_survey_questions,
 )
+
+
+# -------------------------------------------------
+# Soft lock en memoria para evitar doble confirmación
+# dentro del mismo proceso / worker.
+# No cambia contratos y reduce race conditions locales.
+# -------------------------------------------------
+
+_PAID_LOCKS: Dict[str, float] = {}
+_PAID_LOCK_TTL_SECONDS = 30
+
+
+def _cleanup_paid_locks() -> None:
+    now = time.time()
+    stale = [order_id for order_id, ts in _PAID_LOCKS.items() if (now - ts) > _PAID_LOCK_TTL_SECONDS]
+    for order_id in stale:
+        _PAID_LOCKS.pop(order_id, None)
+
+
+def _acquire_paid_lock(order_id: str) -> bool:
+    _cleanup_paid_locks()
+    clean_order_id = str(order_id or "").strip()
+    if not clean_order_id:
+        return False
+    if clean_order_id in _PAID_LOCKS:
+        return False
+    _PAID_LOCKS[clean_order_id] = time.time()
+    return True
+
+
+def _release_paid_lock(order_id: str) -> None:
+    _PAID_LOCKS.pop(str(order_id or "").strip(), None)
 
 
 def _safe_send_text(
@@ -220,6 +253,20 @@ def _send_admin_paid_confirmation(
             )
 
 
+def _normalize_status(value: Any) -> str:
+    return _safe_str(value).strip().upper()
+
+
+def _is_paid_transition_allowed(current_status: str) -> bool:
+    """
+    Reglas actuales:
+    - PENDING_PAYMENT -> PAID : permitido
+    - PAID -> PAID : idempotente, no reescribe
+    - cualquier otro estado: bloqueado
+    """
+    return current_status == "PENDING_PAYMENT"
+
+
 def handle_admin_orders_callback(
     tenant: Dict[str, Any],
     tenant_id: str,
@@ -269,90 +316,128 @@ def handle_admin_orders_callback(
             )
             return {"ok": True}
 
-        order_before = get_order_by_id(orders_sh, order_id)
-        if not order_before:
+        # soft lock local para evitar doble click / doble ejecución concurrente
+        if not _acquire_paid_lock(order_id):
             _safe_send_text(
                 bot_token,
                 chat_id,
-                f"⚠️ Pedido {order_id} no encontrado en Sheets.",
+                "⏳ Este pedido ya se está procesando. Intenta en unos segundos.",
             )
             return {"ok": True}
 
-        status_before = _safe_str(order_before.get("status")).upper()
-        already_paid = status_before == "PAID"
+        try:
+            order_before = get_order_by_id(orders_sh, order_id)
+            if not order_before:
+                _safe_send_text(
+                    bot_token,
+                    chat_id,
+                    f"⚠️ Pedido {order_id} no encontrado en Sheets.",
+                )
+                return {"ok": True}
 
-        if already_paid:
-            order_after = order_before
+            status_before = _normalize_status(order_before.get("status"))
+            already_paid = status_before == "PAID"
+
+            # idempotencia real: si ya estaba PAID, no reescribimos ni duplicamos notificaciones
+            if already_paid:
+                _send_admin_paid_confirmation(
+                    bot_token=bot_token,
+                    chat_id=chat_id,
+                    order_id=order_id,
+                    order_after=order_before,
+                    already_paid=True,
+                )
+                log_event(
+                    "admin_paid_idempotent_hit",
+                    tenant_id=tenant_id,
+                    order_id=order_id,
+                    chat_id=chat_id,
+                )
+                return {"ok": True}
+
+            # validación explícita de transición
+            if not _is_paid_transition_allowed(status_before):
+                _safe_send_text(
+                    bot_token,
+                    chat_id,
+                    f"⚠️ No se puede confirmar el pago porque el pedido está en estado: {status_before or 'SIN ESTADO'}.",
+                )
+                log_event(
+                    "admin_paid_invalid_transition",
+                    tenant_id=tenant_id,
+                    order_id=order_id,
+                    chat_id=chat_id,
+                    current_status=status_before,
+                )
+                return {"ok": True}
+
+            res = update_order_status(orders_sh, order_id, "PAID")
+            if not res.get("ok"):
+                alert_order_status_failed(
+                    tenant_id=tenant_id,
+                    order_id=order_id,
+                    new_status="PAID",
+                    error=res.get("error") or "update_order_status failed",
+                )
+                _safe_send_text(
+                    bot_token,
+                    chat_id,
+                    "⚠️ Error actualizando el estado.",
+                )
+                return {"ok": True}
+
+            if not res.get("found"):
+                _safe_send_text(
+                    bot_token,
+                    chat_id,
+                    f"⚠️ Pedido {order_id} no encontrado en Sheets.",
+                )
+                return {"ok": True}
+
+            order_after = get_order_by_id(orders_sh, order_id)
+            status_after = _normalize_status((order_after or {}).get("status"))
+
+            if status_after != "PAID":
+                log_event(
+                    "admin_paid_postcheck_failed",
+                    tenant_id=tenant_id,
+                    order_id=order_id,
+                    chat_id=chat_id,
+                    status_after=status_after,
+                )
+                _safe_send_text(
+                    bot_token,
+                    chat_id,
+                    "⚠️ El sistema no pudo verificar correctamente el estado final del pedido.",
+                )
+                return {"ok": True}
+
             _send_admin_paid_confirmation(
                 bot_token=bot_token,
                 chat_id=chat_id,
                 order_id=order_id,
                 order_after=order_after,
-                already_paid=True,
+                already_paid=False,
             )
 
-            _notify_client_order_paid(
-                tenant=tenant,
-                tenant_id=tenant_id,
-                order_id=order_id,
-                order_after=order_after,
-            )
-            _notify_owner_order_paid(
-                tenant=tenant,
-                tenant_id=tenant_id,
-                order_id=order_id,
-                order_after=order_after,
-            )
+            if order_after:
+                _notify_client_order_paid(
+                    tenant=tenant,
+                    tenant_id=tenant_id,
+                    order_id=order_id,
+                    order_after=order_after,
+                )
+                _notify_owner_order_paid(
+                    tenant=tenant,
+                    tenant_id=tenant_id,
+                    order_id=order_id,
+                    order_after=order_after,
+                )
+
             return {"ok": True}
 
-        res = update_order_status(orders_sh, order_id, "PAID")
-        if not res.get("ok"):
-            alert_order_status_failed(
-                tenant_id=tenant_id,
-                order_id=order_id,
-                new_status="PAID",
-                error=res.get("error") or "update_order_status failed",
-            )
-            _safe_send_text(
-                bot_token,
-                chat_id,
-                "⚠️ Error actualizando el estado.",
-            )
-            return {"ok": True}
-
-        if not res.get("found"):
-            _safe_send_text(
-                bot_token,
-                chat_id,
-                f"⚠️ Pedido {order_id} no encontrado en Sheets.",
-            )
-            return {"ok": True}
-
-        order_after = get_order_by_id(orders_sh, order_id)
-
-        _send_admin_paid_confirmation(
-            bot_token=bot_token,
-            chat_id=chat_id,
-            order_id=order_id,
-            order_after=order_after,
-            already_paid=False,
-        )
-
-        if order_after:
-            _notify_client_order_paid(
-                tenant=tenant,
-                tenant_id=tenant_id,
-                order_id=order_id,
-                order_after=order_after,
-            )
-            _notify_owner_order_paid(
-                tenant=tenant,
-                tenant_id=tenant_id,
-                order_id=order_id,
-                order_after=order_after,
-            )
-
-        return {"ok": True}
+        finally:
+            _release_paid_lock(order_id)
 
     if not data.startswith("admord|"):
         return None
