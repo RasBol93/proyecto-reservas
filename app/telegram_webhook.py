@@ -9,7 +9,7 @@ from app.tenants import get_tenant_or_404, resolve_bot_by_secret
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
 from app.telegram_api import telegram_answer_callback, telegram_send_text
 from app.utils import normalize, log_event
-from app.webhook_helpers import safe_int
+from app.webhook_helpers import safe_int, rate_limit_allow
 from app.client_flow import handle_client_callback, handle_client_message
 from app.admin_flow import handle_admin_callback, handle_admin_message
 from app.alerts import alert_webhook_error, alert_tenant_error, alert_sheet_error
@@ -33,6 +33,18 @@ def _get_orders_sheet_cached(gc, sheet_id):
     return sh
 
 
+def invalidate_webhook_sheet_cache(sheet_id: str | None = None) -> None:
+    if sheet_id is None:
+        _SHEET_CACHE.clear()
+        return
+
+    clean_sheet_id = str(sheet_id or "").strip()
+    if not clean_sheet_id:
+        return
+
+    _SHEET_CACHE.pop(clean_sheet_id, None)
+
+
 @router.post("/telegram/webhook/{tenant_id}/{secret}")
 async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
     mode = ""
@@ -41,6 +53,8 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
 
     try:
         tenant_id = (tenant_id or "").strip()
+        secret = (secret or "").strip()
+
         if not tenant_id:
             return {"ok": True}
 
@@ -109,6 +123,17 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
                 log_event("webhook_callback_missing_chat_id", tenant_id=tenant_id, mode=mode, data=data)
                 return {"ok": True}
 
+            # rate limit defensivo para callback spam
+            if not rate_limit_allow(tenant_id, chat_id, f"callback:{mode}", limit=20, window_seconds=10):
+                log_event(
+                    "webhook_callback_rate_limited",
+                    tenant_id=tenant_id,
+                    mode=mode,
+                    chat_id=chat_id,
+                    data=data,
+                )
+                return {"ok": True}
+
             if cb_id:
                 try:
                     telegram_answer_callback(bot_token, cb_id, "OK")
@@ -159,6 +184,16 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
             chat_id = safe_int((msg.get("chat") or {}).get("id"))
             if chat_id is None:
                 log_event("webhook_message_missing_chat_id", tenant_id=tenant_id, mode=mode)
+                return {"ok": True}
+
+            # rate limit defensivo para spam de mensajes
+            if not rate_limit_allow(tenant_id, chat_id, f"message:{mode}", limit=12, window_seconds=10):
+                log_event(
+                    "webhook_message_rate_limited",
+                    tenant_id=tenant_id,
+                    mode=mode,
+                    chat_id=chat_id,
+                )
                 return {"ok": True}
 
             text = (msg.get("text") or "").strip()
