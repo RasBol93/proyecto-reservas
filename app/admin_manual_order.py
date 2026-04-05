@@ -1,4 +1,5 @@
-# app/admin_manual_order.py — versión UX mejorada (tipo app) SIN cambiar lógica
+# app/admin_manual_order.py — versión completa compatible, optimizada, con carrito editable
+# y UX mejorada tipo app, SIN romper imports ni contratos
 
 from typing import Any, Dict, List, Tuple
 
@@ -57,6 +58,27 @@ def _admin_order_reset(tmp: Dict[str, Any]) -> None:
     tmp.pop("admin_order_categories", None)
     tmp.pop("admin_order_current_category", None)
     tmp.pop("admin_order_menu_cache", None)
+
+
+# -------------------------------------------------
+# COMPAT HELPERS
+# -------------------------------------------------
+
+def _admin_order_get_active_categories(orders_sh) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]], List[str]]:
+    """
+    Se mantiene por compatibilidad con admin_callbacks_orders.py
+    """
+    menu_idx = load_menu_admin_index(orders_sh, force=False)
+    cats_raw = group_menu_admin_by_category(menu_idx)
+
+    cats_active: Dict[str, List[Dict[str, Any]]] = {}
+    for cat, items in cats_raw.items():
+        only_active = [it for it in items if bool(it.get("active", False))]
+        if only_active:
+            cats_active[cat] = only_active
+
+    cat_names = sorted(cats_active.keys(), key=lambda x: normalize(x))
+    return menu_idx, cats_active, cat_names
 
 
 # -------------------------------------------------
@@ -235,6 +257,19 @@ def _admin_order_remove_item(tmp: Dict[str, Any], sku: str) -> None:
 
 
 # -------------------------------------------------
+# TIME CHOICE
+# -------------------------------------------------
+
+def _admin_order_time_choice_kb(tenant_id: str) -> Dict[str, Any]:
+    return kb([
+        [("🕒 Ahora", f"admord|{tenant_id}|timenow")],
+        [("⏰ Más tarde", f"admord|{tenant_id}|timelater")],
+        [("🛒 Volver al carrito", f"admord|{tenant_id}|cart")],
+        [("❌ Cancelar", f"admord|{tenant_id}|panel")],
+    ])
+
+
+# -------------------------------------------------
 # CART VIEW
 # -------------------------------------------------
 
@@ -244,7 +279,10 @@ def _admin_order_cart_kb(tenant_id: str, items_snapshot: List[Dict[str, Any]], h
     for it in items_snapshot:
         sku = str(it.get("sku") or "").strip()
         name = str(it.get("name") or sku).strip()
-        qty = int(it.get("qty") or 1)
+        try:
+            qty = int(it.get("qty") or 1)
+        except Exception:
+            qty = 1
 
         rows.append([(f"{name} x{qty}", f"admord|{tenant_id}|noop")])
         rows.append([
