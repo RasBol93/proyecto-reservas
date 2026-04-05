@@ -19,6 +19,81 @@ _MENU_ADMIN_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 
 MENU_CACHE_TTL_SECONDS = 90
 
+# Retry simple y corto para operaciones de red/Sheets
+_MENU_RETRY_ATTEMPTS = 3
+_MENU_RETRY_SLEEP_SECONDS = 0.30
+
+
+# -------------------------
+# Retry helpers
+# -------------------------
+
+def _should_retry_exception(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    retry_signals = (
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "remote end closed connection",
+        "service unavailable",
+        "internal error",
+        "bad gateway",
+        "gateway timeout",
+        "rate limit",
+        "quota",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+    )
+    return any(signal in msg for signal in retry_signals)
+
+
+def _sleep_before_retry(attempt_index: int) -> None:
+    try:
+        time.sleep(_MENU_RETRY_SLEEP_SECONDS * max(1, attempt_index))
+    except Exception:
+        pass
+
+
+def _call_with_retry(fn, *, op_name: str, log_fields: Optional[Dict[str, Any]] = None):
+    last_exc: Exception | None = None
+    extra = dict(log_fields or {})
+
+    for attempt in range(1, _MENU_RETRY_ATTEMPTS + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+
+            try:
+                log_event(
+                    "menu_retryable_error",
+                    op_name=op_name,
+                    attempt=attempt,
+                    max_attempts=_MENU_RETRY_ATTEMPTS,
+                    retry=bool(attempt < _MENU_RETRY_ATTEMPTS and _should_retry_exception(e)),
+                    error_type=type(e).__name__,
+                    error=str(e),
+                    **extra,
+                )
+            except Exception:
+                pass
+
+            if attempt >= _MENU_RETRY_ATTEMPTS or not _should_retry_exception(e):
+                break
+
+            _sleep_before_retry(attempt)
+
+    if last_exc is not None:
+        raise last_exc
+
+    raise RuntimeError(f"{op_name} failed without exception")
+
 
 # -------------------------
 # Internals
@@ -26,7 +101,11 @@ MENU_CACHE_TTL_SECONDS = 90
 
 def _ws_has_required_headers(ws, required_headers: List[str], max_scan_rows: int = 10) -> bool:
     try:
-        values = ws.get_all_values()
+        values = _call_with_retry(
+            lambda: ws.get_all_values(),
+            op_name="menu._ws_has_required_headers.get_all_values",
+            log_fields={"worksheet_title": getattr(ws, "title", "")},
+        )
     except Exception as e:
         alert_system_error(error=str(e), module="menu._ws_has_required_headers")
         return False
@@ -47,7 +126,11 @@ def _ws_has_required_headers(ws, required_headers: List[str], max_scan_rows: int
 
 def _find_menu_ws_by_headers(orders_sh) -> Optional[Any]:
     try:
-        for ws in orders_sh.worksheets():
+        worksheets = _call_with_retry(
+            lambda: orders_sh.worksheets(),
+            op_name="menu._find_menu_ws_by_headers.worksheets",
+        )
+        for ws in worksheets:
             if _ws_has_required_headers(ws, REQUIRED_MENU_HEADERS):
                 return ws
     except Exception as e:
@@ -132,6 +215,11 @@ def invalidate_menu_cache(orders_sh) -> None:
     _cache_invalidate(_MENU_ADMIN_CACHE, ck)
 
 
+def invalidate_all_menu_caches() -> None:
+    _MENU_CACHE.clear()
+    _MENU_ADMIN_CACHE.clear()
+
+
 def _get_menu_ws(orders_sh):
     ws = None
 
@@ -162,7 +250,11 @@ def _get_menu_context(orders_sh) -> Dict[str, Any]:
     ws = _get_menu_ws(orders_sh)
 
     try:
-        values = ws.get_all_values()
+        values = _call_with_retry(
+            lambda: ws.get_all_values(),
+            op_name="menu._get_menu_context.get_all_values",
+            log_fields={"worksheet_title": getattr(ws, "title", "")},
+        )
     except Exception as e:
         alert_system_error(error=str(e), module="menu._get_menu_context")
         raise HTTPException(status_code=500, detail=f"Cannot read Menu worksheet: {e}")
@@ -530,7 +622,11 @@ def set_menu_product_active(orders_sh, sku: str, is_active: bool) -> Dict[str, A
         raise HTTPException(status_code=500, detail="Missing 'active' column in Menu")
 
     row_index = int(item["row_index"])
-    ws.update_cell(row_index, active_col_idx0 + 1, "TRUE" if is_active else "FALSE")
+    _call_with_retry(
+        lambda: ws.update_cell(row_index, active_col_idx0 + 1, "TRUE" if is_active else "FALSE"),
+        op_name="menu.set_menu_product_active.update_cell",
+        log_fields={"sku": sku, "row_index": row_index},
+    )
 
     invalidate_menu_cache(orders_sh)
 
@@ -555,7 +651,11 @@ def set_menu_product_price(orders_sh, sku: str, new_price: float) -> Dict[str, A
 
     price_str = _format_price_for_sheet(new_price)
     row_index = int(item["row_index"])
-    ws.update_cell(row_index, price_col_idx0 + 1, price_str)
+    _call_with_retry(
+        lambda: ws.update_cell(row_index, price_col_idx0 + 1, price_str),
+        op_name="menu.set_menu_product_price.update_cell",
+        log_fields={"sku": sku, "row_index": row_index},
+    )
 
     invalidate_menu_cache(orders_sh)
 
@@ -605,7 +705,11 @@ def _set_menu_product_text_field(orders_sh, sku: str, field_name: str, new_value
         raise HTTPException(status_code=422, detail=f"{field_name} cannot be empty")
 
     row_index = int(item["row_index"])
-    ws.update_cell(row_index, field_col_idx0 + 1, clean_value)
+    _call_with_retry(
+        lambda: ws.update_cell(row_index, field_col_idx0 + 1, clean_value),
+        op_name="menu._set_menu_product_text_field.update_cell",
+        log_fields={"sku": sku, "field_name": field_name, "row_index": row_index},
+    )
 
     invalidate_menu_cache(orders_sh)
 
@@ -700,7 +804,11 @@ def create_menu_product(
         put("photo_file_id", "")
 
     try:
-        ws.append_row(row_values, value_input_option="USER_ENTERED")
+        _call_with_retry(
+            lambda: ws.append_row(row_values, value_input_option="USER_ENTERED"),
+            op_name="menu.create_menu_product.append_row",
+            log_fields={"sku": sku, "name": clean_name},
+        )
     except Exception as e:
         alert_system_error(error=str(e), module="menu.create_menu_product")
         raise HTTPException(status_code=500, detail=f"Could not create product: {e}")
