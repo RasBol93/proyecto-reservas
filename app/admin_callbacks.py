@@ -5,18 +5,16 @@ from typing import Any, Dict
 from app.admin_callbacks_menu import handle_admin_menu_callback
 from app.admin_callbacks_surveys import handle_admin_surveys_callback
 from app.admin_callbacks_orders import handle_admin_orders_callback
+from app.admin_callbacks_hours import handle_admin_hours_routed_callback
 
 from app.telegram_api import telegram_send_text
 from app.utils import log_event
 from app.stats import resolve_period, build_stats_report_text, build_periods
 from app.webhook_helpers import (
+    get_sess,
     assert_admin_authorized,
     get_user_role,
     admin_periods_inline_kb,
-)
-from app.admin_hours import (
-    handle_admin_hours_callback,
-    send_admin_hours_menu,
 )
 from app.alerts import (
     alert_system_error,
@@ -28,6 +26,9 @@ from app.admin_consumers import (
 )
 from app.admin_nav import (
     admin_panel_kb,
+)
+from app.admin_menu import (
+    send_admin_menu_home,
 )
 
 
@@ -72,9 +73,10 @@ def handle_admin_callback_impl(
             assert_admin_authorized(tenant, chat_id, tenant_id)
             return {"ok": _send_consumers_menu(bot_token, chat_id, tenant_id, tenant_tz)}
 
-        if data == "admin_hours":
+        if data == "admin_menu":
             assert_admin_authorized(tenant, chat_id, tenant_id)
-            return {"ok": send_admin_hours_menu(bot_token, chat_id, tenant_id, orders_sh, tenant_tz)}
+            sess = get_sess(tenant_id, chat_id)
+            return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
         if data == "admin_payments":
             assert_admin_authorized(tenant, chat_id, tenant_id)
@@ -94,8 +96,6 @@ def handle_admin_callback_impl(
 
         if data == "admin_payments_upload":
             assert_admin_authorized(tenant, chat_id, tenant_id)
-            from app.webhook_helpers import get_sess
-
             sess = get_sess(tenant_id, chat_id)
             tmp = sess.setdefault("tmp", {})
             tmp["admin_payment_mode"] = "awaiting_qr"
@@ -185,6 +185,18 @@ def handle_admin_callback_impl(
                 }
 
             return {"ok": True}
+
+        hours_result = handle_admin_hours_routed_callback(
+            tenant=tenant,
+            tenant_id=tenant_id,
+            bot_token=bot_token,
+            chat_id=chat_id,
+            data=data,
+            orders_sh=orders_sh,
+            tenant_tz=tenant_tz,
+        )
+        if hours_result is not None:
+            return hours_result
 
         surveys_result = handle_admin_surveys_callback(
             tenant=tenant,
