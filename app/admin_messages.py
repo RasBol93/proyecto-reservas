@@ -59,6 +59,78 @@ def _safe_send_text(
         return False
 
 
+def _build_admin_panel_text(is_owner: bool) -> str:
+    if is_owner:
+        return (
+            "🧭 *PANEL ADMIN*\n\n"
+            "Gestiona tu negocio desde aquí.\n\n"
+            "*Módulos disponibles:*\n"
+            "💳 Pagos\n"
+            "📊 Estadísticas\n"
+            "👥 Clientes\n"
+            "📝 Encuestas\n"
+            "🍔 Menú\n"
+            "⏰ Horarios\n\n"
+            "_Selecciona una opción del panel inferior._"
+        )
+
+    return (
+        "🧭 *PANEL ADMIN*\n\n"
+        "Gestiona tu negocio desde aquí.\n\n"
+        "*Operación*\n"
+        "📦 Pedidos · 💳 Pagos\n\n"
+        "*Análisis*\n"
+        "📊 Estadísticas · 👥 Clientes · 📝 Encuestas\n\n"
+        "*Configuración*\n"
+        "🍔 Menú · ⏰ Horarios\n\n"
+        "_Selecciona una opción del panel inferior._"
+    )
+
+
+def _build_stats_intro_text() -> str:
+    return (
+        "📊 *ESTADÍSTICAS*\n\n"
+        "Consulta el rendimiento de tu negocio por período.\n\n"
+        "_Elige una opción a continuación._"
+    )
+
+
+def _build_surveys_intro_text() -> str:
+    return (
+        "📝 *ENCUESTAS*\n\n"
+        "Desde aquí puedes configurar, gestionar y revisar resultados.\n\n"
+        "_Elige una opción a continuación._"
+    )
+
+
+def _build_owner_ready_text() -> str:
+    return (
+        "✅ *Bot propietario listo*\n\n"
+        "Usa el botón inferior para abrir el panel."
+    )
+
+
+def _build_admin_ready_text() -> str:
+    return (
+        "✅ *Admin bot listo*\n\n"
+        "Usa el botón inferior para abrir el panel."
+    )
+
+
+def _build_owner_idle_text() -> str:
+    return (
+        "✅ *Modo propietario activo*\n\n"
+        "Usa el botón inferior para volver al panel."
+    )
+
+
+def _build_admin_idle_text() -> str:
+    return (
+        "✅ *Modo admin activo*\n\n"
+        "Usa el botón inferior para volver al panel."
+    )
+
+
 def _handle_admin_payment_qr_upload(
     tenant: Dict[str, Any],
     tenant_id: str,
@@ -71,8 +143,9 @@ def _handle_admin_payment_qr_upload(
         _safe_send_text(
             bot_token,
             chat_id,
-            "📷 Estoy esperando una imagen del QR.",
+            "📷 *Actualizar QR de pago*\n\nEstoy esperando una imagen del QR.",
             reply_markup=admin_fixed_kb(),
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -86,8 +159,9 @@ def _handle_admin_payment_qr_upload(
         _safe_send_text(
             bot_token,
             chat_id,
-            "⚠️ No pude leer la imagen del QR. Intenta nuevamente.",
+            "⚠️ *Actualizar QR de pago*\n\nNo pude leer la imagen del QR. Intenta nuevamente.",
             reply_markup=admin_fixed_kb(),
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -122,8 +196,9 @@ def _handle_admin_payment_qr_upload(
         _safe_send_text(
             bot_token,
             chat_id,
-            "⚠️ Error procesando el QR. Intenta nuevamente.",
+            "⚠️ *Actualizar QR de pago*\n\nError procesando el QR. Intenta nuevamente.",
             reply_markup=admin_fixed_kb(),
+            parse_mode="Markdown",
         )
         return {"ok": True}
 
@@ -138,15 +213,17 @@ def _handle_admin_payment_qr_upload(
         _safe_send_text(
             bot_token,
             chat_id,
-            "✅ QR actualizado correctamente.",
+            "✅ *QR actualizado correctamente.*",
             reply_markup=admin_fixed_kb(),
+            parse_mode="Markdown",
         )
     else:
         _safe_send_text(
             bot_token,
             chat_id,
-            "⚠️ Error guardando el QR.",
+            "⚠️ *Actualizar QR de pago*\n\nError guardando el QR.",
             reply_markup=admin_fixed_kb(),
+            parse_mode="Markdown",
         )
 
     return {"ok": True}
@@ -174,8 +251,9 @@ def handle_admin_message_impl(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "🧭 PANEL ADMIN\n\nElige una opción:",
+                _build_admin_panel_text(is_owner=is_owner),
                 reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -236,13 +314,14 @@ def handle_admin_message_impl(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "📊 Elige el período:",
+                _build_stats_intro_text(),
                 reply_markup=admin_periods_inline_kb(tenant_id, periods),
+                parse_mode="Markdown",
             )
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "Usa el botón inferior ⚙️ Panel cuando quieras volver.",
+                "Usa el botón inferior para volver al panel cuando quieras.",
                 reply_markup=admin_fixed_kb(),
             )
             return {"ok": True}
@@ -257,7 +336,8 @@ def handle_admin_message_impl(
                 _safe_send_text(
                     bot_token,
                     chat_id,
-                    "🚫 Como propietario no puedes crear pedidos.",
+                    "🚫 *Acceso restringido*\n\nComo propietario no puedes crear pedidos.",
+                    parse_mode="Markdown",
                 )
                 return {"ok": True}
 
@@ -303,13 +383,14 @@ def handle_admin_message_impl(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "📝 ENCUESTAS\n\n¿Qué deseas hacer?",
+                _build_surveys_intro_text(),
                 reply_markup=kb([
                     [("⚙️ Configuración", f"admsurv|{tenant_id}|config")],
                     [("❓ Gestionar preguntas", f"admsurv|{tenant_id}|questions")],
                     [("📊 Ver resultados", f"admsurv|{tenant_id}|analytics")],
                     [("🧭 Panel admin", "admin_panel")],
                 ]),
+                parse_mode="Markdown",
             )
             return {"ok": True}
 
@@ -318,15 +399,17 @@ def handle_admin_message_impl(
                 _safe_send_text(
                     bot_token,
                     chat_id,
-                    "Bot propietario listo ✅\n\nUsa el botón inferior ⚙️ Panel.",
+                    _build_owner_ready_text(),
                     reply_markup=admin_fixed_kb(),
+                    parse_mode="Markdown",
                 )
             else:
                 _safe_send_text(
                     bot_token,
                     chat_id,
-                    "Admin bot listo ✅\n\nUsa el botón inferior ⚙️ Panel.",
+                    _build_admin_ready_text(),
                     reply_markup=admin_fixed_kb(),
+                    parse_mode="Markdown",
                 )
             return {"ok": True}
 
@@ -334,15 +417,17 @@ def handle_admin_message_impl(
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "OK propietario ✅\n\nUsa el botón inferior ⚙️ Panel.",
+                _build_owner_idle_text(),
                 reply_markup=admin_fixed_kb(),
+                parse_mode="Markdown",
             )
         else:
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "OK admin ✅\n\nUsa el botón inferior ⚙️ Panel.",
+                _build_admin_idle_text(),
                 reply_markup=admin_fixed_kb(),
+                parse_mode="Markdown",
             )
 
         return {"ok": True}
@@ -359,7 +444,8 @@ def handle_admin_message_impl(
         _safe_send_text(
             bot_token,
             chat_id,
-            "⚠️ Ocurrió un error en el panel admin.",
+            "⚠️ *Ocurrió un error en el panel admin.*",
             reply_markup=admin_fixed_kb(),
+            parse_mode="Markdown",
         )
         return {"ok": True}
