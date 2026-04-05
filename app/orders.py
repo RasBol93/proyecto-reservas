@@ -5,6 +5,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+
 from app.utils import log_event
 from app.alerts import (
     alert_order_failed,
@@ -17,6 +18,40 @@ from app.alerts import (
 # ----------------------------------------
 # Helpers: worksheet + safe json
 # ----------------------------------------
+
+_ALLOWED_ORDER_STATUSES = {
+    "PENDING_PAYMENT",
+    "PAID",
+}
+
+_ALLOWED_PROOF_TYPES = {
+    "photo",
+    "document",
+}
+
+
+def _normalize_status(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _is_allowed_status(status: str) -> bool:
+    return _normalize_status(status) in _ALLOWED_ORDER_STATUSES
+
+
+def _is_valid_status_transition(current_status: str, new_status: str) -> bool:
+    current_norm = _normalize_status(current_status)
+    new_norm = _normalize_status(new_status)
+
+    # idempotencia
+    if current_norm == new_norm:
+        return True
+
+    # transición válida actual
+    if current_norm == "PENDING_PAYMENT" and new_norm == "PAID":
+        return True
+
+    return False
+
 
 def _get_orders_ws(orders_sh):
     """
@@ -245,6 +280,22 @@ def append_order_row(
         if not clean_order_id:
             raise RuntimeError("order_id missing")
 
+        clean_status = _normalize_status(status)
+        if not _is_allowed_status(clean_status):
+            raise RuntimeError(f"invalid initial status: {clean_status}")
+
+        clean_items = items if isinstance(items, list) else []
+        if not clean_items:
+            raise RuntimeError("items missing")
+
+        try:
+            total_amount_num = float(total_amount)
+        except Exception:
+            raise RuntimeError("invalid total_amount")
+
+        if total_amount_num < 0:
+            raise RuntimeError("total_amount must be >= 0")
+
         data = {
             "order_id": clean_order_id,
             "created_at": _now_iso_utc(),
@@ -252,16 +303,16 @@ def append_order_row(
             "customer_name": str(customer_name or "").strip(),
             "customer_contact": str(customer_contact or "").strip(),
             "customer_telegram_chat_id": str(customer_telegram_chat_id or "").strip(),
-            "items": items or [],
+            "items": clean_items,
             "items_snapshot": items_snapshot or "",
             "currency": str(currency or "BOB").strip() or "BOB",
             "pricing_version": str(pricing_version or "v1").strip() or "v1",
             "notes": str(notes or "").strip(),
             "delivery_type": str(delivery_type or "").strip(),
             "requested_time": str(requested_time or "").strip(),
-            "status": str(status or "").strip(),
+            "status": clean_status,
             "source": str(source or "").strip(),
-            "total_amount": total_amount,
+            "total_amount": total_amount_num,
             "payment_proof_file_id": "",
             "payment_confirmed_at": "",
             "payment_proof_type": "",
@@ -275,9 +326,9 @@ def append_order_row(
             "order_appended",
             tenant_id=tenant_id,
             order_id=clean_order_id,
-            status=status,
+            status=clean_status,
             source=source,
-            total_amount=total_amount,
+            total_amount=total_amount_num,
             customer_contact=customer_contact,
             customer_telegram_chat_id=customer_telegram_chat_id,
         )
@@ -380,7 +431,7 @@ def find_latest_pending_order_for_contact(
     order_vals = _safe_col_values(ws, i_order_id + 1)
 
     contact = (customer_contact or "").strip()
-    wanted_status = (status or "").strip()
+    wanted_status = _normalize_status(status)
     if not contact or not wanted_status:
         return None
 
@@ -393,7 +444,7 @@ def find_latest_pending_order_for_contact(
 
         if str(cv).strip() != contact:
             continue
-        if str(sv).strip() != wanted_status:
+        if _normalize_status(sv) != wanted_status:
             continue
 
         oid = str(ov).strip()
@@ -426,14 +477,33 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
             raise RuntimeError("Missing status column")
 
         tenant_col = _find_col_idx(header, "tenant_id")
-        if tenant_col is not None:
-            row = _safe_row_values(ws, ridx)
-            if tenant_col < len(row):
-                tenant_id_for_alert = str(row[tenant_col] or "").strip()
+        row = _safe_row_values(ws, ridx)
 
-        clean_status = str(new_status or "").strip()
+        if tenant_col is not None and tenant_col < len(row):
+            tenant_id_for_alert = str(row[tenant_col] or "").strip()
+
+        clean_status = _normalize_status(new_status)
         if not clean_status:
             raise RuntimeError("new_status missing")
+        if not _is_allowed_status(clean_status):
+            raise RuntimeError(f"invalid target status: {clean_status}")
+
+        current_status = ""
+        if status_col < len(row):
+            current_status = _normalize_status(row[status_col])
+
+        if current_status and not _is_valid_status_transition(current_status, clean_status):
+            raise RuntimeError(f"invalid status transition: {current_status} -> {clean_status}")
+
+        # idempotencia: si ya está en el estado destino, no reescribir
+        if current_status == clean_status:
+            log_event(
+                "order_status_update_idempotent",
+                tenant_id=tenant_id_for_alert,
+                order_id=order_id,
+                status=clean_status,
+            )
+            return {"ok": True, "found": True, "already_in_status": True}
 
         updates = [
             {"row": ridx, "col": status_col + 1, "value": clean_status},
@@ -454,10 +524,11 @@ def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, 
             "order_status_updated",
             tenant_id=tenant_id_for_alert,
             order_id=order_id,
+            from_status=current_status,
             status=clean_status,
         )
 
-        return {"ok": True, "found": True}
+        return {"ok": True, "found": True, "already_in_status": False}
 
     except Exception as e:
         log_event(
@@ -502,26 +573,53 @@ def update_order_payment_proof(
             return {"ok": True, "found": False}
 
         tenant_col = _find_col_idx(header, "tenant_id")
-        if tenant_col is not None:
-            row = _safe_row_values(ws, ridx)
-            if tenant_col < len(row):
-                tenant_id_for_alert = str(row[tenant_col] or "").strip()
+        row = _safe_row_values(ws, ridx)
+
+        if tenant_col is not None and tenant_col < len(row):
+            tenant_id_for_alert = str(row[tenant_col] or "").strip()
 
         fcol = _find_col_idx(header, "payment_proof_file_id")
         tcol = _find_col_idx(header, "payment_proof_type")
         ccol = _find_col_idx(header, "payment_proof_caption")
+        status_col = _find_col_idx(header, "status")
 
         if fcol is None or tcol is None:
             raise RuntimeError("Missing payment proof columns")
 
         clean_file_id = str(proof_file_id or "").strip()
-        clean_proof_type = str(proof_type or "").strip()
+        clean_proof_type = str(proof_type or "").strip().lower()
         clean_caption = str(proof_caption or "").strip()
 
         if not clean_file_id:
             raise RuntimeError("proof_file_id missing")
-        if not clean_proof_type:
-            raise RuntimeError("proof_type missing")
+        if clean_proof_type not in _ALLOWED_PROOF_TYPES:
+            raise RuntimeError(f"invalid proof_type: {clean_proof_type}")
+
+        current_status = ""
+        if status_col is not None and status_col < len(row):
+            current_status = _normalize_status(row[status_col])
+
+        # si en el futuro hay más estados, esto evita meter comprobantes en estados absurdos
+        if current_status and current_status not in _ALLOWED_ORDER_STATUSES:
+            raise RuntimeError(f"invalid current order status for proof update: {current_status}")
+
+        current_file_id = row[fcol] if fcol < len(row) else ""
+        current_proof_type = row[tcol] if tcol < len(row) else ""
+        current_caption = row[ccol] if (ccol is not None and ccol < len(row)) else ""
+
+        # idempotencia
+        if (
+            str(current_file_id or "").strip() == clean_file_id
+            and str(current_proof_type or "").strip().lower() == clean_proof_type
+            and str(current_caption or "").strip() == clean_caption
+        ):
+            log_event(
+                "order_proof_update_idempotent",
+                tenant_id=tenant_id_for_alert,
+                order_id=order_id,
+                proof_type=clean_proof_type,
+            )
+            return {"ok": True, "found": True, "already_same": True}
 
         updates = [
             {"row": ridx, "col": fcol + 1, "value": clean_file_id},
@@ -544,7 +642,7 @@ def update_order_payment_proof(
             proof_type=clean_proof_type,
         )
 
-        return {"ok": True, "found": True}
+        return {"ok": True, "found": True, "already_same": False}
 
     except Exception as e:
         log_event(
