@@ -4,7 +4,6 @@
 from typing import Any, Dict, Optional
 
 from app.menu import (
-    load_menu_admin_index,
     get_menu_product_or_404,
     set_menu_product_price,
     invalidate_menu_cache,
@@ -807,6 +806,10 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     "Selecciona una categoría usando los botones o toca 'Nueva categoría'.",
+                    reply_markup=kb([
+                        [("➕ Nueva categoría", f"admmenu|{tenant_id}|create_newcat")],
+                        [("🧭 Panel admin", "admin_panel")],
+                    ]),
                 )
                 return {"ok": True}
 
