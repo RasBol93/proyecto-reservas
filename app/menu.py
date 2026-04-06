@@ -467,6 +467,12 @@ def calc_total_amount(items: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str,
 # -------------------------
 
 def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]:
+    """
+    Versión admin consistente con la lectura base del menú.
+    Diferencia principal vs load_menu_index:
+    - NO filtra por active
+    - sí devuelve row_index y active
+    """
     ck = _cache_key_for_orders_sh(orders_sh)
 
     if not force:
@@ -478,10 +484,10 @@ def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str,
 
     try:
         ctx = _get_menu_context(orders_sh)
-        ws = ctx["ws"]
         values = ctx["values"]
         header_row_1based = ctx["header_row_1based"]
         idx_map = ctx["idx_map"]
+        ws = ctx["ws"]
 
         idx: Dict[str, Dict[str, Any]] = {}
         stats = {
@@ -537,6 +543,15 @@ def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str,
 
             if sku in idx:
                 stats["duplicates"] += 1
+                try:
+                    log_event(
+                        "menu_admin_duplicate_sku",
+                        sku=sku,
+                        previous_row_index=idx[sku].get("row_index"),
+                        new_row_index=ridx,
+                    )
+                except Exception:
+                    pass
 
             idx[sku] = {
                 "sku": sku,
