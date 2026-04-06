@@ -460,12 +460,6 @@ def handle_admin_orders_callback(
                     order_id=order_id,
                     order_after=order_after,
                 )
-                _notify_owner_order_paid(
-                    tenant=tenant,
-                    tenant_id=tenant_id,
-                    order_id=order_id,
-                    order_after=order_after,
-                )
 
             return {"ok": True}
 
@@ -607,7 +601,38 @@ def handle_admin_orders_callback(
         _safe_send_text(
             bot_token,
             chat_id,
-            "👤 *Paso 1 de 3*\n\nEscribe el nombre del cliente:",
+            "👤 *Paso 1 de 3*\n\nEscribe el nombre del cliente o toca el botón inferior.",
+            reply_markup=kb([
+                [("⏭ Sin nombre", f"admord|{tenant_id}|noname")],
+                [("❌ Cancelar", f"admord|{tenant_id}|panel")],
+            ]),
+            parse_mode="Markdown",
+        )
+        return {"ok": True}
+
+    if action == "noname":
+        tmp["admin_order_name"] = "SIN_NOMBRE"
+        tmp["admin_order_step"] = "awaiting_phone"
+        _safe_send_text(
+            bot_token,
+            chat_id,
+            "📱 *Paso 2 de 3*\n\nEscribe el celular del cliente o toca el botón inferior.",
+            reply_markup=kb([
+                [("⏭ Sin celular", f"admord|{tenant_id}|nophone")],
+                [("❌ Cancelar", f"admord|{tenant_id}|panel")],
+            ]),
+            parse_mode="Markdown",
+        )
+        return {"ok": True}
+
+    if action == "nophone":
+        tmp["admin_order_contact"] = "SIN_CONTACTO"
+        tmp["admin_order_step"] = "awaiting_time_choice"
+        _safe_send_text(
+            bot_token,
+            chat_id,
+            "⏰ *Paso 3 de 3*\n\nElige la hora del pedido:",
+            reply_markup=_admin_order_time_choice_kb(tenant_id),
             parse_mode="Markdown",
         )
         return {"ok": True}
@@ -665,6 +690,17 @@ def handle_admin_orders_callback(
             )
             return {"ok": True}
 
+        last_order_id = str(tmp.get("admin_order_last_id") or "").strip()
+        if last_order_id:
+            order_after = get_order_by_id(orders_sh, last_order_id)
+            if order_after:
+                _notify_owner_order_paid(
+                    tenant=tenant,
+                    tenant_id=tenant_id,
+                    order_id=last_order_id,
+                    order_after=order_after,
+                )
+
         _safe_send_text(
             bot_token,
             chat_id,
@@ -702,7 +738,7 @@ def handle_admin_orders_callback(
 
         reward_text = get_survey_reward_text(orders_sh)
         tmp["admin_survey_runtime"] = True
-        tmp["admin_survey_step"] = "start"
+        tmp["admin_survey_step"] = "q_0"
         tmp["admin_survey_answers"] = []
         tmp["admin_survey_phone"] = customer_phone
         tmp["admin_survey_name"] = customer_name
@@ -716,6 +752,15 @@ def handle_admin_orders_callback(
             chat_id,
             intro,
             parse_mode="Markdown",
+        )
+
+        first_q = questions[0]
+        send_admin_survey_runtime_question(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            tenant_id=tenant_id,
+            question=first_q,
+            q_idx=0,
         )
         return {"ok": True}
 
