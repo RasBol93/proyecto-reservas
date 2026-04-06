@@ -11,11 +11,9 @@ def admin_root_kb():
 
 def admin_panel_kb(user_role: str = "admin"):
     """
-    Panel rediseñado tipo "mini app":
-    - agrupación lógica
-    - máximo 2 botones por fila
-    - jerarquía visual clara
+    Panel rediseñado tipo mini app:
     - misma lógica / mismos callbacks
+    - solo cambia naming visual
     """
 
     user_role = str(user_role or "").strip().lower()
@@ -23,22 +21,18 @@ def admin_panel_kb(user_role: str = "admin"):
 
     rows = []
 
-    # ---------------------------
     # BLOQUE 1: OPERACIÓN
-    # ---------------------------
     if not is_owner:
         rows.append([
-            ("📦 Pedidos", "admin_order"),
-            ("💳 Pagos", "admin_payments"),
+            ("🧺 Crear pedido", "admin_order"),
+            ("📱 QR", "admin_payments"),
         ])
     else:
         rows.append([
-            ("💳 Pagos", "admin_payments"),
+            ("📱 QR", "admin_payments"),
         ])
 
-    # ---------------------------
     # BLOQUE 2: ANÁLISIS
-    # ---------------------------
     rows.append([
         ("📊 Estadísticas", "admin_stats"),
         ("👥 Clientes", "admin_consumers"),
@@ -48,9 +42,7 @@ def admin_panel_kb(user_role: str = "admin"):
         ("📝 Encuestas", "admin_surveys"),
     ])
 
-    # ---------------------------
     # BLOQUE 3: CONFIGURACIÓN
-    # ---------------------------
     rows.append([
         ("🍔 Menú", "admin_menu"),
         ("⏰ Horarios", "admin_hours"),
@@ -60,9 +52,6 @@ def admin_panel_kb(user_role: str = "admin"):
 
 
 def admin_back_panel_kb(back_data: str):
-    """
-    Navegación consistente tipo app
-    """
     return kb([
         [("⬅️ Volver", back_data)],
         [("🧭 Panel", "admin_panel")],
