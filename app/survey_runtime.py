@@ -154,12 +154,20 @@ def save_survey_answers(
     ]
     """
     try:
-        phone_norm = _normalize_phone(customer_phone)
-        if not _is_valid_phone(phone_norm):
+        raw_phone = str(customer_phone or "").strip()
+        phone_norm = _normalize_phone(raw_phone)
+
+        # Permitir encuestas admin sin celular real
+        if not phone_norm:
+            phone_norm = "SIN_CONTACTO"
+
+        # Validar solo si realmente hay número
+        if phone_norm != "SIN_CONTACTO" and not _is_valid_phone(phone_norm):
             return {"ok": False, "error": "invalid_phone"}
 
-        if has_answered_survey_today(orders_sh, tenant_tz, phone_norm):
-            return {"ok": False, "error": "already_answered_today"}
+        if phone_norm != "SIN_CONTACTO":
+            if has_answered_survey_today(orders_sh, tenant_tz, phone_norm):
+                return {"ok": False, "error": "already_answered_today"}
 
         if not answers:
             return {"ok": False, "error": "empty_answers"}
