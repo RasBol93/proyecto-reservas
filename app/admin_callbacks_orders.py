@@ -41,6 +41,7 @@ from app.admin_manual_order import (
     _admin_order_dec_item,
     _admin_order_remove_item,
     _send_admin_order_cart,
+    _admin_order_time_choice_kb,
 )
 from app.admin_nav import admin_panel_kb
 from app.admin_survey_runtime import (
@@ -336,7 +337,6 @@ def handle_admin_orders_callback(
             )
             return {"ok": True}
 
-        # soft lock local para evitar doble click / doble ejecución concurrente
         if not _acquire_paid_lock(order_id):
             _safe_send_text(
                 bot_token,
@@ -360,7 +360,6 @@ def handle_admin_orders_callback(
             status_before = _normalize_status(order_before.get("status"))
             already_paid = status_before == "PAID"
 
-            # idempotencia real: si ya estaba PAID, no reescribimos ni duplicamos notificaciones
             if already_paid:
                 _send_admin_paid_confirmation(
                     bot_token=bot_token,
@@ -377,7 +376,6 @@ def handle_admin_orders_callback(
                 )
                 return {"ok": True}
 
-            # validación explícita de transición
             if not _is_paid_transition_allowed(status_before):
                 _safe_send_text(
                     bot_token,
