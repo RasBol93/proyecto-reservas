@@ -1,169 +1,233 @@
-from typing import Any, Dict, Optional
+# app/survey_runtime.py
 
-from app.menu import load_menu_admin_index
-from app.orders import append_order_row, gen_order_id, build_items_snapshot
-from app.telegram_api import telegram_send_text
-from app.telegram_keyboard import kb
+from typing import Any, Dict, List
+
+from app.sheets import read_records_manual
 from app.utils import log_event
-from app.webhook_helpers import fmt_snapshot_lines, build_order_recap_text, admin_fixed_kb
-from app.alerts import alert_order_failed
-from app.admin_manual_order import _admin_order_reset
+from app.alerts import alert_sheet_error
+
+from app.survey_core import (
+    SURVEY_RESPONSES_WS,
+    SURVEY_RESPONSES_HEADERS,
+    SURVEY_COUPONS_WS,
+    SURVEY_COUPONS_HEADERS,
+    _ensure_ws,
+    _safe_str,
+    _normalize_phone,
+    _is_valid_phone,
+    _make_response_id,
+    _make_coupon_code,
+    _now_utc_iso,
+    _survey_date_local,
+)
+from app.survey_settings import (
+    survey_is_enabled,
+    get_survey_password,
+)
+from app.survey_questions import (
+    load_survey_questions,
+)
 
 
-def _finalize_admin_manual_order_core(
-    tenant_id: str,
-    bot_token: str,
-    chat_id: int,
+def has_answered_survey_today(orders_sh, tenant_tz: str, phone: str) -> bool:
+    try:
+        phone_norm = _normalize_phone(phone)
+        if not phone_norm:
+            return False
+
+        ws = _ensure_ws(orders_sh, SURVEY_RESPONSES_WS, SURVEY_RESPONSES_HEADERS)
+        rows = read_records_manual(ws, required_headers=SURVEY_RESPONSES_HEADERS)
+        today = _survey_date_local(tenant_tz)
+
+        for r in rows:
+            row_phone = _normalize_phone(r.get("customer_phone"))
+            row_date = _safe_str(r.get("survey_date"))
+            if row_phone == phone_norm and row_date == today:
+                return True
+
+        return False
+
+    except Exception as e:
+        log_event(
+            "survey_has_answered_today_error",
+            phone=_normalize_phone(phone),
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        return False
+
+
+def coupon_exists(orders_sh, coupon_code: str) -> bool:
+    try:
+        code = _safe_str(coupon_code)
+        if not code:
+            return False
+
+        ws = _ensure_ws(orders_sh, SURVEY_COUPONS_WS, SURVEY_COUPONS_HEADERS)
+        rows = read_records_manual(ws, required_headers=SURVEY_COUPONS_HEADERS)
+
+        for r in rows:
+            if _safe_str(r.get("coupon_code")) == code:
+                return True
+
+        return False
+
+    except Exception:
+        return False
+
+
+def generate_unique_coupon_code(orders_sh, phone: str) -> str:
+    phone_norm = _normalize_phone(phone)
+    for _ in range(50):
+        code = _make_coupon_code(phone_norm)
+        if not coupon_exists(orders_sh, code):
+            return code
+    fallback = f"{phone_norm}{_now_utc_iso().replace('-', '').replace(':', '').replace('T', '').replace('Z', '')[-6:]}"
+    return fallback
+
+
+def create_survey_coupon(orders_sh, tenant_id: str, phone: str, reward_text: str) -> Dict[str, Any]:
+    try:
+        phone_norm = _normalize_phone(phone)
+        if not phone_norm:
+            return {"ok": False, "error": "invalid_phone"}
+
+        code = generate_unique_coupon_code(orders_sh, phone_norm)
+        ws = _ensure_ws(orders_sh, SURVEY_COUPONS_WS, SURVEY_COUPONS_HEADERS)
+
+        ws.append_row(
+            [
+                code,
+                _now_utc_iso(),
+                _safe_str(tenant_id),
+                phone_norm,
+                _safe_str(reward_text),
+                "FALSE",
+                "",
+            ],
+            value_input_option="USER_ENTERED",
+        )
+
+        return {
+            "ok": True,
+            "coupon_code": code,
+            "customer_phone": phone_norm,
+            "reward_text": _safe_str(reward_text),
+        }
+
+    except Exception as e:
+        log_event(
+            "survey_create_coupon_error",
+            tenant_id=_safe_str(tenant_id),
+            phone=_normalize_phone(phone),
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        alert_sheet_error(
+            tenant_id=_safe_str(tenant_id),
+            error=f"survey create coupon failed: {e}",
+            extra_key="survey.create_survey_coupon",
+        )
+        return {"ok": False, "error": str(e)}
+
+
+def save_survey_answers(
     orders_sh,
-    tmp: Dict[str, Any],
-    tenant: Optional[Dict[str, Any]] = None,
-    use_fixed_kb_on_error: bool = False,
+    tenant_id: str,
+    tenant_tz: str,
+    customer_phone: str,
+    customer_name: str,
+    answers: List[Dict[str, Any]],
+    coupon_code: str,
 ) -> Dict[str, Any]:
-    requested_time = str(tmp.get("admin_order_requested_time") or "").strip() or "ahora"
-    cart = tmp.get("admin_order_cart") or []
-    customer_name = str(tmp.get("admin_order_name") or "").strip()
-    customer_contact = str(tmp.get("admin_order_contact") or "").strip()
+    """
+    answers esperado:
+    [
+      {
+        "question_id": "...",
+        "question_order": 1,
+        "question_text": "...",
+        "answer_type": "text" | "stars",
+        "answer_value": "..."
+      },
+      ...
+    ]
+    """
+    try:
+        phone_norm = _normalize_phone(customer_phone)
+        if not _is_valid_phone(phone_norm):
+            return {"ok": False, "error": "invalid_phone"}
 
-    if not cart or not customer_name or not customer_contact:
-        _admin_order_reset(tmp)
-        telegram_send_text(
-            bot_token,
-            chat_id,
-            "⚠️ Faltaban datos del pedido manual. Empecemos de nuevo.",
-            reply_markup=admin_fixed_kb() if use_fixed_kb_on_error else None,
-        )
-        return {"ok": True}
+        if has_answered_survey_today(orders_sh, tenant_tz, phone_norm):
+            return {"ok": False, "error": "already_answered_today"}
 
-    menu_idx = load_menu_admin_index(orders_sh, force=False)
-    items_snapshot = build_items_snapshot(cart, menu_idx)
-    lines_txt, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
+        if not answers:
+            return {"ok": False, "error": "empty_answers"}
 
-    order_id = gen_order_id()
+        ws = _ensure_ws(orders_sh, SURVEY_RESPONSES_WS, SURVEY_RESPONSES_HEADERS)
+        response_id = _make_response_id(phone_norm)
+        created_at = _now_utc_iso()
+        survey_date = _survey_date_local(tenant_tz)
 
-    result = append_order_row(
-        orders_sh=orders_sh,
-        tenant_id=tenant_id,
-        order_id=order_id,
-        customer_name=customer_name,
-        customer_contact=customer_contact,
-        customer_telegram_chat_id="",
-        items=cart,
-        items_snapshot=items_snapshot,
-        currency="BOB",
-        pricing_version="v1",
-        notes="",
-        delivery_type="pickup",
-        requested_time=requested_time,
-        status="PAID",
-        source="admin_manual",
-        total_amount=total_amount,
-    )
-
-    if not result.get("ok"):
-        alert_order_failed(
-            tenant_id=tenant_id,
-            order_id=order_id,
-            error=result.get("error") or "append_order_row failed",
-        )
-        telegram_send_text(
-            bot_token,
-            chat_id,
-            "⚠️ Error guardando el pedido manual.",
-            reply_markup=admin_fixed_kb() if use_fixed_kb_on_error else None,
-        )
-        return {"ok": True}
-
-    _admin_order_reset(tmp)
-
-    tmp["admin_order_last_id"] = order_id
-    tmp["admin_order_waiting_proof"] = False
-    tmp["admin_order_proof_received"] = False
-    tmp["admin_order_last_phone"] = customer_contact
-    tmp["admin_order_last_name"] = customer_name
-
-    recap = build_order_recap_text(
-        order_id=order_id,
-        customer_name=customer_name,
-        customer_contact=customer_contact,
-        requested_time=requested_time,
-        detail_lines=lines_txt,
-        total_qty=total_qty,
-        total=total_amount,
-    )
-
-    telegram_send_text(
-        bot_token,
-        chat_id,
-        recap,
-        parse_mode="Markdown",
-    )
-    telegram_send_text(
-        bot_token,
-        chat_id,
-        "✅ *Pedido manual registrado como pagado.*\nAhora puedes fotografiar el comprobante.",
-        parse_mode="Markdown",
-        reply_markup=kb([
-            [("📷 Fotografiar comprobante", f"admord|{tenant_id}|proof")],
-            [("🧭 Panel admin", "admin_panel")],
-        ]),
-    )
-
-    if tenant:
-        try:
-            owner_enabled = str(tenant.get("owner_enabled") or "").strip().lower() == "true"
-            owner_chat = str(tenant.get("owner_chat_id") or "").strip()
-            owner_token = str(tenant.get("owner_bot_token") or "").strip()
-
-            if owner_enabled and owner_chat and owner_token:
-                telegram_send_text(
-                    owner_token,
-                    int(owner_chat),
-                    recap,
-                    parse_mode="Markdown",
-                )
-        except Exception as e:
-            log_event(
-                "notify_owner_manual_order_failed",
-                tenant_id=tenant_id,
-                order_id=order_id,
-                error=str(e),
+        for a in answers:
+            ws.append_row(
+                [
+                    response_id,
+                    created_at,
+                    survey_date,
+                    _safe_str(tenant_id),
+                    phone_norm,
+                    _safe_str(customer_name),
+                    _safe_str(a.get("question_id")),
+                    str(int(a.get("question_order", 0) or 0)),
+                    _safe_str(a.get("question_text")),
+                    _safe_str(a.get("answer_type")),
+                    _safe_str(a.get("answer_value")),
+                    _safe_str(coupon_code),
+                ],
+                value_input_option="USER_ENTERED",
             )
 
-    return {"ok": True}
+        return {
+            "ok": True,
+            "response_id": response_id,
+            "survey_date": survey_date,
+            "customer_phone": phone_norm,
+            "answers_saved": len(answers),
+            "coupon_code": _safe_str(coupon_code),
+        }
+
+    except Exception as e:
+        log_event(
+            "survey_save_answers_error",
+            tenant_id=_safe_str(tenant_id),
+            phone=_normalize_phone(customer_phone),
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        alert_sheet_error(
+            tenant_id=_safe_str(tenant_id),
+            error=f"survey save answers failed: {e}",
+            extra_key="survey.save_survey_answers",
+        )
+        return {"ok": False, "error": str(e)}
 
 
-def finalize_admin_manual_order_from_tmp(
-    tenant_id: str,
-    bot_token: str,
-    chat_id: int,
-    orders_sh,
-    tmp: Dict[str, Any],
-    tenant: Dict[str, Any],
-) -> Dict[str, Any]:
-    return _finalize_admin_manual_order_core(
-        tenant_id=tenant_id,
-        bot_token=bot_token,
-        chat_id=chat_id,
-        orders_sh=orders_sh,
-        tmp=tmp,
-        tenant=tenant,
-        use_fixed_kb_on_error=False,
-    )
+def get_runtime_survey_questions(orders_sh) -> List[Dict[str, Any]]:
+    """
+    Devuelve preguntas activas para el flujo cliente.
+    Si no existe pregunta de teléfono, NO la agrega aquí;
+    el teléfono se manejará como paso obligatorio del flujo.
+    """
+    questions = load_survey_questions(orders_sh)
+    return questions
 
 
-def finalize_admin_manual_order(
-    tenant_id: str,
-    bot_token: str,
-    chat_id: int,
-    orders_sh,
-    tmp: Dict[str, Any],
-) -> Dict[str, Any]:
-    return _finalize_admin_manual_order_core(
-        tenant_id=tenant_id,
-        bot_token=bot_token,
-        chat_id=chat_id,
-        orders_sh=orders_sh,
-        tmp=tmp,
-        tenant=None,
-        use_fixed_kb_on_error=True,
-    )
+def survey_runtime_available(orders_sh) -> bool:
+    try:
+        if not survey_is_enabled(orders_sh):
+            return False
+        qs = get_runtime_survey_questions(orders_sh)
+        return len(qs) > 0 and bool(get_survey_password(orders_sh))
+    except Exception:
+        return False
