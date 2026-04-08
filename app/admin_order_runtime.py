@@ -1,4 +1,4 @@
-# app/admin_order_runtime.py
+# app/admin_order_runtime.py 
 
 from typing import Any, Dict, Optional
 
@@ -9,6 +9,9 @@ from app.telegram_keyboard import kb
 from app.webhook_helpers import fmt_snapshot_lines, build_order_recap_text, admin_fixed_kb
 from app.alerts import alert_order_failed
 from app.admin_manual_order import _admin_order_reset
+
+# ✅ NUEVO IMPORT (no rompe nada)
+from app.sheets import invalidate_sheet_caches
 
 
 def _finalize_admin_manual_order_core(
@@ -73,6 +76,17 @@ def _finalize_admin_manual_order_core(
             reply_markup=admin_fixed_kb() if use_fixed_kb_on_error else None,
         )
         return {"ok": True}
+
+    # =========================================================
+    # ✅ FIX CRÍTICO: invalidar cache de sheets
+    # =========================================================
+    try:
+        sid = getattr(orders_sh, "id", None)
+        if sid:
+            invalidate_sheet_caches(sid)
+    except Exception:
+        pass
+    # =========================================================
 
     _admin_order_reset(tmp)
 
