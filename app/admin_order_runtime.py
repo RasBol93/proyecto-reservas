@@ -10,9 +10,6 @@ from app.webhook_helpers import fmt_snapshot_lines, build_order_recap_text, admi
 from app.alerts import alert_order_failed
 from app.admin_manual_order import _admin_order_reset
 
-# ✅ NUEVO IMPORT (no rompe nada)
-from app.sheets import invalidate_sheet_caches
-
 
 def _finalize_admin_manual_order_core(
     tenant_id: str,
@@ -77,17 +74,6 @@ def _finalize_admin_manual_order_core(
         )
         return {"ok": True}
 
-    # =========================================================
-    # ✅ FIX CRÍTICO: invalidar cache de sheets
-    # =========================================================
-    try:
-        sid = getattr(orders_sh, "id", None)
-        if sid:
-            invalidate_sheet_caches(sid)
-    except Exception:
-        pass
-    # =========================================================
-
     _admin_order_reset(tmp)
 
     tmp["admin_order_last_id"] = order_id
@@ -95,6 +81,19 @@ def _finalize_admin_manual_order_core(
     tmp["admin_order_proof_received"] = False
     tmp["admin_order_last_phone"] = customer_contact
     tmp["admin_order_last_name"] = customer_name
+
+    # ✅ Snapshot transaccional del pedido manual.
+    # No dependemos de releer Google Sheets inmediatamente después.
+    tmp["admin_order_last_snapshot"] = {
+        "order_id": order_id,
+        "customer_name": customer_name,
+        "customer_contact": customer_contact,
+        "requested_time": requested_time,
+        "items_snapshot": items_snapshot,
+        "total_amount": total_amount,
+        "total_qty": total_qty,
+        "detail_lines": lines_txt,
+    }
 
     recap = build_order_recap_text(
         order_id=order_id,
