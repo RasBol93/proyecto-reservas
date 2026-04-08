@@ -200,7 +200,25 @@ def _notify_owner_order_paid(
         owner_chat = str(tenant.get("owner_chat_id") or "").strip()
         owner_token = str(tenant.get("owner_bot_token") or "").strip()
 
+        log_event(
+            "DEBUG_OWNER_NOTIFY_ENTER",
+            tenant_id=tenant_id,
+            order_id=order_id,
+            owner_enabled=owner_enabled,
+            owner_chat_present=bool(owner_chat),
+            owner_token_present=bool(owner_token),
+            owner_chat_id=owner_chat,
+        )
+
         if not (owner_enabled and owner_chat and owner_token):
+            log_event(
+                "DEBUG_OWNER_NOTIFY_SKIPPED_CONFIG",
+                tenant_id=tenant_id,
+                order_id=order_id,
+                owner_enabled=owner_enabled,
+                owner_chat_present=bool(owner_chat),
+                owner_token_present=bool(owner_token),
+            )
             return
 
         recap_data = _build_paid_recap_from_order(order_id, order_after)
@@ -210,11 +228,19 @@ def _notify_owner_order_paid(
             "💰 Pago validado correctamente."
         )
 
-        _safe_send_text(
+        sent = _safe_send_text(
             owner_token,
             int(owner_chat),
             owner_msg,
             parse_mode="Markdown",
+        )
+
+        log_event(
+            "DEBUG_OWNER_NOTIFY_SEND_RESULT",
+            tenant_id=tenant_id,
+            order_id=order_id,
+            owner_chat_id=owner_chat,
+            sent=bool(sent),
         )
     except Exception as e:
         log_event(
@@ -689,8 +715,22 @@ def handle_admin_orders_callback(
             return {"ok": True}
 
         last_order_id = str(tmp.get("admin_order_last_id") or "").strip()
+        log_event(
+            "DEBUG_PROOF_OK_ENTER",
+            tenant_id=tenant_id,
+            chat_id=chat_id,
+            order_id=last_order_id,
+            proof_received=bool(tmp.get("admin_order_proof_received")),
+        )
         if last_order_id:
             order_after = get_order_by_id(orders_sh, last_order_id)
+            log_event(
+                "DEBUG_PROOF_OK_ORDER_LOOKUP",
+                tenant_id=tenant_id,
+                chat_id=chat_id,
+                order_id=last_order_id,
+                order_found=bool(order_after),
+            )
             if order_after:
                 _notify_owner_order_paid(
                     tenant=tenant,
