@@ -722,21 +722,42 @@ def handle_admin_orders_callback(
             order_id=last_order_id,
             proof_received=bool(tmp.get("admin_order_proof_received")),
         )
+
         if last_order_id:
-            order_after = get_order_by_id(orders_sh, last_order_id)
-            log_event(
-                "DEBUG_PROOF_OK_ORDER_LOOKUP",
-                tenant_id=tenant_id,
-                chat_id=chat_id,
-                order_id=last_order_id,
-                order_found=bool(order_after),
-            )
+            order_after = None
+
+            # 🔁 Retry corto para Google Sheets:
+            # en pedidos manuales puede haber un pequeño delay entre append y lectura.
+            for attempt in range(3):
+                order_after = get_order_by_id(orders_sh, last_order_id)
+
+                log_event(
+                    "DEBUG_PROOF_OK_ORDER_LOOKUP_ATTEMPT",
+                    tenant_id=tenant_id,
+                    chat_id=chat_id,
+                    order_id=last_order_id,
+                    attempt=attempt + 1,
+                    order_found=bool(order_after),
+                )
+
+                if order_after:
+                    break
+
+                time.sleep(0.5)
+
             if order_after:
                 _notify_owner_order_paid(
                     tenant=tenant,
                     tenant_id=tenant_id,
                     order_id=last_order_id,
                     order_after=order_after,
+                )
+            else:
+                log_event(
+                    "DEBUG_PROOF_OK_ORDER_NOT_FOUND_AFTER_RETRY",
+                    tenant_id=tenant_id,
+                    chat_id=chat_id,
+                    order_id=last_order_id,
                 )
 
         _safe_send_text(
