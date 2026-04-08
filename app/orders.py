@@ -56,12 +56,15 @@ def _is_valid_status_transition(current_status: str, new_status: str) -> bool:
 def _get_orders_ws(orders_sh):
     """
     orders_sh: gspread Spreadsheet
-    Preferimos worksheet 'ORDERS'. Si no existe, usamos la primera.
+    Busca nombres permitidos de la hoja de pedidos.
+    Ya no cae silenciosamente a la primera hoja.
     """
-    try:
-        return orders_sh.worksheet("ORDERS")
-    except Exception:
-        return orders_sh.get_worksheet(0)
+    for ws_name in ("ORDERS", "Orders", "orders"):
+        try:
+            return orders_sh.worksheet(ws_name)
+        except Exception:
+            pass
+    raise RuntimeError("ORDERS worksheet not found (accepted names: ORDERS, Orders, orders)")
 
 
 def _now_iso_utc() -> str:
@@ -143,6 +146,10 @@ def _cell_a1(row_1based: int, col_1based: int) -> str:
     return f"{_col_to_a1(col_1based)}{row_1based}"
 
 
+def _range_a1(row_1based: int, start_col_1based: int, end_col_1based: int) -> str:
+    return f"{_cell_a1(row_1based, start_col_1based)}:{_cell_a1(row_1based, end_col_1based)}"
+
+
 def _batch_write_cells(ws, updates: List[Dict[str, str]]) -> None:
     """
     updates: [{"row":2,"col":3,"value":"x"}, ...]
@@ -183,6 +190,45 @@ def _safe_col_values(ws, col_index_1based: int) -> List[Any]:
         return ws.col_values(col_index_1based)
     except Exception:
         return []
+
+
+def _find_next_empty_row(ws, header_len: int) -> int:
+    """
+    Busca la siguiente fila vacía real usando solo el ancho técnico del header.
+    Esto evita que append_row se vaya a la derecha por rangos extraños de Google Sheets.
+    """
+    if header_len <= 0:
+        return 2
+
+    try:
+        values = ws.get_all_values()
+    except Exception:
+        values = []
+
+    # fila 1 = header técnico; empezamos a revisar desde fila 2
+    if not values or len(values) == 1:
+        return 2
+
+    for idx_0based, row in enumerate(values[1:], start=2):
+        slice_row = row[:header_len]
+        if not any(str(cell).strip() for cell in slice_row):
+            return idx_0based
+
+    return len(values) + 1
+
+
+def _write_full_row(ws, row_index_1based: int, row_values: List[str]) -> None:
+    """
+    Escribe la fila completa explícitamente desde columna A hasta el ancho del header.
+    """
+    if not row_values:
+        return
+    end_col = len(row_values)
+    ws.update(
+        _range_a1(row_index_1based, 1, end_col),
+        [row_values],
+        value_input_option="RAW",
+    )
 
 
 # ----------------------------------------
@@ -269,6 +315,7 @@ def append_order_row(
 ) -> Dict[str, Any]:
     """
     Inserta una fila en ORDERS alineada a headers.
+    Escribe explícitamente en la siguiente fila vacía, sin usar append_row.
     """
     try:
         ws = _get_orders_ws(orders_sh)
@@ -320,7 +367,8 @@ def append_order_row(
         }
 
         row = _build_row_by_header(header, data)
-        ws.append_row(row, value_input_option="RAW")
+        next_row = _find_next_empty_row(ws, len(header))
+        _write_full_row(ws, next_row, row)
 
         log_event(
             "order_appended",
@@ -331,6 +379,7 @@ def append_order_row(
             total_amount=total_amount_num,
             customer_contact=customer_contact,
             customer_telegram_chat_id=customer_telegram_chat_id,
+            row_index=next_row,
         )
 
         return {"ok": True, "order_id": clean_order_id}
