@@ -402,7 +402,7 @@ def handle_admin_orders_callback(
                 )
                 return {"ok": True}
 
-            if not _is_paid_transition_allowed(status_before):
+            if not _is_paid_transition_ALLOWED(status_before):
                 _safe_send_text(
                     bot_token,
                     chat_id,
@@ -724,28 +724,23 @@ def handle_admin_orders_callback(
         )
 
         if last_order_id:
-            order_after = None
+            snapshot = tmp.get("admin_order_last_snapshot")
 
-            # 🔁 Retry corto para Google Sheets:
-            # en pedidos manuales puede haber un pequeño delay entre append y lectura.
-            for attempt in range(3):
-                order_after = get_order_by_id(orders_sh, last_order_id)
-
+            if snapshot and snapshot.get("order_id") == last_order_id:
                 log_event(
-                    "DEBUG_PROOF_OK_ORDER_LOOKUP_ATTEMPT",
+                    "DEBUG_PROOF_OK_USING_SNAPSHOT",
                     tenant_id=tenant_id,
                     chat_id=chat_id,
                     order_id=last_order_id,
-                    attempt=attempt + 1,
-                    order_found=bool(order_after),
                 )
 
-                if order_after:
-                    break
+                order_after = {
+                    "customer_name": snapshot.get("customer_name") or "",
+                    "customer_contact": snapshot.get("customer_contact") or "",
+                    "requested_time": snapshot.get("requested_time") or "",
+                    "items_snapshot": snapshot.get("items_snapshot") or [],
+                }
 
-                time.sleep(0.5)
-
-            if order_after:
                 _notify_owner_order_paid(
                     tenant=tenant,
                     tenant_id=tenant_id,
@@ -753,12 +748,30 @@ def handle_admin_orders_callback(
                     order_after=order_after,
                 )
             else:
+                order_after = get_order_by_id(orders_sh, last_order_id)
+
                 log_event(
-                    "DEBUG_PROOF_OK_ORDER_NOT_FOUND_AFTER_RETRY",
+                    "DEBUG_PROOF_OK_FALLBACK_SHEETS",
                     tenant_id=tenant_id,
                     chat_id=chat_id,
                     order_id=last_order_id,
+                    order_found=bool(order_after),
                 )
+
+                if order_after:
+                    _notify_owner_order_paid(
+                        tenant=tenant,
+                        tenant_id=tenant_id,
+                        order_id=last_order_id,
+                        order_after=order_after,
+                    )
+                else:
+                    log_event(
+                        "DEBUG_PROOF_OK_NO_DATA",
+                        tenant_id=tenant_id,
+                        chat_id=chat_id,
+                        order_id=last_order_id,
+                    )
 
         _safe_send_text(
             bot_token,
