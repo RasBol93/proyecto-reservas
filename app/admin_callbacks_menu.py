@@ -134,6 +134,7 @@ def handle_admin_menu_callback(
         item_before = get_menu_product_or_404(orders_sh, sku)
         new_active = not bool(item_before.get("active", False))
         set_menu_product_active(orders_sh, sku, new_active)
+        invalidate_menu_cache(orders_sh)
         item_after = get_menu_product_or_404(orders_sh, sku)
 
         telegram_send_text(
