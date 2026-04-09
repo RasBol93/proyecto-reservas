@@ -4,14 +4,16 @@ from typing import Any, Dict, List, Tuple
 
 from app.promotions import (
     load_promotions,
-    get_active_promotions,
-    get_inactive_promotions,
     get_promotion_by_id,
 )
 from app.telegram_api import telegram_send_text
 from app.telegram_keyboard import kb
 from app.utils import normalize
 from app.webhook_helpers import fmt_price_short
+from app.menu import (
+    load_menu_admin_index,
+    group_menu_admin_by_category,
+)
 
 
 PROMO_TYPE_LABELS = {
@@ -61,14 +63,13 @@ def _build_discount_summary(promo: Dict[str, Any]) -> str:
     original_price = fmt_price_short(promo.get("original_price", 0))
     promo_price = fmt_price_short(promo.get("promo_price", 0))
 
-    base = (
+    return (
         f"{_promo_type_label('discount')}\n"
         f"Nombre: {name}\n"
         f"SKU producto: {product_sku or '-'}\n"
         f"Precio normal: Bs {original_price}\n"
         f"Precio promo: Bs {promo_price}"
     )
-    return base
 
 
 def _build_combo_summary(promo: Dict[str, Any]) -> str:
@@ -78,7 +79,7 @@ def _build_combo_summary(promo: Dict[str, Any]) -> str:
     promo_price = fmt_price_short(promo.get("promo_price", 0))
 
     lines = []
-    for it in combo_items[:5]:
+    for it in combo_items[:8]:
         sku = str(it.get("sku") or "").strip()
         qty = int(it.get("qty") or 1)
         item_name = str(it.get("name") or sku).strip()
@@ -86,14 +87,13 @@ def _build_combo_summary(promo: Dict[str, Any]) -> str:
 
     combo_txt = "\n".join(lines) if lines else "• Sin items"
 
-    base = (
+    return (
         f"{_promo_type_label('combo')}\n"
         f"Nombre: {name}\n"
         f"Contenido:\n{combo_txt}\n"
         f"Precio normal: Bs {original_price}\n"
         f"Precio combo: Bs {promo_price}"
     )
-    return base
 
 
 def _build_promo_card_text(promo: Dict[str, Any]) -> str:
@@ -132,6 +132,45 @@ def _build_promo_row_label(promo: Dict[str, Any]) -> str:
     return f"{active_dot} {type_emoji} {name} — {original_price}→{promo_price}"
 
 
+def _get_menu_cached(sess: Dict[str, Any], orders_sh):
+    tmp = sess.setdefault("tmp", {})
+
+    cached = tmp.get("admin_promo_menu_cache")
+    if cached is not None:
+        return cached
+
+    menu_idx = load_menu_admin_index(orders_sh, force=False)
+    cats = group_menu_admin_by_category(menu_idx)
+    cat_names = sorted(cats.keys(), key=lambda x: normalize(x))
+
+    tmp["admin_promo_menu_cache"] = (menu_idx, cats, cat_names)
+    return tmp["admin_promo_menu_cache"]
+
+
+def _clear_menu_cached(sess: Dict[str, Any]) -> None:
+    sess.setdefault("tmp", {}).pop("admin_promo_menu_cache", None)
+
+
+def _combo_lines(combo_items: List[Dict[str, Any]]) -> List[str]:
+    lines: List[str] = []
+    for it in combo_items:
+        qty = int(it.get("qty") or 1)
+        name = str(it.get("name") or it.get("sku") or "").strip()
+        unit_price = float(it.get("unit_price") or 0.0)
+        line_total = round(qty * unit_price, 2)
+        lines.append(f"• {qty} x {name} — Bs {fmt_price_short(line_total)}")
+    return lines
+
+
+def _combo_original_total(combo_items: List[Dict[str, Any]]) -> float:
+    total = 0.0
+    for it in combo_items:
+        qty = int(it.get("qty") or 1)
+        unit_price = float(it.get("unit_price") or 0.0)
+        total += qty * unit_price
+    return round(total, 2)
+
+
 # -------------------------
 # Home
 # -------------------------
@@ -166,6 +205,9 @@ def send_admin_promotions_home(
     tmp.pop("admin_promo_create_original_price", None)
     tmp.pop("admin_promo_create_promo_price", None)
     tmp.pop("admin_promo_create_description", None)
+    tmp.pop("admin_promo_discount_category", None)
+    tmp.pop("admin_promo_combo_category", None)
+    _clear_menu_cached(sess)
 
     msg = (
         "🎁 PROMOCIONES\n\n"
@@ -329,6 +371,9 @@ def send_admin_promotions_create_home(
     tmp.pop("admin_promo_create_original_price", None)
     tmp.pop("admin_promo_create_promo_price", None)
     tmp.pop("admin_promo_create_description", None)
+    tmp.pop("admin_promo_discount_category", None)
+    tmp.pop("admin_promo_combo_category", None)
+    _clear_menu_cached(sess)
 
     msg = (
         "➕ CREAR PROMOCIÓN\n\n"
@@ -371,6 +416,228 @@ def send_admin_promotions_ask_name(
         reply_markup=kb([
             [("⬅️ Volver", f"admpromo|{tenant_id}|create")],
         ]),
+    )
+
+
+def admin_promotions_category_kb(
+    tenant_id: str,
+    cat_names: List[str],
+    callback_prefix: str,
+    back_callback: str,
+) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    for idx, cat in enumerate(cat_names[:30]):
+        rows.append([(f"📂 {cat}", f"{callback_prefix}|cat|{idx}")])
+
+    rows.append([("⬅️ Volver", back_callback)])
+    rows.append([("🏠 Promociones", f"admpromo|{tenant_id}|home")])
+
+    return kb(rows)
+
+
+def send_admin_promotions_discount_categories(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sess: Dict[str, Any],
+) -> bool:
+    _menu_idx, cats, cat_names = _get_menu_cached(sess, orders_sh)
+
+    tmp = sess.setdefault("tmp", {})
+    tmp["admin_promo_create_step"] = "discount_select_category"
+
+    msg = (
+        "💸 DESCUENTO DE PRODUCTO\n\n"
+        f"Nombre promo: {str(tmp.get('admin_promo_create_name') or '').strip()}\n\n"
+        "Elige la categoría del producto:"
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=admin_promotions_category_kb(
+            tenant_id=tenant_id,
+            cat_names=cat_names,
+            callback_prefix=f"admpromo|{tenant_id}|discount_pick",
+            back_callback=f"admpromo|{tenant_id}|create",
+        ),
+    )
+
+
+def send_admin_promotions_combo_categories(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sess: Dict[str, Any],
+) -> bool:
+    _menu_idx, cats, cat_names = _get_menu_cached(sess, orders_sh)
+
+    tmp = sess.setdefault("tmp", {})
+    tmp["admin_promo_create_step"] = "combo_select_category"
+
+    msg = (
+        "🎁 ARMAR COMBO\n\n"
+        f"Nombre promo: {str(tmp.get('admin_promo_create_name') or '').strip()}\n\n"
+        "Elige una categoría para agregar productos al combo:"
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=admin_promotions_category_kb(
+            tenant_id=tenant_id,
+            cat_names=cat_names,
+            callback_prefix=f"admpromo|{tenant_id}|combo_pick",
+            back_callback=f"admpromo|{tenant_id}|create",
+        ),
+    )
+
+
+def admin_promotions_product_kb(
+    tenant_id: str,
+    items: List[Dict[str, Any]],
+    callback_prefix: str,
+    back_callback: str,
+) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    for it in items[:30]:
+        sku = str(it.get("sku") or "").strip()
+        name = str(it.get("name") or "").strip()
+        price_txt = fmt_price_short(it.get("price", 0))
+        rows.append([(f"{name} — Bs {price_txt}", f"{callback_prefix}|sku|{sku}")])
+
+    rows.append([("⬅️ Volver", back_callback)])
+    rows.append([("🏠 Promociones", f"admpromo|{tenant_id}|home")])
+
+    return kb(rows)
+
+
+def send_admin_promotions_discount_products(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sess: Dict[str, Any],
+    category: str,
+) -> bool:
+    _menu_idx, cats, _cat_names = _get_menu_cached(sess, orders_sh)
+    items = cats.get(category, [])
+
+    tmp = sess.setdefault("tmp", {})
+    tmp["admin_promo_create_step"] = "discount_select_product"
+    tmp["admin_promo_discount_category"] = category
+
+    msg = (
+        "💸 DESCUENTO DE PRODUCTO\n\n"
+        f"Categoría: {category}\n\n"
+        "Elige el producto al que aplicarás el descuento:"
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=admin_promotions_product_kb(
+            tenant_id=tenant_id,
+            items=items,
+            callback_prefix=f"admpromo|{tenant_id}|discount_pick",
+            back_callback=f"admpromo|{tenant_id}|discount_back_categories",
+        ),
+    )
+
+
+def send_admin_promotions_combo_products(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    orders_sh,
+    sess: Dict[str, Any],
+    category: str,
+) -> bool:
+    _menu_idx, cats, _cat_names = _get_menu_cached(sess, orders_sh)
+    items = cats.get(category, [])
+
+    tmp = sess.setdefault("tmp", {})
+    tmp["admin_promo_create_step"] = "combo_select_product"
+    tmp["admin_promo_combo_category"] = category
+
+    msg = (
+        "🎁 ARMAR COMBO\n\n"
+        f"Categoría: {category}\n\n"
+        "Elige un producto para agregar al combo:"
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=admin_promotions_product_kb(
+            tenant_id=tenant_id,
+            items=items,
+            callback_prefix=f"admpromo|{tenant_id}|combo_pick",
+            back_callback=f"admpromo|{tenant_id}|combo_back_categories",
+        ),
+    )
+
+
+def admin_promotions_combo_builder_kb(
+    tenant_id: str,
+    combo_items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    for idx, it in enumerate(combo_items[:20]):
+        qty = int(it.get("qty") or 1)
+        name = str(it.get("name") or it.get("sku") or "").strip()
+        rows.append([
+            (f"➖ {name}", f"admpromo|{tenant_id}|combo_qty|{idx}|dec"),
+            (f"{qty}", "admpromo|noop"),
+            (f"➕ {name}", f"admpromo|{tenant_id}|combo_qty|{idx}|inc"),
+        ])
+        rows.append([
+            (f"🗑 Quitar {name}", f"admpromo|{tenant_id}|combo_remove|{idx}"),
+        ])
+
+    rows.append([("➕ Agregar más productos", f"admpromo|{tenant_id}|combo_back_categories")])
+    rows.append([("✅ Seguir con precio", f"admpromo|{tenant_id}|combo_continue_price")])
+    rows.append([("❌ Cancelar", f"admpromo|{tenant_id}|home")])
+
+    return kb(rows)
+
+
+def send_admin_promotions_combo_builder(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    sess: Dict[str, Any],
+) -> bool:
+    tmp = sess.setdefault("tmp", {})
+    combo_items = tmp.get("admin_promo_create_combo_items") or []
+    tmp["admin_promo_create_step"] = "combo_builder"
+
+    lines = _combo_lines(combo_items)
+    original_total = _combo_original_total(combo_items)
+    lines_txt = "\n".join(lines) if lines else "• Aún no agregaste productos"
+
+    msg = (
+        "🎁 ARMAR COMBO\n\n"
+        f"Nombre promo: {str(tmp.get('admin_promo_create_name') or '').strip()}\n\n"
+        f"Productos seleccionados:\n{lines_txt}\n\n"
+        f"Precio normal total: Bs {fmt_price_short(original_total)}\n\n"
+        "Puedes ajustar cantidades, quitar productos o seguir con el precio promocional."
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=admin_promotions_combo_builder_kb(tenant_id, combo_items),
     )
 
 
