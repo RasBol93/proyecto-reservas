@@ -1,4 +1,4 @@
-# app/admin_callbacks.py — callbacks admin sin teclado persistente inferior y con cierre correcto de pedido manual
+# app/admin_callbacks.py — callbacks admin con promociones integradas
 
 from typing import Any, Dict
 
@@ -6,6 +6,7 @@ from app.admin_callbacks_menu import handle_admin_menu_callback
 from app.admin_callbacks_surveys import handle_admin_surveys_callback
 from app.admin_callbacks_orders import handle_admin_orders_callback
 from app.admin_callbacks_hours import handle_admin_hours_routed_callback
+from app.admin_callbacks_promotions import handle_admin_promotions_callback  # 🔥 NUEVO
 
 from app.telegram_api import telegram_send_text
 from app.utils import log_event
@@ -48,6 +49,20 @@ def handle_admin_callback_impl(
     tenant_tz: str,
 ) -> Dict[str, Any]:
     try:
+
+        # 🔥 PROMOCIONES (PRIMER FILTRO)
+        promotions_result = handle_admin_promotions_callback(
+            tenant=tenant,
+            tenant_id=tenant_id,
+            bot_token=bot_token,
+            chat_id=chat_id,
+            data=data,
+            orders_sh=orders_sh,
+            get_effective_admin_role=_effective_admin_role,
+        )
+        if promotions_result is not None:
+            return promotions_result
+
         if data == "admin_panel":
             user_role = _effective_admin_role(tenant, chat_id)
             telegram_send_text(
