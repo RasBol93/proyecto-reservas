@@ -40,6 +40,7 @@ def admin_panel_kb(user_role: str = "admin"):
 
     rows.append([
         ("📝 Encuestas", "admin_surveys"),
+        ("🎁 Promociones", "admin_promotions"),
     ])
 
     # BLOQUE 3: CONFIGURACIÓN
