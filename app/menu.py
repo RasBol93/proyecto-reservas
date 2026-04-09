@@ -1,5 +1,3 @@
-# app/menu.py
-
 from typing import Any, Dict, List, Optional, Tuple
 import re
 import time
@@ -9,6 +7,7 @@ from fastapi import HTTPException
 from app.sheets import get_ws, read_records_manual, detect_header_row
 from app.utils import to_bool, normalize, log_event
 from app.alerts import alert_system_error, alert_tenant_error
+from app.promotions import get_active_promotions
 
 
 REQUIRED_MENU_HEADERS = ["sku", "name", "price", "active", "category"]
@@ -22,6 +21,8 @@ MENU_CACHE_TTL_SECONDS = 90
 # Retry simple y corto para operaciones de red/Sheets
 _MENU_RETRY_ATTEMPTS = 3
 _MENU_RETRY_SLEEP_SECONDS = 0.30
+
+PROMOTIONS_CATEGORY_NAME = "🎁 Promociones"
 
 
 # -------------------------
@@ -311,6 +312,153 @@ def _looks_like_headerish_menu_row(sku: str, name: str, price_raw: str, active_r
     return matches >= 3
 
 
+def _build_discount_promo_virtual_item(promo: Dict[str, Any], menu_idx: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    product_sku = str(promo.get("product_sku") or "").strip()
+    if not product_sku:
+        return None
+
+    base_item = menu_idx.get(product_sku)
+    if not base_item:
+        return None
+
+    promo_id = str(promo.get("promo_id") or "").strip()
+    promo_name = str(promo.get("name") or "").strip()
+    description = str(promo.get("description") or "").strip()
+
+    original_price = float(promo.get("original_price") or 0.0)
+    promo_price = float(promo.get("promo_price") or 0.0)
+
+    if original_price <= 0:
+        original_price = float(base_item.get("price") or 0.0)
+
+    if promo_price <= 0:
+        return None
+
+    if not promo_name:
+        promo_name = str(base_item.get("name") or product_sku).strip()
+
+    if not description:
+        description = f"De Bs {int(original_price) if float(original_price).is_integer() else original_price} a Bs {int(promo_price) if float(promo_price).is_integer() else promo_price}"
+
+    return {
+        "sku": f"promo::{promo_id}",
+        "name": promo_name,
+        "price": float(promo_price),
+        "category": PROMOTIONS_CATEGORY_NAME,
+        "photo_file_id": str(base_item.get("photo_file_id") or "").strip(),
+        "photo_url": str(base_item.get("photo_url") or "").strip(),
+        "is_promo": True,
+        "promo_id": promo_id,
+        "promo_type": "discount",
+        "promo_description": description,
+        "promo_original_price": float(original_price),
+        "base_product_sku": product_sku,
+    }
+
+
+def _build_combo_promo_virtual_item(promo: Dict[str, Any], menu_idx: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    promo_id = str(promo.get("promo_id") or "").strip()
+    promo_name = str(promo.get("name") or "").strip()
+    combo_items = promo.get("combo_items") or []
+    promo_price = float(promo.get("promo_price") or 0.0)
+    original_price = float(promo.get("original_price") or 0.0)
+    description = str(promo.get("description") or "").strip()
+
+    if not promo_id or not promo_name or not isinstance(combo_items, list) or not combo_items:
+        return None
+
+    resolved_items: List[Dict[str, Any]] = []
+    first_photo_url = ""
+    first_photo_file_id = ""
+
+    computed_original = 0.0
+    for it in combo_items:
+        sku = str(it.get("sku") or "").strip()
+        if not sku or sku not in menu_idx:
+            return None
+
+        try:
+            qty = int(it.get("qty") or 1)
+        except Exception:
+            qty = 1
+        qty = max(1, qty)
+
+        base_item = menu_idx[sku]
+        base_price = float(base_item.get("price") or 0.0)
+        computed_original += base_price * qty
+
+        if not first_photo_url:
+            first_photo_url = str(base_item.get("photo_url") or "").strip()
+        if not first_photo_file_id:
+            first_photo_file_id = str(base_item.get("photo_file_id") or "").strip()
+
+        resolved_items.append({
+            "sku": sku,
+            "qty": qty,
+            "name": str(base_item.get("name") or sku).strip(),
+            "unit_price": base_price,
+        })
+
+    if original_price <= 0:
+        original_price = computed_original
+
+    if promo_price <= 0:
+        return None
+
+    if not description:
+        item_names = " + ".join([str(x.get("name") or "").strip() for x in resolved_items[:3] if str(x.get("name") or "").strip()])
+        if item_names:
+            description = item_names
+
+    return {
+        "sku": f"promo::{promo_id}",
+        "name": promo_name,
+        "price": float(promo_price),
+        "category": PROMOTIONS_CATEGORY_NAME,
+        "photo_file_id": first_photo_file_id,
+        "photo_url": first_photo_url,
+        "is_promo": True,
+        "promo_id": promo_id,
+        "promo_type": "combo",
+        "promo_description": description,
+        "promo_original_price": float(original_price),
+        "combo_items": resolved_items,
+    }
+
+
+def _build_virtual_promotions_index(orders_sh, menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    result: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        promos = get_active_promotions(orders_sh)
+    except Exception as e:
+        try:
+            log_event("menu_promotions_load_failed", error=str(e))
+        except Exception:
+            pass
+        return result
+
+    for promo in promos:
+        promo_type = str(promo.get("type") or "").strip().lower()
+        item: Optional[Dict[str, Any]] = None
+
+        if promo_type == "discount":
+            item = _build_discount_promo_virtual_item(promo, menu_idx)
+        elif promo_type == "combo":
+            item = _build_combo_promo_virtual_item(promo, menu_idx)
+
+        if not item:
+            continue
+
+        sku = str(item.get("sku") or "").strip()
+        if not sku:
+            continue
+
+        result[sku] = item
+
+    return result
+
+
 # -------------------------
 # Public API (cliente)
 # -------------------------
@@ -338,6 +486,7 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
             "skipped_bad_price": 0,
             "skipped_headerish": 0,
             "duplicates": 0,
+            "virtual_promotions": 0,
         }
 
         for r in rows:
@@ -396,6 +545,11 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
                 "photo_url": photo_url,
             }
 
+        virtual_promos = _build_virtual_promotions_index(orders_sh, idx)
+        if virtual_promos:
+            idx.update(virtual_promos)
+            stats["virtual_promotions"] = len(virtual_promos)
+
         _cache_set(_MENU_CACHE, ck, idx)
 
         try:
@@ -421,19 +575,32 @@ def group_menu_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, Lis
 
     for item in menu_idx.values():
         cat = item.get("category", "") or "Otros"
-        cats.setdefault(cat, []).append(
-            {
-                "sku": item["sku"],
-                "name": item.get("name", ""),
-                "price": item.get("price", 0),
-                "category": cat,
-                "photo_file_id": item.get("photo_file_id", ""),
-                "photo_url": item.get("photo_url", ""),
-            }
-        )
+
+        row_item = {
+            "sku": item["sku"],
+            "name": item.get("name", ""),
+            "price": item.get("price", 0),
+            "category": cat,
+            "photo_file_id": item.get("photo_file_id", ""),
+            "photo_url": item.get("photo_url", ""),
+        }
+
+        if bool(item.get("is_promo")):
+            row_item["is_promo"] = True
+            row_item["promo_id"] = item.get("promo_id", "")
+            row_item["promo_type"] = item.get("promo_type", "")
+            row_item["promo_description"] = item.get("promo_description", "")
+            row_item["promo_original_price"] = item.get("promo_original_price", 0)
+            row_item["base_product_sku"] = item.get("base_product_sku", "")
+            row_item["combo_items"] = item.get("combo_items", [])
+
+        cats.setdefault(cat, []).append(row_item)
 
     for cat in cats:
-        cats[cat] = sorted(cats[cat], key=lambda x: normalize(x.get("name", "")))
+        if cat == PROMOTIONS_CATEGORY_NAME:
+            cats[cat] = sorted(cats[cat], key=lambda x: normalize(x.get("name", "")))
+        else:
+            cats[cat] = sorted(cats[cat], key=lambda x: normalize(x.get("name", "")))
 
     return cats
 
