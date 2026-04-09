@@ -6,7 +6,7 @@ from app.admin_callbacks_menu import handle_admin_menu_callback
 from app.admin_callbacks_surveys import handle_admin_surveys_callback
 from app.admin_callbacks_orders import handle_admin_orders_callback
 from app.admin_callbacks_hours import handle_admin_hours_routed_callback
-from app.admin_callbacks_promotions import handle_admin_promotions_callback  # 🔥 NUEVO
+from app.admin_callbacks_promotions import handle_admin_promotions_callback
 
 from app.telegram_api import telegram_send_text
 from app.utils import log_event
@@ -31,6 +31,9 @@ from app.admin_nav import (
 from app.admin_menu import (
     send_admin_menu_home,
 )
+from app.admin_promotions import (
+    send_admin_promotions_home,
+)
 
 
 def _effective_admin_role(tenant: Dict[str, Any], chat_id: int) -> str:
@@ -49,20 +52,6 @@ def handle_admin_callback_impl(
     tenant_tz: str,
 ) -> Dict[str, Any]:
     try:
-
-        # 🔥 PROMOCIONES (PRIMER FILTRO)
-        promotions_result = handle_admin_promotions_callback(
-            tenant=tenant,
-            tenant_id=tenant_id,
-            bot_token=bot_token,
-            chat_id=chat_id,
-            data=data,
-            orders_sh=orders_sh,
-            get_effective_admin_role=_effective_admin_role,
-        )
-        if promotions_result is not None:
-            return promotions_result
-
         if data == "admin_panel":
             user_role = _effective_admin_role(tenant, chat_id)
             telegram_send_text(
@@ -92,6 +81,11 @@ def handle_admin_callback_impl(
             assert_admin_authorized(tenant, chat_id, tenant_id)
             sess = get_sess(tenant_id, chat_id)
             return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if data == "admin_promotions":
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            sess = get_sess(tenant_id, chat_id)
+            return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
         if data == "admin_payments":
             assert_admin_authorized(tenant, chat_id, tenant_id)
@@ -237,6 +231,18 @@ def handle_admin_callback_impl(
         )
         if orders_result is not None:
             return orders_result
+
+        promotions_result = handle_admin_promotions_callback(
+            tenant=tenant,
+            tenant_id=tenant_id,
+            bot_token=bot_token,
+            chat_id=chat_id,
+            data=data,
+            orders_sh=orders_sh,
+            get_effective_admin_role=_effective_admin_role,
+        )
+        if promotions_result is not None:
+            return promotions_result
 
         menu_result = handle_admin_menu_callback(
             tenant=tenant,
