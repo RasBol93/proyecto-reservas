@@ -1,11 +1,12 @@
 # app/admin_messages.py — admin por texto "panel", pedido manual mejorado, QR de pagos,
-# comprobante manual y encuesta runtime
+# comprobante manual, encuesta runtime y promociones
 
 from typing import Any, Dict, Optional
 
 from app.admin_messages_menu import handle_admin_menu_message
 from app.admin_messages_surveys import handle_admin_surveys_message
 from app.admin_messages_orders import handle_admin_orders_message
+from app.admin_messages_promotions import handle_admin_promotions_message
 
 from app.telegram_api import telegram_send_text
 from app.telegram_keyboard import kb
@@ -20,6 +21,9 @@ from app.webhook_helpers import (
 from app.admin_hours import send_admin_hours_menu
 from app.admin_menu import (
     send_admin_menu_home,
+)
+from app.admin_promotions import (
+    send_admin_promotions_home,
 )
 from app.alerts import (
     alert_system_error,
@@ -69,6 +73,7 @@ def _build_admin_panel_text(is_owner: bool) -> str:
             "📊 Estadísticas\n"
             "👥 Clientes\n"
             "📝 Encuestas\n"
+            "🎁 Promociones\n"
             "🍔 Menú\n"
             "⏰ Horarios\n\n"
             "_Selecciona una opción del panel inferior._"
@@ -82,7 +87,7 @@ def _build_admin_panel_text(is_owner: bool) -> str:
         "*Análisis*\n"
         "📊 Estadísticas · 👥 Clientes · 📝 Encuestas\n\n"
         "*Configuración*\n"
-        "🍔 Menú · ⏰ Horarios\n\n"
+        "🎁 Promociones · 🍔 Menú · ⏰ Horarios\n\n"
         "_Selecciona una opción del panel inferior._"
     )
 
@@ -296,6 +301,18 @@ def handle_admin_message_impl(
         if orders_result is not None:
             return orders_result
 
+        promotions_result = handle_admin_promotions_message(
+            tenant=tenant,
+            tenant_id=tenant_id,
+            bot_token=bot_token,
+            chat_id=chat_id,
+            msg=msg,
+            orders_sh=orders_sh,
+            tmp=tmp,
+        )
+        if promotions_result is not None:
+            return promotions_result
+
         menu_result = handle_admin_menu_message(
             tenant=tenant,
             tenant_id=tenant_id,
@@ -371,6 +388,18 @@ def handle_admin_message_impl(
         ):
             assert_admin_authorized(tenant, chat_id, tenant_id)
             return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if txt_norm in (
+            "promociones",
+            "promocion",
+            "promo",
+            "promos",
+            "config promociones",
+            "configuracion promociones",
+            "configuracion de promociones",
+        ):
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
         if txt_norm in (
             "encuestas",
