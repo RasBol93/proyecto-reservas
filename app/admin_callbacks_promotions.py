@@ -1,33 +1,22 @@
-# app/admin_callbacks_promotions.py — callbacks admin para promociones
+# app/admin_messages_promotions.py — mensajes admin para creación de promociones
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+import re
 
 from fastapi import HTTPException
 
 from app.telegram_api import telegram_send_text
 from app.telegram_keyboard import kb
-from app.webhook_helpers import (
-    get_sess,
-    assert_admin_authorized,
+from app.utils import normalize
+from app.webhook_helpers import fmt_price_short
+from app.menu import (
+    load_menu_admin_index,
+    group_menu_admin_by_category,
+    get_menu_product_or_404,
 )
-from app.admin_nav import admin_panel_kb
 from app.admin_promotions import (
-    _clear_promotions_cache,
-    send_admin_promotions_home,
-    send_admin_promotions_list,
-    send_admin_promotion_detail,
-    send_admin_promotions_create_home,
-    send_admin_promotions_ask_name,
     build_admin_promo_create_summary,
     admin_promotions_confirm_kb,
-)
-from app.promotions import (
-    invalidate_promotions_cache,
-    get_promotion_by_id,
-    set_promotion_active,
-    delete_promotion,
-    create_discount_promotion,
-    create_combo_promotion,
 )
 
 
@@ -50,272 +39,286 @@ def _safe_send_text(
         return False
 
 
-def _clear_admin_promo_create_state(tmp: Dict[str, Any]) -> None:
-    tmp.pop("admin_promo_create_step", None)
-    tmp.pop("admin_promo_create_type", None)
-    tmp.pop("admin_promo_create_name", None)
-    tmp.pop("admin_promo_create_product_sku", None)
-    tmp.pop("admin_promo_create_combo_items", None)
-    tmp.pop("admin_promo_create_original_price", None)
-    tmp.pop("admin_promo_create_promo_price", None)
-    tmp.pop("admin_promo_create_description", None)
+def _parse_price_text(text: str) -> Optional[float]:
+    s = str(text or "").strip().lower()
+    if not s:
+        return None
+
+    s = s.replace(",", ".")
+    m = re.search(r"(\d+(?:\.\d+)?)", s)
+    if not m:
+        return None
+
+    try:
+        value = float(m.group(1))
+    except Exception:
+        return None
+
+    if value < 0:
+        return None
+
+    return round(value, 2)
 
 
-def _go_back_to_list(
-    bot_token: str,
-    chat_id: int,
-    tenant_id: str,
-    orders_sh,
-    sess: Dict[str, Any],
-) -> Dict[str, Any]:
-    tmp = sess.setdefault("tmp", {})
-    list_mode = str(tmp.get("admin_promo_current_filter") or "").strip().lower()
-    if list_mode not in ("active", "inactive"):
-        return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
-    return {"ok": send_admin_promotions_list(bot_token, chat_id, tenant_id, orders_sh, sess, list_mode)}
+def _parse_combo_items_text(text: str, menu_idx: Dict[str, Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:
+    """
+    Formato esperado:
+    sku1 x2, sku2 x1
+    sku1, sku2 x3
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        return None
+
+    result: List[Dict[str, Any]] = []
+
+    for part in parts:
+        m = re.match(r"^\s*([A-Za-z0-9_\-:]+)\s*(?:x\s*(\d+))?\s*$", part, flags=re.IGNORECASE)
+        if not m:
+            return None
+
+        sku = str(m.group(1) or "").strip()
+        qty_raw = m.group(2)
+
+        if sku not in menu_idx:
+            return None
+
+        try:
+            qty = int(qty_raw) if qty_raw else 1
+        except Exception:
+            qty = 1
+        qty = max(1, qty)
+
+        item = menu_idx[sku]
+        result.append({
+            "sku": sku,
+            "qty": qty,
+            "name": str(item.get("name") or sku).strip(),
+            "unit_price": float(item.get("price") or 0.0),
+        })
+
+    return result
 
 
-def _send_combo_builder_placeholder(
-    bot_token: str,
-    chat_id: int,
-    tenant_id: str,
-    tmp: Dict[str, Any],
-) -> Dict[str, Any]:
-    combo_items = tmp.get("admin_promo_create_combo_items") or []
+def _build_categories_kb(tenant_id: str, cats: Dict[str, List[Dict[str, Any]]], callback_prefix: str) -> Dict[str, Any]:
+    cat_names = sorted(cats.keys(), key=lambda x: normalize(x))
+    rows = []
 
-    if combo_items:
-        lines = []
-        for it in combo_items:
-            qty = int(it.get("qty") or 1)
-            name = str(it.get("name") or it.get("sku") or "").strip()
-            lines.append(f"• {qty} x {name}")
-        combo_txt = "\n".join(lines)
-    else:
-        combo_txt = "• Aún no agregaste productos"
+    for idx, cat in enumerate(cat_names[:30]):
+        rows.append([(f"📂 {cat}", f"{callback_prefix}|cat|{idx}")])
 
-    msg = (
-        "🎁 CREAR COMBO\n\n"
-        "Construcción inicial del combo.\n\n"
-        f"Items actuales:\n{combo_txt}\n\n"
-        "Por ahora, el siguiente paso recomendado es escribir los productos en el mensaje "
-        "siguiendo un formato como:\n"
-        "`sku1 x2, sku2 x1`\n\n"
-        "Luego definiremos el precio total del combo."
-    )
-
-    _safe_send_text(
-        bot_token,
-        chat_id,
-        msg,
-        reply_markup=kb([
-            [("⬅️ Cancelar", f"admpromo|{tenant_id}|home")],
-        ]),
-        parse_mode="Markdown",
-    )
-    return {"ok": True}
+    rows.append([("⬅️ Cancelar", f"admpromo|{tenant_id}|home")])
+    return kb(rows)
 
 
-def handle_admin_promotions_callback(
+def _build_products_kb(tenant_id: str, items: List[Dict[str, Any]], callback_prefix: str) -> Dict[str, Any]:
+    rows = []
+
+    for it in items[:30]:
+        sku = str(it.get("sku") or "").strip()
+        name = str(it.get("name") or "").strip()
+        price_txt = fmt_price_short(it.get("price", 0))
+        rows.append([(f"{name} — Bs {price_txt}", f"{callback_prefix}|sku|{sku}")])
+
+    rows.append([("⬅️ Cancelar", f"admpromo|{tenant_id}|home")])
+    return kb(rows)
+
+
+def _build_combo_quick_add_kb(tenant_id: str) -> Dict[str, Any]:
+    return kb([
+        [("✅ Listo, seguir", f"admpromo|{tenant_id}|create_discount_preview")],
+        [("⬅️ Cancelar", f"admpromo|{tenant_id}|home")],
+    ])
+
+
+def handle_admin_promotions_message(
     tenant: Dict[str, Any],
     tenant_id: str,
     bot_token: str,
     chat_id: int,
-    data: str,
+    msg: Dict[str, Any],
     orders_sh,
-    get_effective_admin_role,
+    tmp: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    if not data.startswith("admpromo|"):
+    text = (msg.get("text") or "").strip()
+    if not text:
         return None
 
-    assert_admin_authorized(tenant, chat_id, tenant_id)
+    step = str(tmp.get("admin_promo_create_step") or "").strip().lower()
+    if not step:
+        return None
 
-    parts = data.split("|")
-    if len(parts) < 3:
-        return {"ok": True}
+    promo_type = str(tmp.get("admin_promo_create_type") or "").strip().lower()
 
-    cb_tenant_id = parts[1].strip()
-    if cb_tenant_id != tenant_id:
-        raise HTTPException(status_code=400, detail="Tenant mismatch in admin promotions callback")
-
-    action = parts[2].strip()
-    sess = get_sess(tenant_id, chat_id)
-    tmp = sess.setdefault("tmp", {})
-
-    if action == "panel":
-        _clear_admin_promo_create_state(tmp)
-        _clear_promotions_cache(sess)
-
-        user_role = get_effective_admin_role(tenant, chat_id)
-        _safe_send_text(
-            bot_token,
-            chat_id,
-            "🧭 *PANEL ADMIN*\n\nElige una opción:",
-            reply_markup=admin_panel_kb(user_role=user_role),
-            parse_mode="Markdown",
-        )
-        return {"ok": True}
-
-    if action == "menu":
-        _clear_admin_promo_create_state(tmp)
-        _clear_promotions_cache(sess)
-        _safe_send_text(
-            bot_token,
-            chat_id,
-            "🍔 *MENÚ*\n\nVuelve al módulo menú desde el panel.",
-            reply_markup=kb([
-                [("🧭 Panel admin", "admin_panel")],
-            ]),
-            parse_mode="Markdown",
-        )
-        return {"ok": True}
-
-    if action == "home":
-        _clear_admin_promo_create_state(tmp)
-        _clear_promotions_cache(sess)
-        return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
-
-    if action == "refresh":
-        invalidate_promotions_cache(orders_sh)
-        _clear_promotions_cache(sess)
-        _safe_send_text(
-            bot_token,
-            chat_id,
-            "✅ Promociones refrescadas.",
-        )
-        return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
-
-    if action == "list" and len(parts) >= 4:
-        list_mode = str(parts[3] or "").strip().lower()
-        if list_mode not in ("active", "inactive"):
-            return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
-
-        _clear_admin_promo_create_state(tmp)
-        _clear_promotions_cache(sess)
-        return {"ok": send_admin_promotions_list(bot_token, chat_id, tenant_id, orders_sh, sess, list_mode)}
-
-    if action == "backlist":
-        return _go_back_to_list(bot_token, chat_id, tenant_id, orders_sh, sess)
-
-    if action == "detail" and len(parts) >= 4:
-        promo_id = str(parts[3] or "").strip()
-        if not promo_id:
-            return _go_back_to_list(bot_token, chat_id, tenant_id, orders_sh, sess)
-
-        _clear_admin_promo_create_state(tmp)
-        return {"ok": send_admin_promotion_detail(bot_token, chat_id, tenant_id, orders_sh, sess, promo_id)}
-
-    if action == "toggle" and len(parts) >= 4:
-        promo_id = str(parts[3] or "").strip()
-        if not promo_id:
-            return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
-
-        promo_before = get_promotion_by_id(orders_sh, promo_id)
-        if not promo_before:
+    # -------------------------------------------------
+    # STEP: name
+    # -------------------------------------------------
+    if step == "name":
+        name = str(text or "").strip()
+        if not name:
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No encontré esa promoción.",
+                "⚠️ El nombre no puede estar vacío.",
             )
-            return _go_back_to_list(bot_token, chat_id, tenant_id, orders_sh, sess)
+            return {"ok": True}
 
-        updated = set_promotion_active(
-            orders_sh=orders_sh,
-            promo_id=promo_id,
-            is_active=not bool(promo_before.get("active", False)),
-        )
+        tmp["admin_promo_create_name"] = name
 
-        invalidate_promotions_cache(orders_sh)
-        _clear_promotions_cache(sess)
-
-        _safe_send_text(
-            bot_token,
-            chat_id,
-            f"✅ Promoción actualizada.\nEstado: {'Activa' if updated.get('active') else 'Inactiva'}",
-        )
-        return {"ok": send_admin_promotion_detail(bot_token, chat_id, tenant_id, orders_sh, sess, promo_id)}
-
-    if action == "delete" and len(parts) >= 4:
-        promo_id = str(parts[3] or "").strip()
-        if not promo_id:
-            return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
-
-        promo = get_promotion_by_id(orders_sh, promo_id)
-        promo_name = str((promo or {}).get("name") or promo_id).strip()
-
-        delete_promotion(orders_sh, promo_id)
-        invalidate_promotions_cache(orders_sh)
-        _clear_promotions_cache(sess)
-        tmp.pop("admin_promo_current_id", None)
-
-        _safe_send_text(
-            bot_token,
-            chat_id,
-            f"🗑 Promoción eliminada.\n{promo_name}",
-        )
-        return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
-
-    if action == "create":
-        _clear_promotions_cache(sess)
-        return {"ok": send_admin_promotions_create_home(bot_token, chat_id, tenant_id, sess)}
-
-    if action == "create_type" and len(parts) >= 4:
-        promo_type = str(parts[3] or "").strip().lower()
-        if promo_type not in ("discount", "combo"):
-            return {"ok": send_admin_promotions_create_home(bot_token, chat_id, tenant_id, sess)}
-
-        return {"ok": send_admin_promotions_ask_name(bot_token, chat_id, tenant_id, promo_type, sess)}
-
-    if action == "create_confirm":
-        promo_type = str(tmp.get("admin_promo_create_type") or "").strip().lower()
-
+        # -------- discount flow --------
         if promo_type == "discount":
-            created = create_discount_promotion(
-                orders_sh=orders_sh,
-                name=str(tmp.get("admin_promo_create_name") or "").strip(),
-                product_sku=str(tmp.get("admin_promo_create_product_sku") or "").strip(),
-                original_price=float(tmp.get("admin_promo_create_original_price") or 0),
-                promo_price=float(tmp.get("admin_promo_create_promo_price") or 0),
-                description=str(tmp.get("admin_promo_create_description") or "").strip(),
-                active=True,
-            )
+            menu_idx = load_menu_admin_index(orders_sh, force=False)
+            cats = group_menu_admin_by_category(menu_idx)
 
-        elif promo_type == "combo":
-            created = create_combo_promotion(
-                orders_sh=orders_sh,
-                name=str(tmp.get("admin_promo_create_name") or "").strip(),
-                combo_items=tmp.get("admin_promo_create_combo_items") or [],
-                original_price=float(tmp.get("admin_promo_create_original_price") or 0),
-                promo_price=float(tmp.get("admin_promo_create_promo_price") or 0),
-                description=str(tmp.get("admin_promo_create_description") or "").strip(),
-                active=True,
-            )
-        else:
+            tmp["admin_promo_create_step"] = "discount_select_category"
+            tmp["admin_promo_discount_categories"] = sorted(cats.keys(), key=lambda x: normalize(x))
+
             _safe_send_text(
                 bot_token,
                 chat_id,
-                "⚠️ No hay una promoción lista para confirmar.",
+                (
+                    "💸 DESCUENTO DE PRODUCTO\n\n"
+                    f"Nombre promo: {name}\n\n"
+                    "Ahora elige la categoría del producto:"
+                ),
+                reply_markup=_build_categories_kb(
+                    tenant_id=tenant_id,
+                    cats=cats,
+                    callback_prefix=f"admpromo|{tenant_id}|create_discount_select",
+                ),
             )
-            return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+            return {"ok": True}
 
-        invalidate_promotions_cache(orders_sh)
-        _clear_promotions_cache(sess)
-        _clear_admin_promo_create_state(tmp)
+        # -------- combo flow --------
+        if promo_type == "combo":
+            tmp["admin_promo_create_step"] = "combo_items"
+            tmp["admin_promo_create_combo_items"] = []
+
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                (
+                    "🎁 CREAR COMBO\n\n"
+                    f"Nombre promo: {name}\n\n"
+                    "Ahora escribe los productos del combo en este formato:\n"
+                    "`sku1 x2, sku2 x1`\n\n"
+                    "Ejemplo:\n"
+                    "`burg01 x1, papa01 x1, coca01 x1`"
+                ),
+                reply_markup=_build_combo_quick_add_kb(tenant_id),
+                parse_mode="Markdown",
+            )
+            return {"ok": True}
+
+        return {"ok": True}
+
+    # -------------------------------------------------
+    # STEP: combo_items
+    # -------------------------------------------------
+    if step == "combo_items":
+        menu_idx = load_menu_admin_index(orders_sh, force=False)
+        combo_items = _parse_combo_items_text(text, menu_idx)
+
+        if not combo_items:
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                (
+                    "⚠️ No pude leer los items del combo.\n\n"
+                    "Usa este formato:\n"
+                    "`sku1 x2, sku2 x1`"
+                ),
+                parse_mode="Markdown",
+            )
+            return {"ok": True}
+
+        tmp["admin_promo_create_combo_items"] = combo_items
+
+        original_price = 0.0
+        lines = []
+        for it in combo_items:
+            qty = int(it.get("qty") or 1)
+            name = str(it.get("name") or it.get("sku") or "").strip()
+            unit_price = float(it.get("unit_price") or 0.0)
+            original_price += qty * unit_price
+            lines.append(f"• {qty} x {name}")
+
+        tmp["admin_promo_create_original_price"] = round(original_price, 2)
+        tmp["admin_promo_create_step"] = "promo_price"
 
         _safe_send_text(
             bot_token,
             chat_id,
-            f"✅ Promoción creada correctamente.\n{str(created.get('name') or '').strip()}",
+            (
+                "🎁 COMBO CONFIGURADO\n\n"
+                f"Items:\n{chr(10).join(lines)}\n\n"
+                f"Precio normal total: Bs {fmt_price_short(original_price)}\n\n"
+                "Ahora escribe el precio promocional del combo."
+            ),
         )
-        return {"ok": send_admin_promotion_detail(bot_token, chat_id, tenant_id, orders_sh, sess, str(created.get("promo_id") or "").strip())}
+        return {"ok": True}
 
-    if action == "create_combo_builder":
-        tmp["admin_promo_create_step"] = "combo_items"
-        if not isinstance(tmp.get("admin_promo_create_combo_items"), list):
-            tmp["admin_promo_create_combo_items"] = []
-        return _send_combo_builder_placeholder(bot_token, chat_id, tenant_id, tmp)
+    # -------------------------------------------------
+    # STEP: promo_price
+    # -------------------------------------------------
+    if step == "promo_price":
+        promo_price = _parse_price_text(text)
+        if promo_price is None:
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                "⚠️ No pude leer el precio promocional. Ejemplo válido: 25",
+            )
+            return {"ok": True}
 
-    if action == "create_discount_preview":
+        original_price = float(tmp.get("admin_promo_create_original_price") or 0.0)
+        if original_price <= 0:
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                "⚠️ El precio original no es válido.",
+            )
+            return {"ok": True}
+
+        if promo_price > original_price:
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                f"⚠️ El precio promocional no puede ser mayor al precio normal (Bs {fmt_price_short(original_price)}).",
+            )
+            return {"ok": True}
+
+        tmp["admin_promo_create_promo_price"] = round(promo_price, 2)
+        tmp["admin_promo_create_step"] = "description"
+
+        _safe_send_text(
+            bot_token,
+            chat_id,
+            (
+                "✍️ DESCRIPCIÓN DE PROMOCIÓN\n\n"
+                "Escribe una descripción corta visible.\n"
+                "También puedes escribir `auto` para que el sistema la genere."
+            ),
+        )
+        return {"ok": True}
+
+    # -------------------------------------------------
+    # STEP: description
+    # -------------------------------------------------
+    if step == "description":
+        description = str(text or "").strip()
+
+        if normalize(description) == "auto":
+            description = ""
+
+        tmp["admin_promo_create_description"] = description
+
         summary = build_admin_promo_create_summary(tmp)
+
         _safe_send_text(
             bot_token,
             chat_id,
@@ -324,4 +327,37 @@ def handle_admin_promotions_callback(
         )
         return {"ok": True}
 
-    return {"ok": True}
+    # -------------------------------------------------
+    # STEP: discount_select_product_manual
+    # (por si luego queremos entrada manual de sku)
+    # -------------------------------------------------
+    if step == "discount_select_product_manual":
+        sku = str(text or "").strip()
+
+        try:
+            product = get_menu_product_or_404(orders_sh, sku)
+        except Exception:
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                "⚠️ No encontré ese SKU. Intenta otra vez.",
+            )
+            return {"ok": True}
+
+        tmp["admin_promo_create_product_sku"] = sku
+        tmp["admin_promo_create_original_price"] = float(product.get("price") or 0.0)
+        tmp["admin_promo_create_step"] = "promo_price"
+
+        _safe_send_text(
+            bot_token,
+            chat_id,
+            (
+                "💸 PRODUCTO SELECCIONADO\n\n"
+                f"Producto: {product.get('name', '')}\n"
+                f"Precio actual: Bs {fmt_price_short(product.get('price', 0))}\n\n"
+                "Ahora escribe el nuevo precio promocional."
+            ),
+        )
+        return {"ok": True}
+
+    return None
