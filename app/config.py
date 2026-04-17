@@ -42,7 +42,7 @@ MAX_SOURCE_LEN = 20
 # =========================================================
 
 ALLOWED_DELIVERY_TYPES = {"pickup"}
-ALLOWED_SOURCES = {"api", "swagger", "telegram", "whatsapp"}
+ALLOWED_SOURCES = {"api", "swagger", "telegram", "whatsapp", "webapp"}
 
 
 # =========================================================

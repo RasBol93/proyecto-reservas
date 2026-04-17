@@ -26,7 +26,7 @@ except Exception:
     except Exception as e:
         raise ImportError("Error importing order writer") from e
 
-from app.orders import update_order_status, gen_order_id
+from app.orders import update_order_status, gen_order_id, build_items_snapshot
 
 from app.validators import (
     validate_tenant_id,
@@ -200,7 +200,11 @@ def create_order(payload: OrderCreateIn):
 
     delivery_type = validate_delivery_type(payload.delivery_type or "pickup")
     requested_time = validate_requested_time(payload.requested_time or "ahora")
-    source = validate_source(payload.source or "api")
+
+    raw_source = str(payload.source or "").strip().lower()
+    if not raw_source or raw_source == "api":
+        raw_source = "webapp"
+    source = validate_source(raw_source)
 
     orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
 
@@ -208,22 +212,31 @@ def create_order(payload: OrderCreateIn):
 
     items_list = [{"sku": it.sku.strip(), "qty": int(it.qty)} for it in payload.items]
     total_amount = calc_total_amount(items_list, menu_idx)
+    items_snapshot = build_items_snapshot(items_list, menu_idx)
 
     order_id = gen_order_id()
+    resolved_tenant_id = str(tenant.get("tenant_id") or payload.tenant_id).strip()
 
-    append_order_row(
+    result = append_order_row(
         orders_sh=orders_sh,
-        tenant_id=payload.tenant_id,
+        tenant_id=resolved_tenant_id,
         order_id=order_id,
         customer_name=name,
         customer_contact=contact,
         items=items_list,
+        items_snapshot=items_snapshot,
         delivery_type=delivery_type,
         requested_time=requested_time,
         status="PENDING_PAYMENT",
         source=source,
         total_amount=total_amount,
     )
+
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not persist order: {str(result.get('error') or 'sheet write failed')}",
+        )
 
     return OrderCreateOut(ok=True, order_id=order_id, total_amount=total_amount)
 

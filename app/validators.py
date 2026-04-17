@@ -73,9 +73,14 @@ def validate_requested_time(requested_time: str) -> str:
         return "ahora"
 
     requested_time = requested_time.strip()
+    if requested_time.lower() == "ahora":
+        return "ahora"
 
     if len(requested_time) > MAX_REQUESTED_TIME_LEN:
         raise HTTPException(status_code=422, detail="requested_time too long")
+
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", requested_time):
+        raise HTTPException(status_code=400, detail="requested_time must be 'ahora' or HH:MM")
 
     return requested_time
 
