@@ -402,7 +402,7 @@ def handle_admin_orders_callback(
                 )
                 return {"ok": True}
 
-            if not _is_paid_transition_ALLOWED(status_before):
+            if not _is_paid_transition_allowed(status_before):
                 _safe_send_text(
                     bot_token,
                     chat_id,
@@ -479,6 +479,12 @@ def handle_admin_orders_callback(
 
             if order_after:
                 _notify_client_order_paid(
+                    tenant=tenant,
+                    tenant_id=tenant_id,
+                    order_id=order_id,
+                    order_after=order_after,
+                )
+                _notify_owner_order_paid(
                     tenant=tenant,
                     tenant_id=tenant_id,
                     order_id=order_id,

@@ -26,7 +26,14 @@ except Exception:
     except Exception as e:
         raise ImportError("Error importing order writer") from e
 
-from app.orders import update_order_status, gen_order_id, build_items_snapshot
+from app.orders import (
+    update_order_status,
+    update_order_payment_proof,
+    gen_order_id,
+    build_items_snapshot,
+    get_order_by_id,
+)
+from app.payment_flow import notify_admin_payment_reported
 
 from app.validators import (
     validate_tenant_id,
@@ -74,6 +81,18 @@ def _serialize_pickup_slots(slots):
     return serialized
 
 
+def _get_order_for_tenant_or_404(orders_sh, tenant_id: str, order_id: str):
+    order = get_order_by_id(orders_sh, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    order_tenant_id = str(order.get("tenant_id") or "").strip()
+    if order_tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return order
+
+
 # =========================
 # Models
 # =========================
@@ -116,6 +135,32 @@ class MarkPaidOut(BaseModel):
     status: str
     old_status: Optional[str] = None
     already_paid: Optional[bool] = None
+
+
+class OrderReportPaidIn(BaseModel):
+    tenant_id: str
+    order_id: str
+
+
+class OrderReportPaidOut(BaseModel):
+    ok: bool
+    order_id: str
+    notified_admin: bool
+    already_paid: Optional[bool] = None
+
+
+class OrderPaymentProofIn(BaseModel):
+    tenant_id: str
+    order_id: str
+    proof_type: str
+    proof_reference: str
+    proof_caption: Optional[str] = ""
+
+
+class OrderPaymentProofOut(BaseModel):
+    ok: bool
+    order_id: str
+    proof_type: str
 
 
 # =========================
@@ -264,4 +309,100 @@ def mark_paid(payload: MarkPaidIn):
         ok=True,
         order_id=payload.order_id,
         status="PAID",
+    )
+
+
+@router.post("/orders/payment_proof", response_model=OrderPaymentProofOut)
+def set_order_payment_proof(payload: OrderPaymentProofIn):
+    validate_tenant_id(payload.tenant_id)
+    validate_order_id(payload.order_id)
+
+    clean_proof_type = str(payload.proof_type or "").strip().lower()
+    if clean_proof_type not in {"photo", "document", "external_url"}:
+        raise HTTPException(status_code=400, detail="proof_type must be one of ['document', 'external_url', 'photo']")
+
+    clean_proof_reference = str(payload.proof_reference or "").strip()
+    if not clean_proof_reference:
+        raise HTTPException(status_code=400, detail="proof_reference is required")
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(payload.tenant_id, gc=gc)
+
+    if not tenant.get("orders_enabled", False):
+        raise HTTPException(status_code=400, detail="Orders not enabled")
+
+    orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
+    resolved_tenant_id = str(tenant.get("tenant_id") or payload.tenant_id).strip()
+    order = _get_order_for_tenant_or_404(orders_sh, resolved_tenant_id, payload.order_id)
+
+    order_source = str(order.get("source") or "").strip().lower()
+    if order_source not in {"webapp", "api"}:
+        raise HTTPException(status_code=400, detail="Order source not supported for this endpoint")
+
+    result = update_order_payment_proof(
+        orders_sh=orders_sh,
+        order_id=payload.order_id,
+        proof_file_id=clean_proof_reference,
+        proof_type=clean_proof_type,
+        proof_caption=str(payload.proof_caption or "").strip(),
+    )
+
+    if not result.get("ok"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not persist payment proof: {str(result.get('error') or 'sheet write failed')}",
+        )
+
+    return OrderPaymentProofOut(
+        ok=True,
+        order_id=payload.order_id,
+        proof_type=clean_proof_type,
+    )
+
+
+@router.post("/orders/report_paid", response_model=OrderReportPaidOut)
+def report_order_paid(payload: OrderReportPaidIn):
+    validate_tenant_id(payload.tenant_id)
+    validate_order_id(payload.order_id)
+    rate_limiter.hit(f"report_paid:{payload.tenant_id}", RL_MARKPAID_PER_MIN)
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(payload.tenant_id, gc=gc)
+
+    if not tenant.get("orders_enabled", False):
+        raise HTTPException(status_code=400, detail="Orders not enabled")
+
+    orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
+    resolved_tenant_id = str(tenant.get("tenant_id") or payload.tenant_id).strip()
+    order = _get_order_for_tenant_or_404(orders_sh, resolved_tenant_id, payload.order_id)
+
+    order_source = str(order.get("source") or "").strip().lower()
+    if order_source not in {"webapp", "api"}:
+        raise HTTPException(status_code=400, detail="Order source not supported for this endpoint")
+
+    already_paid = str(order.get("status") or "").strip().upper() == "PAID"
+    if already_paid:
+        return OrderReportPaidOut(
+            ok=True,
+            order_id=payload.order_id,
+            notified_admin=False,
+            already_paid=True,
+        )
+
+    notified_admin = notify_admin_payment_reported(
+        tenant=tenant,
+        tenant_id=resolved_tenant_id,
+        orders_sh=orders_sh,
+        order_id=payload.order_id,
+        is_reminder=False,
+    )
+
+    if not notified_admin:
+        raise HTTPException(status_code=502, detail="Could not notify admin about reported payment")
+
+    return OrderReportPaidOut(
+        ok=True,
+        order_id=payload.order_id,
+        notified_admin=True,
+        already_paid=False,
     )

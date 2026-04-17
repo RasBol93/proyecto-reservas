@@ -173,6 +173,17 @@ def notify_admin_payment_reported(
         proof_file_id = str(order.get("payment_proof_file_id") or "").strip()
         proof_type = str(order.get("payment_proof_type") or "").strip()
         proof_caption = str(order.get("payment_proof_caption") or "").strip()
+        has_telegram_proof = bool(proof_file_id and proof_type in ("photo", "document"))
+
+        proof_section = ""
+        if proof_file_id and proof_type:
+            if has_telegram_proof:
+                proof_section = "Comprobante: adjunto a continuación.\n\n"
+            else:
+                proof_section = f"Comprobante: {proof_caption or proof_file_id}\n"
+                if proof_caption and proof_caption != proof_file_id:
+                    proof_section += f"Referencia: {proof_file_id}\n"
+                proof_section += "\n"
 
         confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{clean_order_id}")]])
 
@@ -184,6 +195,7 @@ def notify_admin_payment_reported(
             f"Cliente: {order.get('customer_name', '')}\n"
             f"Teléfono: {order.get('customer_contact', '')}\n\n"
             f"Hora de recojo: {order.get('requested_time', 'pendiente')}\n\n"
+            f"{proof_section}"
             f"Detalle:\n{lines_txt}\n\n"
             f"Total: Bs {total:.2f}\n\n"
             "Presiona ✅ Confirmar pago cuando verifiques."
@@ -198,7 +210,7 @@ def notify_admin_payment_reported(
             )
 
         ok_proof = False
-        if proof_file_id and proof_type:
+        if has_telegram_proof:
             ok_proof = forward_proof_to_admin(
                 tenant, tenant_id, proof_file_id, proof_type, proof_caption
             )

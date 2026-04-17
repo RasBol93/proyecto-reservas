@@ -27,6 +27,7 @@ _ALLOWED_ORDER_STATUSES = {
 _ALLOWED_PROOF_TYPES = {
     "photo",
     "document",
+    "external_url",
 }
 
 
