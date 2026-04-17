@@ -1,7 +1,10 @@
 # app/payment_flow.py — optimizado (menos lecturas, más simple)
 # hardened incremental: misma estructura, mismos contratos, más robustez
 
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
+import mimetypes
+from urllib.parse import urlparse, unquote
+from urllib.request import Request, urlopen
 
 from app.orders import get_order_by_id
 from app.telegram_api import (
@@ -28,6 +31,56 @@ from app.alerts import (
 )
 
 
+_EXTERNAL_PROOF_TIMEOUT_SECONDS = 10
+
+
+def _guess_filename_from_url(url: str, content_type: str) -> str:
+    try:
+        parsed = urlparse(str(url or "").strip())
+        name = unquote((parsed.path or "").split("/")[-1]).strip()
+    except Exception:
+        name = ""
+
+    if name:
+        return name
+
+    ext = mimetypes.guess_extension((content_type or "").split(";")[0].strip()) or ""
+    return f"proof{ext}"
+
+
+def _looks_like_image_content(filename: str, content_type: str) -> bool:
+    clean_content_type = (content_type or "").split(";")[0].strip().lower()
+    if clean_content_type.startswith("image/"):
+        return True
+
+    guessed_type, _ = mimetypes.guess_type(filename or "")
+    return bool((guessed_type or "").startswith("image/"))
+
+
+def _download_external_proof_bytes(url: str) -> Tuple[bytes, str, str]:
+    clean_url = str(url or "").strip()
+    if not clean_url:
+        raise RuntimeError("external proof url missing")
+
+    req = Request(
+        clean_url,
+        headers={
+            "User-Agent": "proyecto-reservas/1.0",
+            "Accept": "*/*",
+        },
+    )
+
+    with urlopen(req, timeout=_EXTERNAL_PROOF_TIMEOUT_SECONDS) as resp:
+        file_bytes = resp.read()
+        content_type = str(resp.headers.get("Content-Type") or "application/octet-stream").strip()
+
+    if not isinstance(file_bytes, (bytes, bytearray)) or len(file_bytes) == 0:
+        raise RuntimeError("downloaded external proof is empty")
+
+    filename = _guess_filename_from_url(clean_url, content_type)
+    return bytes(file_bytes), filename, content_type
+
+
 def forward_proof_to_admin(
     tenant: Dict[str, Any],
     tenant_id: str,
@@ -35,15 +88,14 @@ def forward_proof_to_admin(
     proof_type: str,
     proof_caption: str,
 ) -> bool:
-    client_token = get_client_bot_token(tenant)
     admin_token = get_admin_bot_token(tenant)
     admin_chat_id = get_admin_chat_id(tenant)
 
-    if not client_token or not admin_token or not admin_chat_id:
+    if not admin_token or not admin_chat_id:
         log_event("forward_proof_missing_config", tenant_id=tenant_id)
         alert_tenant_error(
             tenant_id=tenant_id,
-            error="Missing client/admin token or admin_chat_id",
+            error="Missing admin token or admin_chat_id",
         )
         return False
 
@@ -56,40 +108,55 @@ def forward_proof_to_admin(
         alert_payment_failed(tenant_id=tenant_id, error="Missing proof_file_id")
         return False
 
-    if clean_proof_type not in ("photo", "document"):
+    if clean_proof_type not in ("photo", "document", "external_url"):
         log_event("forward_proof_invalid_type", tenant_id=tenant_id, proof_type=clean_proof_type)
         alert_payment_failed(tenant_id=tenant_id, error=f"Invalid proof_type: {clean_proof_type}")
         return False
 
     try:
-        file_path = telegram_get_file_path(client_token, clean_file_id)
-        if not file_path:
-            log_event("forward_proof_file_path_missing", tenant_id=tenant_id, proof_type=clean_proof_type)
-            alert_telegram_error(
-                error="telegram_get_file_path returned empty path",
-                method="getFile",
-                chat_id=admin_chat_id,
-            )
-            return False
+        content_type = "application/octet-stream"
+        if clean_proof_type in ("photo", "document"):
+            client_token = get_client_bot_token(tenant)
+            if not client_token:
+                log_event("forward_proof_missing_client_token", tenant_id=tenant_id)
+                alert_tenant_error(
+                    tenant_id=tenant_id,
+                    error="Missing client token for Telegram proof forwarding",
+                )
+                return False
 
-        file_bytes = telegram_download_file_bytes(client_token, file_path)
-        if not file_bytes:
-            log_event("forward_proof_file_bytes_missing", tenant_id=tenant_id, proof_type=clean_proof_type)
-            alert_telegram_error(
-                error="telegram_download_file_bytes returned empty bytes",
-                method="downloadFile",
-                chat_id=admin_chat_id,
-            )
-            return False
+            file_path = telegram_get_file_path(client_token, clean_file_id)
+            if not file_path:
+                log_event("forward_proof_file_path_missing", tenant_id=tenant_id, proof_type=clean_proof_type)
+                alert_telegram_error(
+                    error="telegram_get_file_path returned empty path",
+                    method="getFile",
+                    chat_id=admin_chat_id,
+                )
+                return False
 
-        filename = file_path.split("/")[-1] if file_path else "proof"
+            file_bytes = telegram_download_file_bytes(client_token, file_path)
+            if not file_bytes:
+                log_event("forward_proof_file_bytes_missing", tenant_id=tenant_id, proof_type=clean_proof_type)
+                alert_telegram_error(
+                    error="telegram_download_file_bytes returned empty bytes",
+                    method="downloadFile",
+                    chat_id=admin_chat_id,
+                )
+                return False
+
+            filename = file_path.split("/")[-1] if file_path else "proof"
+            send_as_photo = clean_proof_type == "photo"
+        else:
+            file_bytes, filename, content_type = _download_external_proof_bytes(clean_file_id)
+            send_as_photo = _looks_like_image_content(filename, content_type)
 
         caption = clean_caption or (
-            "Comprobante (foto)" if clean_proof_type == "photo" else "Comprobante (archivo)"
+            "Comprobante (foto)" if send_as_photo else "Comprobante (archivo)"
         )
 
-        method = "sendPhoto" if clean_proof_type == "photo" else "sendDocument"
-        field = "photo" if clean_proof_type == "photo" else "document"
+        method = "sendPhoto" if send_as_photo else "sendDocument"
+        field = "photo" if send_as_photo else "document"
 
         ok = telegram_send_file_bytes(
             bot_token=admin_token,
@@ -97,7 +164,7 @@ def forward_proof_to_admin(
             chat_id=admin_chat_id,
             file_field=field,
             filename=filename,
-            content_type="application/octet-stream",
+            content_type=content_type,
             file_bytes=file_bytes,
             caption=caption,
         )
@@ -173,11 +240,11 @@ def notify_admin_payment_reported(
         proof_file_id = str(order.get("payment_proof_file_id") or "").strip()
         proof_type = str(order.get("payment_proof_type") or "").strip()
         proof_caption = str(order.get("payment_proof_caption") or "").strip()
-        has_telegram_proof = bool(proof_file_id and proof_type in ("photo", "document"))
+        has_forwardable_proof = bool(proof_file_id and proof_type in ("photo", "document", "external_url"))
 
         proof_section = ""
         if proof_file_id and proof_type:
-            if has_telegram_proof:
+            if proof_type in ("photo", "document"):
                 proof_section = "Comprobante: adjunto a continuación.\n\n"
             else:
                 proof_section = f"Comprobante: {proof_caption or proof_file_id}\n"
@@ -210,7 +277,7 @@ def notify_admin_payment_reported(
             )
 
         ok_proof = False
-        if has_telegram_proof:
+        if has_forwardable_proof:
             ok_proof = forward_proof_to_admin(
                 tenant, tenant_id, proof_file_id, proof_type, proof_caption
             )
