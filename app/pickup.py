@@ -81,6 +81,15 @@ def _build_dt(now: datetime, hhmm: str) -> datetime:
     return now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
 
 
+def _build_pickup_base_response(ctx: Dict[str, Any], interval: int) -> Dict[str, Any]:
+    return {
+        "open_time": ctx["open_time"],
+        "close_time": ctx["close_time"],
+        "last_order_time": ctx["last_order_time"],
+        "pickup_interval_minutes": interval,
+    }
+
+
 def _get_today_business_window(orders_sh, tenant_tz: str):
     bs = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
 
@@ -147,13 +156,7 @@ def generate_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
     cfg = get_pickup_config(orders_sh)
     ctx = _get_today_business_window(orders_sh, tenant_tz)
     interval = max(1, int(cfg["pickup_interval_minutes"]))
-
-    base_response = {
-        "open_time": ctx["open_time"],
-        "close_time": ctx["close_time"],
-        "last_order_time": ctx["last_order_time"],
-        "pickup_interval_minutes": interval,
-    }
+    base_response = _build_pickup_base_response(ctx, interval)
 
     if not ctx["accepts_orders_now"]:
         return {
@@ -219,6 +222,50 @@ def generate_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
     return {
         "ok": True,
         "message": "Elige una hora de recojo:",
+        "slots": slots,
+        **base_response,
+    }
+
+
+def generate_public_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
+    cfg = get_pickup_config(orders_sh)
+    ctx = _get_today_business_window(orders_sh, tenant_tz)
+    interval = max(1, int(cfg["pickup_interval_minutes"]))
+    base_response = _build_pickup_base_response(ctx, interval)
+
+    if not ctx["accepts_orders_now"]:
+        return {
+            "ok": False,
+            "message": ctx["public_message"] or "No estamos recibiendo pedidos en este momento.",
+            "slots": [],
+            **base_response,
+        }
+
+    current = ctx["now"] + timedelta(minutes=interval)
+
+    if ctx["last_dt"] and current > ctx["last_dt"]:
+        return {
+            "ok": False,
+            "message": "Ya no estamos aceptando pedidos hoy.",
+            "slots": [],
+            **base_response,
+        }
+
+    slots = []
+    while True:
+        if ctx["last_dt"] and current > ctx["last_dt"]:
+            break
+
+        hhmm = _format_hhmm(current)
+        slots.append({
+            "label": hhmm,
+            "hhmm": hhmm,
+        })
+        current += timedelta(minutes=interval)
+
+    return {
+        "ok": bool(slots),
+        "message": "Elige una hora de recojo:" if slots else "No hay horarios disponibles.",
         "slots": slots,
         **base_response,
     }

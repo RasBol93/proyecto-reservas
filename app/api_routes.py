@@ -16,7 +16,7 @@ from app.rate_limit import rate_limiter
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
 from app.tenants import get_tenant_or_404, load_tenants, tenants_cache_info
 from app.menu import load_menu_index, group_menu_by_category, calc_total_amount
-from app.pickup import generate_pickup_slots
+from app.pickup import generate_public_pickup_slots
 
 try:
     from app.orders import append_order_row
@@ -62,7 +62,6 @@ def _serialize_pickup_slots(slots):
     for slot in slots or []:
         hhmm = str(slot.get("hhmm") or "").strip()
         label = str(slot.get("label") or hhmm).strip()
-        slot_id = str(slot.get("id") or "").strip()
 
         if not hhmm:
             continue
@@ -70,8 +69,6 @@ def _serialize_pickup_slots(slots):
         serialized.append({
             "value": hhmm,
             "label": label,
-            "hhmm": hhmm,
-            "is_asap": slot_id == "pickup|asap",
         })
 
     return serialized
@@ -166,7 +163,7 @@ def get_pickup_slots(tenant_id: str = Query(...)):
     orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
     tenant_tz = str(tenant.get("timezone") or "America/La_Paz").strip() or "America/La_Paz"
 
-    pickup_data = generate_pickup_slots(orders_sh=orders_sh, tenant_tz=tenant_tz)
+    pickup_data = generate_public_pickup_slots(orders_sh=orders_sh, tenant_tz=tenant_tz)
 
     return {
         "ok": bool(pickup_data.get("ok")),
