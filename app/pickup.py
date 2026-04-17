@@ -146,16 +146,24 @@ def _get_today_business_window(orders_sh, tenant_tz: str):
 def generate_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
     cfg = get_pickup_config(orders_sh)
     ctx = _get_today_business_window(orders_sh, tenant_tz)
+    interval = max(1, int(cfg["pickup_interval_minutes"]))
+
+    base_response = {
+        "open_time": ctx["open_time"],
+        "close_time": ctx["close_time"],
+        "last_order_time": ctx["last_order_time"],
+        "pickup_interval_minutes": interval,
+    }
 
     if not ctx["accepts_orders_now"]:
         return {
             "ok": False,
             "message": ctx["public_message"] or "No estamos abiertos.",
             "slots": [],
+            **base_response,
         }
 
     now = ctx["now"]
-    interval = max(1, int(cfg["pickup_interval_minutes"]))
     lead = max(1, int(cfg["pickup_lead_time_minutes"]))
 
     earliest_asap = now + timedelta(minutes=lead)
@@ -171,6 +179,7 @@ def generate_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
             "ok": False,
             "message": "Ya no estamos aceptando pedidos hoy.",
             "slots": [],
+            **base_response,
         }
 
     if ctx["last_dt"] and first_interval_slot > ctx["last_dt"]:
@@ -183,10 +192,7 @@ def generate_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
             "ok": True,
             "message": "Elige una hora de recojo:",
             "slots": slots,
-            "open_time": ctx["open_time"],
-            "close_time": ctx["close_time"],
-            "last_order_time": ctx["last_order_time"],
-            "pickup_interval_minutes": interval,
+            **base_response,
         }
 
     slots = [{
@@ -214,10 +220,7 @@ def generate_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
         "ok": True,
         "message": "Elige una hora de recojo:",
         "slots": slots,
-        "open_time": ctx["open_time"],
-        "close_time": ctx["close_time"],
-        "last_order_time": ctx["last_order_time"],
-        "pickup_interval_minutes": interval,
+        **base_response,
     }
 
 

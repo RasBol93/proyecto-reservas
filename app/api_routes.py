@@ -16,6 +16,7 @@ from app.rate_limit import rate_limiter
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
 from app.tenants import get_tenant_or_404, load_tenants, tenants_cache_info
 from app.menu import load_menu_index, group_menu_by_category, calc_total_amount
+from app.pickup import generate_pickup_slots
 
 try:
     from app.orders import append_order_row
@@ -54,6 +55,26 @@ def _get_orders_sheet(gc, sheet_id):
     sh = open_spreadsheet_by_key(gc, sheet_id)
     _SHEET_CACHE[sheet_id] = sh
     return sh
+
+
+def _serialize_pickup_slots(slots):
+    serialized = []
+    for slot in slots or []:
+        hhmm = str(slot.get("hhmm") or "").strip()
+        label = str(slot.get("label") or hhmm).strip()
+        slot_id = str(slot.get("id") or "").strip()
+
+        if not hhmm:
+            continue
+
+        serialized.append({
+            "value": hhmm,
+            "label": label,
+            "hhmm": hhmm,
+            "is_asap": slot_id == "pickup|asap",
+        })
+
+    return serialized
 
 
 # =========================
@@ -129,6 +150,34 @@ def get_menu(tenant_id: str = Query(...)):
     categories = group_menu_by_category(menu_idx)
 
     return {"ok": True, "tenant_id": tenant_id, "categories": categories}
+
+
+@router.get("/pickup/slots")
+def get_pickup_slots(tenant_id: str = Query(...)):
+    validate_tenant_id(tenant_id)
+    rate_limiter.hit(f"pickup_slots:{tenant_id}", RL_MENU_PER_MIN)
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(tenant_id, gc=gc)
+
+    if not tenant.get("orders_enabled", False):
+        raise HTTPException(status_code=400, detail="Orders not enabled")
+
+    orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
+    tenant_tz = str(tenant.get("timezone") or "America/La_Paz").strip() or "America/La_Paz"
+
+    pickup_data = generate_pickup_slots(orders_sh=orders_sh, tenant_tz=tenant_tz)
+
+    return {
+        "ok": bool(pickup_data.get("ok")),
+        "tenant_id": tenant.get("tenant_id") or tenant_id,
+        "message": str(pickup_data.get("message") or ""),
+        "slots": _serialize_pickup_slots(pickup_data.get("slots") or []),
+        "pickup_interval_minutes": int(pickup_data.get("pickup_interval_minutes") or 0),
+        "open_time": str(pickup_data.get("open_time") or ""),
+        "close_time": str(pickup_data.get("close_time") or ""),
+        "last_order_time": str(pickup_data.get("last_order_time") or ""),
+    }
 
 
 @router.post("/orders/create", response_model=OrderCreateOut)
