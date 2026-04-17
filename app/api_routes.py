@@ -161,6 +161,8 @@ class OrderPaymentProofOut(BaseModel):
     ok: bool
     order_id: str
     proof_type: str
+    notified_admin: bool
+    verification_status: str
 
 
 # =========================
@@ -339,6 +341,9 @@ def set_order_payment_proof(payload: OrderPaymentProofIn):
     if order_source not in {"webapp", "api"}:
         raise HTTPException(status_code=400, detail="Order source not supported for this endpoint")
 
+    if str(order.get("status") or "").strip().upper() == "PAID":
+        raise HTTPException(status_code=409, detail="Order is already paid")
+
     result = update_order_payment_proof(
         orders_sh=orders_sh,
         order_id=payload.order_id,
@@ -353,10 +358,23 @@ def set_order_payment_proof(payload: OrderPaymentProofIn):
             detail=f"Could not persist payment proof: {str(result.get('error') or 'sheet write failed')}",
         )
 
+    notified_admin = notify_admin_payment_reported(
+        tenant=tenant,
+        tenant_id=resolved_tenant_id,
+        orders_sh=orders_sh,
+        order_id=payload.order_id,
+        is_reminder=False,
+    )
+
+    if not notified_admin:
+        raise HTTPException(status_code=502, detail="Payment proof saved but could not notify admin")
+
     return OrderPaymentProofOut(
         ok=True,
         order_id=payload.order_id,
         proof_type=clean_proof_type,
+        notified_admin=True,
+        verification_status="pending_verification",
     )
 
 
