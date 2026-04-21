@@ -1,11 +1,10 @@
 import secrets
 import time
 from pathlib import Path
-from typing import BinaryIO, Dict
+from typing import Dict
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError, SSLError
 
 from app.config import (
     ENV_R2_ACCOUNT_ID,
@@ -16,6 +15,9 @@ from app.config import (
     env_required,
 )
 from app.utils import log_event
+
+
+_PRESIGNED_UPLOAD_EXPIRES_SECONDS = 600
 
 
 def _clean_ext(filename: str, content_type: str) -> str:
@@ -71,44 +73,62 @@ def _get_r2_client(cfg: Dict[str, str]):
     )
 
 
-def upload_payment_proof_fileobj(fileobj: BinaryIO, filename: str, content_type: str = "") -> Dict[str, str]:
+def build_payment_proof_upload_target(filename: str, content_type: str = "") -> Dict[str, str]:
     cfg = _build_r2_config()
     ext = _clean_ext(filename=filename, content_type=content_type)
     key = f"payment_proofs/{int(time.time())}_{secrets.token_hex(8)}{ext}"
     clean_content_type = str(content_type or "").strip() or "application/octet-stream"
+    file_url = f"{cfg['public_base_url']}/{key}"
+
+    return {
+        "key": key,
+        "file_url": file_url,
+        "content_type": clean_content_type,
+    }
+
+
+def generate_payment_proof_presigned_upload(filename: str, content_type: str = "") -> Dict[str, str]:
+    cfg = _build_r2_config()
+    upload_target = build_payment_proof_upload_target(filename=filename, content_type=content_type)
+    client = _get_r2_client(cfg)
 
     try:
-        client = _get_r2_client(cfg)
-        client.upload_fileobj(
-            Fileobj=fileobj,
-            Bucket=cfg["bucket_name"],
-            Key=key,
-            ExtraArgs={"ContentType": clean_content_type},
+        upload_url = client.generate_presigned_url(
+            ClientMethod="put_object",
+            Params={
+                "Bucket": cfg["bucket_name"],
+                "Key": upload_target["key"],
+                "ContentType": upload_target["content_type"],
+            },
+            ExpiresIn=_PRESIGNED_UPLOAD_EXPIRES_SECONDS,
+            HttpMethod="PUT",
         )
-    except (SSLError, ClientError, BotoCoreError, Exception) as e:
+    except Exception as e:
         log_event(
-            "r2_payment_proof_upload_failed",
-            key=key,
+            "r2_payment_proof_presign_failed",
+            key=upload_target["key"],
             bucket_name=cfg["bucket_name"],
             endpoint_url=cfg["endpoint_url"],
             region_name="auto",
             signature_version="s3v4",
             addressing_style="path",
-            content_type=clean_content_type,
+            content_type=upload_target["content_type"],
             error_type=type(e).__name__,
             error=str(e),
         )
-        raise RuntimeError(f"R2 upload failed: {e}") from e
+        raise RuntimeError(f"R2 presign failed: {e}") from e
 
-    url = f"{cfg['public_base_url']}/{key}"
     log_event(
-        "r2_payment_proof_uploaded",
-        key=key,
+        "r2_payment_proof_presigned",
+        key=upload_target["key"],
         bucket_name=cfg["bucket_name"],
-        content_type=clean_content_type,
-        url=url,
+        endpoint_url=cfg["endpoint_url"],
+        content_type=upload_target["content_type"],
+        file_url=upload_target["file_url"],
+        expires_in_seconds=_PRESIGNED_UPLOAD_EXPIRES_SECONDS,
     )
     return {
-        "key": key,
-        "url": url,
+        "upload_url": upload_url,
+        "file_url": upload_target["file_url"],
+        "object_key": upload_target["key"],
     }

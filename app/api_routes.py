@@ -2,7 +2,7 @@
 
 from typing import List, Optional, Dict
 
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.config import (
@@ -34,7 +34,7 @@ from app.orders import (
     get_order_by_id,
 )
 from app.payment_flow import notify_admin_payment_reported
-from app.r2_storage import upload_payment_proof_fileobj
+from app.r2_storage import generate_payment_proof_presigned_upload
 
 from app.validators import (
     validate_tenant_id,
@@ -169,6 +169,18 @@ class OrderPaymentProofOut(BaseModel):
 class PaymentProofUploadOut(BaseModel):
     success: bool
     url: str
+
+
+class PaymentProofPresignIn(BaseModel):
+    filename: str
+    content_type: Optional[str] = ""
+
+
+class PaymentProofPresignOut(BaseModel):
+    success: bool
+    upload_url: str
+    file_url: str
+    object_key: str
 
 
 # =========================
@@ -321,21 +333,32 @@ def mark_paid(payload: MarkPaidIn):
 
 
 @router.post("/upload/payment-proof", response_model=PaymentProofUploadOut)
-async def upload_payment_proof(file: UploadFile = File(...)):
-    if file is None:
-        raise HTTPException(status_code=400, detail="file is required")
+def upload_payment_proof():
+    raise HTTPException(
+        status_code=410,
+        detail="Binary upload via backend is obsolete. Use POST /upload/payment-proof/presign instead.",
+    )
+
+
+@router.post("/upload/payment-proof/presign", response_model=PaymentProofPresignOut)
+def presign_payment_proof_upload(payload: PaymentProofPresignIn):
+    filename = str(payload.filename or "").strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required")
 
     try:
-        uploaded = upload_payment_proof_fileobj(
-            fileobj=file.file,
-            filename=str(file.filename or "").strip(),
-            content_type=str(file.content_type or "").strip(),
+        presigned = generate_payment_proof_presigned_upload(
+            filename=filename,
+            content_type=str(payload.content_type or "").strip(),
         )
-        return PaymentProofUploadOut(success=True, url=uploaded["url"])
+        return PaymentProofPresignOut(
+            success=True,
+            upload_url=presigned["upload_url"],
+            file_url=presigned["file_url"],
+            object_key=presigned["object_key"],
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not upload payment proof: {e}")
-    finally:
-        await file.close()
+        raise HTTPException(status_code=500, detail=f"Could not presign payment proof upload: {e}")
 
 
 @router.post("/orders/payment_proof", response_model=OrderPaymentProofOut)
