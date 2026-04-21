@@ -2,7 +2,7 @@
 
 from typing import List, Optional, Dict
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
 
 from app.config import (
@@ -34,6 +34,7 @@ from app.orders import (
     get_order_by_id,
 )
 from app.payment_flow import notify_admin_payment_reported
+from app.r2_storage import upload_payment_proof_fileobj
 
 from app.validators import (
     validate_tenant_id,
@@ -163,6 +164,11 @@ class OrderPaymentProofOut(BaseModel):
     proof_type: str
     notified_admin: bool
     verification_status: str
+
+
+class PaymentProofUploadOut(BaseModel):
+    success: bool
+    url: str
 
 
 # =========================
@@ -312,6 +318,24 @@ def mark_paid(payload: MarkPaidIn):
         order_id=payload.order_id,
         status="PAID",
     )
+
+
+@router.post("/upload/payment-proof", response_model=PaymentProofUploadOut)
+async def upload_payment_proof(file: UploadFile = File(...)):
+    if file is None:
+        raise HTTPException(status_code=400, detail="file is required")
+
+    try:
+        uploaded = upload_payment_proof_fileobj(
+            fileobj=file.file,
+            filename=str(file.filename or "").strip(),
+            content_type=str(file.content_type or "").strip(),
+        )
+        return PaymentProofUploadOut(success=True, url=uploaded["url"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not upload payment proof: {e}")
+    finally:
+        await file.close()
 
 
 @router.post("/orders/payment_proof", response_model=OrderPaymentProofOut)

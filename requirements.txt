@@ -7,3 +7,5 @@ google-auth
 google-auth-httplib2
 google-auth-oauthlib
 cloudinary
+boto3
+python-multipart
