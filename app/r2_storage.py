@@ -69,7 +69,7 @@ def _get_r2_client(cfg: Dict[str, str]):
         region_name="auto",
         config=Config(
             signature_version="s3v4",
-            s3={"addressing_style": "virtual"},
+            s3={"addressing_style": "path"},
         ),
     )
 
@@ -111,7 +111,7 @@ def generate_payment_proof_presigned_upload(filename: str, content_type: str = "
             endpoint_url=cfg["endpoint_url"],
             region_name="auto",
             signature_version="s3v4",
-            addressing_style="virtual",
+            addressing_style="path",
             content_type=upload_target["content_type"],
             content_type_signed=False,
             error_type=type(e).__name__,
@@ -125,15 +125,20 @@ def generate_payment_proof_presigned_upload(filename: str, content_type: str = "
         header for header in signed_headers.split(";")
         if header and header.lower() != "host"
     ]
+    upload_url_host = parsed_upload_url.netloc
+    upload_style = "path"
+    if upload_url_host.startswith(f"{cfg['bucket_name']}."):
+        upload_style = "virtual"
 
     log_event(
         "r2_payment_proof_presigned",
         key=upload_target["key"],
         bucket_name=cfg["bucket_name"],
         endpoint_url=cfg["endpoint_url"],
-        upload_url_host=parsed_upload_url.netloc,
+        upload_url_host=upload_url_host,
         upload_url_path=parsed_upload_url.path,
-        addressing_style="virtual",
+        addressing_style="path",
+        upload_url_style=upload_style,
         signed_headers=signed_headers,
         signed_headers_extra=",".join(signed_headers_extra),
         has_extra_signed_headers=bool(signed_headers_extra),
