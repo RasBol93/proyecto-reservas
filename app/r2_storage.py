@@ -5,6 +5,7 @@ from typing import BinaryIO, Dict
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError, SSLError
 
 from app.config import (
     ENV_R2_ACCOUNT_ID,
@@ -63,7 +64,10 @@ def _get_r2_client(cfg: Dict[str, str]):
         aws_access_key_id=cfg["access_key_id"],
         aws_secret_access_key=cfg["secret_access_key"],
         region_name="auto",
-        config=Config(signature_version="s3v4"),
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "path"},
+        ),
     )
 
 
@@ -81,11 +85,16 @@ def upload_payment_proof_fileobj(fileobj: BinaryIO, filename: str, content_type:
             Key=key,
             ExtraArgs={"ContentType": clean_content_type},
         )
-    except Exception as e:
+    except (SSLError, ClientError, BotoCoreError, Exception) as e:
         log_event(
             "r2_payment_proof_upload_failed",
             key=key,
             bucket_name=cfg["bucket_name"],
+            endpoint_url=cfg["endpoint_url"],
+            region_name="auto",
+            signature_version="s3v4",
+            addressing_style="path",
+            content_type=clean_content_type,
             error_type=type(e).__name__,
             error=str(e),
         )
