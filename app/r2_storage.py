@@ -2,6 +2,7 @@ import secrets
 import time
 from pathlib import Path
 from typing import Dict
+from urllib.parse import parse_qs, urlparse
 
 import boto3
 from botocore.config import Config
@@ -68,7 +69,7 @@ def _get_r2_client(cfg: Dict[str, str]):
         region_name="auto",
         config=Config(
             signature_version="s3v4",
-            s3={"addressing_style": "path"},
+            s3={"addressing_style": "virtual"},
         ),
     )
 
@@ -98,7 +99,6 @@ def generate_payment_proof_presigned_upload(filename: str, content_type: str = "
             Params={
                 "Bucket": cfg["bucket_name"],
                 "Key": upload_target["key"],
-                "ContentType": upload_target["content_type"],
             },
             ExpiresIn=_PRESIGNED_UPLOAD_EXPIRES_SECONDS,
             HttpMethod="PUT",
@@ -111,19 +111,33 @@ def generate_payment_proof_presigned_upload(filename: str, content_type: str = "
             endpoint_url=cfg["endpoint_url"],
             region_name="auto",
             signature_version="s3v4",
-            addressing_style="path",
+            addressing_style="virtual",
             content_type=upload_target["content_type"],
+            content_type_signed=False,
             error_type=type(e).__name__,
             error=str(e),
         )
         raise RuntimeError(f"R2 presign failed: {e}") from e
+
+    parsed_upload_url = urlparse(upload_url)
+    signed_headers = parse_qs(parsed_upload_url.query).get("X-Amz-SignedHeaders", [""])[0]
+    signed_headers_extra = [
+        header for header in signed_headers.split(";")
+        if header and header.lower() != "host"
+    ]
 
     log_event(
         "r2_payment_proof_presigned",
         key=upload_target["key"],
         bucket_name=cfg["bucket_name"],
         endpoint_url=cfg["endpoint_url"],
-        content_type=upload_target["content_type"],
+        upload_url_host=parsed_upload_url.netloc,
+        upload_url_path=parsed_upload_url.path,
+        addressing_style="virtual",
+        signed_headers=signed_headers,
+        signed_headers_extra=",".join(signed_headers_extra),
+        has_extra_signed_headers=bool(signed_headers_extra),
+        content_type_signed=False,
         file_url=upload_target["file_url"],
         expires_in_seconds=_PRESIGNED_UPLOAD_EXPIRES_SECONDS,
     )
