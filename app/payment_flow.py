@@ -81,6 +81,25 @@ def _download_external_proof_bytes(url: str) -> Tuple[bytes, str, str]:
     return bytes(file_bytes), filename, content_type
 
 
+def _build_proof_fallback_text(proof_file_id: str, proof_type: str, proof_caption: str) -> str:
+    clean_file_id = str(proof_file_id or "").strip()
+    clean_proof_type = str(proof_type or "").strip()
+    clean_caption = str(proof_caption or "").strip()
+
+    if not clean_file_id:
+        return ""
+
+    if clean_proof_type == "external_url":
+        if clean_caption and clean_caption != clean_file_id:
+            return f"Comprobante: {clean_caption}\nReferencia: {clean_file_id}"
+        return f"Comprobante: {clean_file_id}"
+
+    if clean_caption and clean_caption != clean_file_id:
+        return f"Comprobante: {clean_caption}"
+
+    return "Comprobante reportado, pero no se pudo reenviar la media."
+
+
 def forward_proof_to_admin(
     tenant: Dict[str, Any],
     tenant_id: str,
@@ -242,16 +261,6 @@ def notify_admin_payment_reported(
         proof_caption = str(order.get("payment_proof_caption") or "").strip()
         has_forwardable_proof = bool(proof_file_id and proof_type in ("photo", "document", "external_url"))
 
-        proof_section = ""
-        if proof_file_id and proof_type:
-            if proof_type in ("photo", "document"):
-                proof_section = "Comprobante: adjunto a continuación.\n\n"
-            else:
-                proof_section = f"Comprobante: {proof_caption or proof_file_id}\n"
-                if proof_caption and proof_caption != proof_file_id:
-                    proof_section += f"Referencia: {proof_file_id}\n"
-                proof_section += "\n"
-
         confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{clean_order_id}")]])
 
         title = "🔔 RECORDATORIO — NUEVO PEDIDO" if is_reminder else "🆕 NUEVO PEDIDO"
@@ -262,7 +271,6 @@ def notify_admin_payment_reported(
             f"Cliente: {order.get('customer_name', '')}\n"
             f"Teléfono: {order.get('customer_contact', '')}\n\n"
             f"Hora de recojo: {order.get('requested_time', 'pendiente')}\n\n"
-            f"{proof_section}"
             f"Detalle:\n{lines_txt}\n\n"
             f"Total: Bs {total:.2f}\n\n"
             "Presiona ✅ Confirmar pago cuando verifiques."
@@ -281,6 +289,20 @@ def notify_admin_payment_reported(
             ok_proof = forward_proof_to_admin(
                 tenant, tenant_id, proof_file_id, proof_type, proof_caption
             )
+            if not ok_proof:
+                fallback_txt = _build_proof_fallback_text(
+                    proof_file_id,
+                    proof_type,
+                    proof_caption,
+                )
+                if fallback_txt:
+                    fallback_ok = telegram_send_text(admin_token, admin_chat_id, fallback_txt)
+                    if not fallback_ok:
+                        alert_telegram_error(
+                            error="telegram_send_text returned False",
+                            method="sendMessage",
+                            chat_id=admin_chat_id,
+                        )
 
         try:
             log_event(
