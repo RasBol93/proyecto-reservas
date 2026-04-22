@@ -1,33 +1,34 @@
-# app/payment_flow.py — optimizado (menos lecturas, más simple)
-# hardened incremental: misma estructura, mismos contratos, más robustez
+# app/payment_flow.py - optimizado (menos lecturas, mas simple)
+# hardened incremental: misma estructura, mismos contratos, mas robustez
 
-from typing import Any, Dict, Tuple
 import mimetypes
-from urllib.parse import urlparse, unquote
+import threading
+from typing import Any, Dict, Tuple
+from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
+from app.alerts import (
+    alert_payment_failed,
+    alert_system_error,
+    alert_telegram_error,
+    alert_tenant_error,
+)
 from app.orders import get_order_by_id
 from app.telegram_api import (
-    telegram_send_text,
-    telegram_get_file_path,
     telegram_download_file_bytes,
+    telegram_get_file_path,
     telegram_send_file_bytes,
+    telegram_send_text,
 )
 from app.telegram_keyboard import kb
 from app.utils import log_event
 from app.webhook_helpers import (
+    fmt_cart_lines,
+    fmt_snapshot_lines,
     get_admin_bot_token,
     get_admin_chat_id,
     get_client_bot_token,
     parse_items_field,
-    fmt_cart_lines,
-    fmt_snapshot_lines,
-)
-from app.alerts import (
-    alert_payment_failed,
-    alert_tenant_error,
-    alert_telegram_error,
-    alert_system_error,
 )
 
 
@@ -134,6 +135,7 @@ def forward_proof_to_admin(
 
     try:
         content_type = "application/octet-stream"
+
         if clean_proof_type in ("photo", "document"):
             client_token = get_client_bot_token(tenant)
             if not client_token:
@@ -209,14 +211,13 @@ def forward_proof_to_admin(
         return False
 
 
-def notify_admin_payment_reported(
+def _notify_admin_payment_reported_sync(
     tenant: Dict[str, Any],
     tenant_id: str,
     orders_sh,
     order_id: str,
     is_reminder: bool = False,
 ) -> bool:
-
     try:
         admin_token = get_admin_bot_token(tenant)
         admin_chat_id = get_admin_chat_id(tenant)
@@ -232,23 +233,19 @@ def notify_admin_payment_reported(
 
         order = get_order_by_id(orders_sh, clean_order_id)
         if not order:
-            telegram_send_text(admin_token, admin_chat_id, f"⚠️ Pedido {clean_order_id} no encontrado.")
+            telegram_send_text(admin_token, admin_chat_id, f"\u26a0\ufe0f Pedido {clean_order_id} no encontrado.")
             return False
 
-        # -------------------------
-        # PRIORIDAD: snapshot
-        # -------------------------
         items_snapshot = parse_items_field(order.get("items_snapshot"))
 
         if items_snapshot:
             lines_txt, total, total_qty = fmt_snapshot_lines(items_snapshot)
         else:
-            # fallback SOLO si no hay snapshot
             cart = parse_items_field(order.get("items"))
             try:
                 lines_txt, _, total_qty = fmt_cart_lines(cart, {})
             except Exception:
-                lines_txt = "(vacío)"
+                lines_txt = "(vacio)"
                 total_qty = 0
 
             try:
@@ -261,19 +258,18 @@ def notify_admin_payment_reported(
         proof_caption = str(order.get("payment_proof_caption") or "").strip()
         has_forwardable_proof = bool(proof_file_id and proof_type in ("photo", "document", "external_url"))
 
-        confirm_btn = kb([[("✅ Confirmar pago", f"paid|{tenant_id}|{clean_order_id}")]])
-
-        title = "🔔 RECORDATORIO — NUEVO PEDIDO" if is_reminder else "🆕 NUEVO PEDIDO"
+        confirm_btn = kb([[("\u2705 Confirmar pago", f"paid|{tenant_id}|{clean_order_id}")]])
+        title = "\U0001f514 RECORDATORIO \u2014 NUEVO PEDIDO" if is_reminder else "\U0001f195 NUEVO PEDIDO"
 
         txt = (
             f"{title}\n\n"
-            f"Código de pedido: {clean_order_id}\n\n"
+            f"Codigo de pedido: {clean_order_id}\n\n"
             f"Cliente: {order.get('customer_name', '')}\n"
-            f"Teléfono: {order.get('customer_contact', '')}\n\n"
+            f"Telefono: {order.get('customer_contact', '')}\n\n"
             f"Hora de recojo: {order.get('requested_time', 'pendiente')}\n\n"
             f"Detalle:\n{lines_txt}\n\n"
             f"Total: Bs {total:.2f}\n\n"
-            "Presiona ✅ Confirmar pago cuando verifiques."
+            "Presiona \u2705 Confirmar pago cuando verifiques."
         )
 
         ok_txt = telegram_send_text(admin_token, admin_chat_id, txt, reply_markup=confirm_btn)
@@ -287,7 +283,11 @@ def notify_admin_payment_reported(
         ok_proof = False
         if has_forwardable_proof:
             ok_proof = forward_proof_to_admin(
-                tenant, tenant_id, proof_file_id, proof_type, proof_caption
+                tenant,
+                tenant_id,
+                proof_file_id,
+                proof_type,
+                proof_caption,
             )
             if not ok_proof:
                 fallback_txt = _build_proof_fallback_text(
@@ -320,6 +320,83 @@ def notify_admin_payment_reported(
             pass
 
         return bool(ok_txt)
+
+    except Exception as e:
+        log_event("notify_admin_payment_reported_error", tenant_id=tenant_id, order_id=order_id, error=str(e))
+        alert_payment_failed(tenant_id=tenant_id, error=str(e))
+        alert_system_error(error=str(e), module="payment_flow.notify_admin_payment_reported")
+        return False
+
+
+def _notify_admin_payment_reported_fire_and_forget(
+    tenant: Dict[str, Any],
+    tenant_id: str,
+    orders_sh,
+    order_id: str,
+    is_reminder: bool = False,
+) -> None:
+    try:
+        _notify_admin_payment_reported_sync(
+            tenant=tenant,
+            tenant_id=tenant_id,
+            orders_sh=orders_sh,
+            order_id=order_id,
+            is_reminder=is_reminder,
+        )
+    except Exception as e:
+        log_event(
+            "notify_admin_payment_reported_background_error",
+            tenant_id=tenant_id,
+            order_id=order_id,
+            error=str(e),
+        )
+
+
+def notify_admin_payment_reported(
+    tenant: Dict[str, Any],
+    tenant_id: str,
+    orders_sh,
+    order_id: str,
+    is_reminder: bool = False,
+) -> bool:
+    try:
+        admin_token = get_admin_bot_token(tenant)
+        admin_chat_id = get_admin_chat_id(tenant)
+
+        if not admin_token or not admin_chat_id:
+            alert_tenant_error(tenant_id=tenant_id, error="Missing admin config")
+            return False
+
+        clean_order_id = str(order_id or "").strip()
+        if not clean_order_id:
+            alert_payment_failed(tenant_id=tenant_id, error="Missing order_id")
+            return False
+
+        order = get_order_by_id(orders_sh, clean_order_id)
+        if not order:
+            telegram_send_text(admin_token, admin_chat_id, f"\u26a0\ufe0f Pedido {clean_order_id} no encontrado.")
+            return False
+
+        worker = threading.Thread(
+            target=_notify_admin_payment_reported_fire_and_forget,
+            kwargs={
+                "tenant": tenant,
+                "tenant_id": tenant_id,
+                "orders_sh": orders_sh,
+                "order_id": clean_order_id,
+                "is_reminder": bool(is_reminder),
+            },
+            daemon=True,
+        )
+        worker.start()
+
+        log_event(
+            "notify_admin_payment_reported_scheduled",
+            tenant_id=tenant_id,
+            order_id=clean_order_id,
+            is_reminder=bool(is_reminder),
+        )
+        return True
 
     except Exception as e:
         log_event("notify_admin_payment_reported_error", tenant_id=tenant_id, order_id=order_id, error=str(e))
