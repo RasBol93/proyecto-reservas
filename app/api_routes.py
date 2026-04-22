@@ -35,6 +35,7 @@ from app.orders import (
 )
 from app.payment_flow import notify_admin_payment_reported
 from app.r2_storage import generate_payment_proof_presigned_upload, upload_payment_proof_bytes
+from app.webhook_helpers import parse_items_field, fmt_snapshot_lines
 
 from app.validators import (
     validate_tenant_id,
@@ -92,6 +93,68 @@ def _get_order_for_tenant_or_404(orders_sh, tenant_id: str, order_id: str):
         raise HTTPException(status_code=404, detail="Order not found")
 
     return order
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _serialize_order_snapshot(order: Dict[str, str]):
+    items_snapshot = parse_items_field(order.get("items_snapshot"))
+    if items_snapshot:
+        detail_lines, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
+        normalized_items = []
+        for item in items_snapshot:
+            normalized_items.append({
+                "sku": str(item.get("sku") or "").strip(),
+                "name": str(item.get("name") or item.get("sku") or "").strip(),
+                "qty": _safe_int(item.get("qty") or 1, 1),
+                "unit_price": _safe_float(item.get("unit_price") or 0),
+                "line_total": _safe_float(item.get("line_total") or 0),
+            })
+        return normalized_items, detail_lines, total_amount, total_qty
+
+    items = parse_items_field(order.get("items"))
+    normalized_items = []
+    total_qty = 0
+    for item in items:
+        qty = max(1, _safe_int(item.get("qty") or 1, 1))
+        sku = str(item.get("sku") or "").strip()
+        total_qty += qty
+        normalized_items.append({
+            "sku": sku,
+            "name": sku,
+            "qty": qty,
+            "unit_price": 0.0,
+            "line_total": 0.0,
+        })
+
+    detail_lines = "\n".join(
+        [f"{it['qty']} x {it['name']}" for it in normalized_items]
+    ) or "(vacío)"
+
+    return normalized_items, detail_lines, _safe_float(order.get("total_amount") or 0), total_qty
+
+
+def _derive_web_order_ui_status(order: Dict[str, str]) -> str:
+    status = str(order.get("status") or "").strip().upper()
+    has_proof = bool(str(order.get("payment_proof_file_id") or "").strip())
+
+    if status == "PAID":
+        return "paid"
+    if status == "PENDING_PAYMENT" and has_proof:
+        return "pending_payment_review"
+    return "pending_payment"
 
 
 # =========================
@@ -164,6 +227,33 @@ class OrderPaymentProofOut(BaseModel):
     proof_type: str
     notified_admin: bool
     verification_status: str
+
+
+class OrderStatusItemOut(BaseModel):
+    sku: str
+    name: str
+    qty: int
+    unit_price: float
+    line_total: float
+
+
+class OrderStatusOut(BaseModel):
+    ok: bool
+    tenant_id: str
+    order_id: str
+    status: str
+    ui_status: str
+    verification_status: str
+    is_paid: bool
+    payment_confirmed_at: str
+    requested_time: str
+    customer_name: str
+    customer_contact: str
+    currency: str
+    total_amount: float
+    total_qty: int
+    detail_lines: str
+    items: List[OrderStatusItemOut]
 
 
 class PaymentProofUploadOut(BaseModel):
@@ -440,6 +530,51 @@ def set_order_payment_proof(payload: OrderPaymentProofIn):
         proof_type=clean_proof_type,
         notified_admin=True,
         verification_status="pending_verification",
+    )
+
+
+@router.get("/orders/status", response_model=OrderStatusOut)
+def get_order_status(
+    tenant_id: str = Query(...),
+    order_id: str = Query(...),
+):
+    validate_tenant_id(tenant_id)
+    validate_order_id(order_id)
+    rate_limiter.hit(f"order_status:{tenant_id}:{order_id}", RL_MENU_PER_MIN)
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(tenant_id, gc=gc)
+
+    if not tenant.get("orders_enabled", False):
+        raise HTTPException(status_code=400, detail="Orders not enabled")
+
+    orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
+    resolved_tenant_id = str(tenant.get("tenant_id") or tenant_id).strip()
+    order = _get_order_for_tenant_or_404(orders_sh, resolved_tenant_id, order_id)
+
+    items, detail_lines, total_amount, total_qty = _serialize_order_snapshot(order)
+    raw_status = str(order.get("status") or "").strip().upper()
+    ui_status = _derive_web_order_ui_status(order)
+    is_paid = raw_status == "PAID"
+    verification_status = "confirmed" if is_paid else "pending_verification"
+
+    return OrderStatusOut(
+        ok=True,
+        tenant_id=resolved_tenant_id,
+        order_id=order_id,
+        status=raw_status,
+        ui_status=ui_status,
+        verification_status=verification_status,
+        is_paid=is_paid,
+        payment_confirmed_at=str(order.get("payment_confirmed_at") or "").strip(),
+        requested_time=str(order.get("requested_time") or "").strip(),
+        customer_name=str(order.get("customer_name") or "").strip(),
+        customer_contact=str(order.get("customer_contact") or "").strip(),
+        currency=str(order.get("currency") or "BOB").strip() or "BOB",
+        total_amount=total_amount,
+        total_qty=total_qty,
+        detail_lines=detail_lines,
+        items=items,
     )
 
 
