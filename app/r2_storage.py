@@ -88,6 +88,55 @@ def build_payment_proof_upload_target(filename: str, content_type: str = "") -> 
     }
 
 
+def upload_payment_proof_bytes(file_bytes: bytes, filename: str, content_type: str = "") -> Dict[str, str]:
+    cfg = _build_r2_config()
+    upload_target = build_payment_proof_upload_target(filename=filename, content_type=content_type)
+    client = _get_r2_client(cfg)
+
+    log_event(
+        "r2_payment_proof_upload_started",
+        key=upload_target["key"],
+        bucket_name=cfg["bucket_name"],
+        endpoint_url=cfg["endpoint_url"],
+        content_type=upload_target["content_type"],
+        size_bytes=len(file_bytes or b""),
+    )
+
+    try:
+        client.put_object(
+            Bucket=cfg["bucket_name"],
+            Key=upload_target["key"],
+            Body=file_bytes,
+            ContentType=upload_target["content_type"],
+        )
+    except Exception as e:
+        log_event(
+            "r2_payment_proof_upload_failed",
+            key=upload_target["key"],
+            bucket_name=cfg["bucket_name"],
+            endpoint_url=cfg["endpoint_url"],
+            content_type=upload_target["content_type"],
+            size_bytes=len(file_bytes or b""),
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        raise RuntimeError(f"R2 upload failed: {e}") from e
+
+    log_event(
+        "r2_payment_proof_uploaded",
+        key=upload_target["key"],
+        bucket_name=cfg["bucket_name"],
+        endpoint_url=cfg["endpoint_url"],
+        content_type=upload_target["content_type"],
+        size_bytes=len(file_bytes or b""),
+        url=upload_target["file_url"],
+    )
+    return {
+        "url": upload_target["file_url"],
+        "object_key": upload_target["key"],
+    }
+
+
 def generate_payment_proof_presigned_upload(filename: str, content_type: str = "") -> Dict[str, str]:
     cfg = _build_r2_config()
     upload_target = build_payment_proof_upload_target(filename=filename, content_type=content_type)

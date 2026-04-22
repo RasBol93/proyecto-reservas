@@ -2,7 +2,7 @@
 
 from typing import List, Optional, Dict
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
 
 from app.config import (
@@ -34,7 +34,7 @@ from app.orders import (
     get_order_by_id,
 )
 from app.payment_flow import notify_admin_payment_reported
-from app.r2_storage import generate_payment_proof_presigned_upload
+from app.r2_storage import generate_payment_proof_presigned_upload, upload_payment_proof_bytes
 
 from app.validators import (
     validate_tenant_id,
@@ -169,6 +169,7 @@ class OrderPaymentProofOut(BaseModel):
 class PaymentProofUploadOut(BaseModel):
     success: bool
     url: str
+    object_key: str
 
 
 class PaymentProofPresignIn(BaseModel):
@@ -333,11 +334,28 @@ def mark_paid(payload: MarkPaidIn):
 
 
 @router.post("/upload/payment-proof", response_model=PaymentProofUploadOut)
-def upload_payment_proof():
-    raise HTTPException(
-        status_code=410,
-        detail="Binary upload via backend is obsolete. Use POST /upload/payment-proof/presign instead.",
-    )
+async def upload_payment_proof(file: UploadFile = File(...)):
+    if file is None:
+        raise HTTPException(status_code=400, detail="file is required")
+
+    try:
+        file_bytes = await file.read()
+        uploaded = upload_payment_proof_bytes(
+            file_bytes=file_bytes,
+            filename=str(file.filename or "").strip(),
+            content_type=str(file.content_type or "").strip(),
+        )
+        return PaymentProofUploadOut(
+            success=True,
+            url=uploaded["url"],
+            object_key=uploaded["object_key"],
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not upload payment proof: {e}")
+    finally:
+        await file.close()
 
 
 @router.post("/upload/payment-proof/presign", response_model=PaymentProofPresignOut)
