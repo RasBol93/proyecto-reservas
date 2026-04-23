@@ -33,6 +33,8 @@ from app.orders import (
     build_items_snapshot,
     get_order_by_id,
     get_order_by_id_strict,
+    get_order_context_by_id,
+    get_order_context_by_id_strict,
     OrdersReadTemporarilyUnavailable,
 )
 from app.payment_flow import notify_admin_payment_reported
@@ -97,6 +99,19 @@ def _get_order_for_tenant_or_404(orders_sh, tenant_id: str, order_id: str):
     return order
 
 
+def _get_order_context_for_tenant_or_404(orders_sh, tenant_id: str, order_id: str):
+    order_ctx = get_order_context_by_id(orders_sh, order_id)
+    if not order_ctx:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    order = dict(order_ctx.get("order") or {})
+    order_tenant_id = str(order.get("tenant_id") or "").strip()
+    if order_tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return order_ctx
+
+
 def _get_order_for_tenant_or_404_strict(orders_sh, tenant_id: str, order_id: str):
     try:
         order = get_order_by_id_strict(orders_sh, order_id)
@@ -111,6 +126,23 @@ def _get_order_for_tenant_or_404_strict(orders_sh, tenant_id: str, order_id: str
         raise HTTPException(status_code=404, detail="Order not found")
 
     return order
+
+
+def _get_order_context_for_tenant_or_404_strict(orders_sh, tenant_id: str, order_id: str):
+    try:
+        order_ctx = get_order_context_by_id_strict(orders_sh, order_id)
+    except OrdersReadTemporarilyUnavailable:
+        raise HTTPException(status_code=503, detail="Order status temporarily unavailable")
+
+    if not order_ctx:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    order = dict(order_ctx.get("order") or {})
+    order_tenant_id = str(order.get("tenant_id") or "").strip()
+    if order_tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return order_ctx
 
 
 def _safe_float(value, default: float = 0.0) -> float:
@@ -510,7 +542,8 @@ def set_order_payment_proof(payload: OrderPaymentProofIn):
 
     orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
     resolved_tenant_id = str(tenant.get("tenant_id") or payload.tenant_id).strip()
-    order = _get_order_for_tenant_or_404(orders_sh, resolved_tenant_id, payload.order_id)
+    order_ctx = _get_order_context_for_tenant_or_404(orders_sh, resolved_tenant_id, payload.order_id)
+    order = dict(order_ctx.get("order") or {})
 
     order_source = str(order.get("source") or "").strip().lower()
     if order_source not in {"webapp", "api"}:
@@ -525,6 +558,7 @@ def set_order_payment_proof(payload: OrderPaymentProofIn):
         proof_file_id=clean_proof_reference,
         proof_type=clean_proof_type,
         proof_caption=str(payload.proof_caption or "").strip(),
+        order_ctx=order_ctx,
     )
 
     if not result.get("ok"):
@@ -576,7 +610,8 @@ def get_order_status(
 
     orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
     resolved_tenant_id = str(tenant.get("tenant_id") or tenant_id).strip()
-    order = _get_order_for_tenant_or_404_strict(orders_sh, resolved_tenant_id, order_id)
+    order_ctx = _get_order_context_for_tenant_or_404_strict(orders_sh, resolved_tenant_id, order_id)
+    order = dict(order_ctx.get("order") or {})
     order_source = str(order.get("source") or "").strip().lower()
     if order_source not in {"webapp", "api"}:
         raise HTTPException(status_code=404, detail="Order not found")

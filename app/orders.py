@@ -36,6 +36,7 @@ _ALLOWED_PROOF_TYPES = {
 }
 
 _ORDERS_WS_CACHE: Dict[str, Any] = {}
+_ORDERS_HEADER_CACHE: Dict[str, List[str]] = {}
 _TRANSIENT_ORDERS_ERROR_SIGNALS = (
     "429",
     "quota",
@@ -92,10 +93,7 @@ def _get_orders_ws(orders_sh):
     Busca nombres permitidos de la hoja de pedidos.
     Ya no cae silenciosamente a la primera hoja.
     """
-    try:
-        spreadsheet_key = str(getattr(orders_sh, "id", None) or id(orders_sh))
-    except Exception:
-        spreadsheet_key = str(id(orders_sh))
+    spreadsheet_key = _orders_spreadsheet_key(orders_sh)
 
     cached = _ORDERS_WS_CACHE.get(spreadsheet_key)
     if cached is not None:
@@ -122,6 +120,25 @@ def _get_orders_ws(orders_sh):
                 raise OrdersReadTemporarilyUnavailable(f"ORDERS worksheet temporarily unavailable: {msg}") from e
             raise RuntimeError(f"ORDERS worksheet access error: {msg}") from e
     raise RuntimeError("ORDERS worksheet not found (accepted names: ORDERS, Orders, orders)")
+
+
+def _orders_spreadsheet_key(orders_sh) -> str:
+    try:
+        sid = getattr(orders_sh, "id", None)
+        if sid:
+            return str(sid)
+    except Exception:
+        pass
+    return str(id(orders_sh))
+
+
+def _orders_header_cache_key(ws) -> str:
+    try:
+        spreadsheet = getattr(ws, "spreadsheet", None)
+        return _orders_spreadsheet_key(spreadsheet)
+    except Exception:
+        pass
+    return str(id(ws))
 
 
 def _now_iso_utc() -> str:
@@ -153,8 +170,29 @@ def _get_header(ws) -> List[str]:
     """
     Asumimos que fila 1 tiene headers técnicos.
     """
-    hdr = ws.row_values(1)
-    return [h.strip() for h in hdr if str(h).strip()]
+    return _load_orders_header(ws, strict=False)
+
+
+def _load_orders_header(ws, *, strict: bool) -> List[str]:
+    cache_key = _orders_header_cache_key(ws)
+    cached = _ORDERS_HEADER_CACHE.get(cache_key)
+    if cached:
+        return cached
+
+    if strict:
+        try:
+            hdr = ws.row_values(1)
+        except Exception as e:
+            if _is_transient_orders_error_message(e):
+                raise OrdersReadTemporarilyUnavailable(f"ORDERS header temporarily unavailable: {e}") from e
+            raise
+    else:
+        hdr = ws.row_values(1)
+
+    clean_header = [h.strip() for h in hdr if str(h).strip()]
+    if clean_header:
+        _ORDERS_HEADER_CACHE[cache_key] = clean_header
+    return clean_header
 
 
 def _find_col_idx(header: List[str], col_name: str) -> Optional[int]:
@@ -510,19 +548,10 @@ def _find_row_index_by_order_id(ws, order_id: str) -> Optional[int]:
 
 
 def get_order_by_id(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
-    ws = _get_orders_ws(orders_sh)
-    header = _get_header(ws)
-    if not header:
+    ctx = get_order_context_by_id(orders_sh, order_id)
+    if not ctx:
         return None
-
-    ridx = _find_row_index_by_order_id(ws, order_id)
-    if ridx is None:
-        return None
-
-    row = _safe_row_values(ws, ridx)
-    if not row:
-        return None
-    return _row_to_dict(header, row)
+    return dict(ctx.get("order") or {})
 
 
 def _strict_col_values(ws, col_index_1based: int) -> List[Any]:
@@ -544,18 +573,21 @@ def _strict_row_values(ws, row_index: int) -> List[Any]:
 
 
 def _strict_header(ws) -> List[str]:
-    try:
-        hdr = ws.row_values(1)
-    except Exception as e:
-        if _is_transient_orders_error_message(e):
-            raise OrdersReadTemporarilyUnavailable(f"ORDERS header temporarily unavailable: {e}") from e
-        raise
-    return [h.strip() for h in hdr if str(h).strip()]
+    return _load_orders_header(ws, strict=True)
 
 
-def get_order_by_id_strict(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
-    ws = _get_orders_ws(orders_sh)
-    header = _strict_header(ws)
+def _build_order_context(ws, header: List[str], row_index: int, row: List[Any]) -> Dict[str, Any]:
+    return {
+        "ws": ws,
+        "header": header,
+        "row_index": int(row_index),
+        "row": row,
+        "order": _row_to_dict(header, row),
+    }
+
+
+def _resolve_order_context(ws, order_id: str, *, strict: bool) -> Optional[Dict[str, Any]]:
+    header = _strict_header(ws) if strict else _get_header(ws)
     if not header:
         return None
 
@@ -563,24 +595,42 @@ def get_order_by_id_strict(orders_sh, order_id: str) -> Optional[Dict[str, Any]]
     if oid_col is None:
         return None
 
-    col_values = _strict_col_values(ws, oid_col + 1)
+    col_values = _strict_col_values(ws, oid_col + 1) if strict else _safe_col_values(ws, oid_col + 1)
     target = (order_id or "").strip()
     if not target:
         return None
 
-    ridx = None
+    row_index = None
     for i in range(1, len(col_values)):
         if str(col_values[i]).strip() == target:
-            ridx = i + 1
+            row_index = i + 1
             break
 
-    if ridx is None:
+    if row_index is None:
         return None
 
-    row = _strict_row_values(ws, ridx)
+    row = _strict_row_values(ws, row_index) if strict else _safe_row_values(ws, row_index)
     if not row:
         return None
-    return _row_to_dict(header, row)
+
+    return _build_order_context(ws, header, row_index, row)
+
+
+def get_order_context_by_id(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
+    ws = _get_orders_ws(orders_sh)
+    return _resolve_order_context(ws, order_id, strict=False)
+
+
+def get_order_context_by_id_strict(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
+    ws = _get_orders_ws(orders_sh)
+    return _resolve_order_context(ws, order_id, strict=True)
+
+
+def get_order_by_id_strict(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
+    ctx = get_order_context_by_id_strict(orders_sh, order_id)
+    if not ctx:
+        return None
+    return dict(ctx.get("order") or {})
 
 
 def find_latest_pending_order_for_contact(
@@ -635,26 +685,36 @@ def find_latest_pending_order_for_contact(
 # UPDATE helpers
 # ----------------------------------------
 
-def update_order_status(orders_sh, order_id: str, new_status: str) -> Dict[str, Any]:
+def update_order_status(orders_sh, order_id: str, new_status: str, order_ctx: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     tenant_id_for_alert = ""
 
     try:
-        ws = _get_orders_ws(orders_sh)
-        header = _get_header(ws)
-        if not header:
-            raise RuntimeError("ORDERS header row missing")
-
-        ridx = _find_row_index_by_order_id(ws, order_id)
-
-        if ridx is None:
+        clean_order_id = str(order_id or "").strip()
+        if not clean_order_id:
             return {"ok": True, "found": False}
+
+        use_ctx = order_ctx if isinstance(order_ctx, dict) else None
+        if use_ctx is not None:
+            ctx_order_id = str(((use_ctx.get("order") or {}).get("order_id")) or "").strip()
+            if ctx_order_id and ctx_order_id != clean_order_id:
+                use_ctx = None
+
+        if use_ctx is None:
+            use_ctx = get_order_context_by_id(orders_sh, clean_order_id)
+
+        if not use_ctx:
+            return {"ok": True, "found": False}
+
+        ws = use_ctx["ws"]
+        header = use_ctx["header"]
+        ridx = int(use_ctx["row_index"])
+        row = list(use_ctx.get("row") or [])
 
         status_col = _find_col_idx(header, "status")
         if status_col is None:
             raise RuntimeError("Missing status column")
 
         tenant_col = _find_col_idx(header, "tenant_id")
-        row = _safe_row_values(ws, ridx)
 
         if tenant_col is not None and tenant_col < len(row):
             tenant_id_for_alert = str(row[tenant_col] or "").strip()
@@ -735,22 +795,33 @@ def update_order_payment_proof(
     proof_file_id: str,
     proof_type: str,
     proof_caption: str = "",
+    order_ctx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     tenant_id_for_alert = ""
 
     try:
-        ws = _get_orders_ws(orders_sh)
-        header = _get_header(ws)
-        if not header:
-            raise RuntimeError("ORDERS header row missing")
-
-        ridx = _find_row_index_by_order_id(ws, order_id)
-
-        if ridx is None:
+        clean_order_id = str(order_id or "").strip()
+        if not clean_order_id:
             return {"ok": True, "found": False}
 
+        use_ctx = order_ctx if isinstance(order_ctx, dict) else None
+        if use_ctx is not None:
+            ctx_order_id = str(((use_ctx.get("order") or {}).get("order_id")) or "").strip()
+            if ctx_order_id and ctx_order_id != clean_order_id:
+                use_ctx = None
+
+        if use_ctx is None:
+            use_ctx = get_order_context_by_id(orders_sh, clean_order_id)
+
+        if not use_ctx:
+            return {"ok": True, "found": False}
+
+        ws = use_ctx["ws"]
+        header = use_ctx["header"]
+        ridx = int(use_ctx["row_index"])
+        row = list(use_ctx.get("row") or [])
+
         tenant_col = _find_col_idx(header, "tenant_id")
-        row = _safe_row_values(ws, ridx)
 
         if tenant_col is not None and tenant_col < len(row):
             tenant_id_for_alert = str(row[tenant_col] or "").strip()

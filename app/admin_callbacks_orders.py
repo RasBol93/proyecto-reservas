@@ -7,6 +7,7 @@ from fastapi import HTTPException
 
 from app.orders import (
     get_order_by_id,
+    get_order_context_by_id,
     update_order_status,
 )
 from app.menu import get_menu_product_or_404
@@ -373,8 +374,8 @@ def handle_admin_orders_callback(
             return {"ok": True}
 
         try:
-            order_before = get_order_by_id(orders_sh, order_id)
-            if not order_before:
+            order_ctx = get_order_context_by_id(orders_sh, order_id)
+            if not order_ctx:
                 _safe_send_text(
                     bot_token,
                     chat_id,
@@ -383,6 +384,7 @@ def handle_admin_orders_callback(
                 )
                 return {"ok": True}
 
+            order_before = dict(order_ctx.get("order") or {})
             status_before = _normalize_status(order_before.get("status"))
             already_paid = status_before == "PAID"
 
@@ -422,7 +424,7 @@ def handle_admin_orders_callback(
                 )
                 return {"ok": True}
 
-            res = update_order_status(orders_sh, order_id, "PAID")
+            res = update_order_status(orders_sh, order_id, "PAID", order_ctx=order_ctx)
             if not res.get("ok"):
                 alert_order_status_failed(
                     tenant_id=tenant_id,
@@ -447,32 +449,11 @@ def handle_admin_orders_callback(
                 )
                 return {"ok": True}
 
-            order_after = get_order_by_id(orders_sh, order_id)
-            status_after = _normalize_status((order_after or {}).get("status"))
-
-            if status_after != "PAID":
-                try:
-                    time.sleep(0.25)
-                except Exception:
-                    pass
-
-                order_after_retry = get_order_by_id(orders_sh, order_id)
-                status_after_retry = _normalize_status((order_after_retry or {}).get("status"))
-
-                if status_after_retry == "PAID":
-                    order_after = order_after_retry
-                    status_after = status_after_retry
-                else:
-                    log_event(
-                        "admin_paid_postcheck_fallback",
-                        tenant_id=tenant_id,
-                        order_id=order_id,
-                        chat_id=chat_id,
-                        status_after=status_after_retry or status_after,
-                    )
-                    order_after = dict(order_before or {})
-                    order_after["status"] = "PAID"
-                    status_after = "PAID"
+            order_after = dict(order_before or {})
+            order_after["status"] = "PAID"
+            if not _safe_str(order_after.get("payment_confirmed_at")):
+                order_after["payment_confirmed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            status_after = "PAID"
 
             if status_after != "PAID":
                 log_event(
