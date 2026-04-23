@@ -1,9 +1,13 @@
 # app/sheets.py — versión optimizada con caché simple de client, spreadsheet y worksheet
 # hardened incremental: misma estructura, mismos contratos, más robustez
 
+import contextvars
 import json
+import threading
 import time
-from typing import Any, Dict, List, Tuple
+import uuid
+from collections import deque
+from typing import Any, Dict, List, Optional, Tuple
 
 import gspread
 
@@ -19,6 +23,10 @@ from app.alerts import alert_system_error, alert_sheet_error
 _GSPREAD_CLIENT_CACHE: gspread.Client | None = None
 _SPREADSHEET_CACHE: Dict[str, gspread.Spreadsheet] = {}
 _WORKSHEET_CACHE: Dict[Tuple[str, str], gspread.Worksheet] = {}
+_SHEETS_REQUEST_CTX: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar("sheets_request_ctx", default=None)
+_RECENT_SHEETS_REQUESTS: deque[Dict[str, Any]] = deque(maxlen=200)
+_RECENT_SHEETS_REQUESTS_LOCK = threading.Lock()
+_GSPREAD_INSTRUMENTATION_INSTALLED = False
 
 
 # ----------------------------------------
@@ -27,6 +35,302 @@ _WORKSHEET_CACHE: Dict[Tuple[str, str], gspread.Worksheet] = {}
 
 _SHEETS_RETRY_ATTEMPTS = 3
 _SHEETS_RETRY_SLEEP_SECONDS = 0.35
+
+
+def _safe_text(value: Any) -> str:
+    try:
+        return str(value or "").strip()
+    except Exception:
+        return ""
+
+
+def _is_quota_429_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    quota_signals = (
+        "429",
+        "quota",
+        "quota exceeded",
+        "rate limit",
+        "too many requests",
+    )
+    return any(signal in msg for signal in quota_signals)
+
+
+def start_sheets_request_context(
+    *,
+    path: str = "",
+    flow_name: str = "",
+    tenant_id: str = "",
+    request_id: str = "",
+) -> str:
+    rid = _safe_text(request_id) or f"req_{uuid.uuid4().hex[:12]}"
+    ctx = {
+        "request_id": rid,
+        "path": _safe_text(path),
+        "flow_name": _safe_text(flow_name) or _safe_text(path) or "http_request",
+        "tenant_id": _safe_text(tenant_id),
+        "started_at_ts": time.time(),
+        "sheet_reads": [],
+        "sheet_reads_count": 0,
+        "worksheets_touched": set(),
+        "spreadsheets_touched": set(),
+        "had_429": False,
+        "serving_sources": set(),
+    }
+    _SHEETS_REQUEST_CTX.set(ctx)
+    return rid
+
+
+def set_sheets_observation_context(
+    *,
+    tenant_id: Optional[str] = None,
+    flow_name: Optional[str] = None,
+    path: Optional[str] = None,
+) -> None:
+    ctx = _SHEETS_REQUEST_CTX.get()
+    if not isinstance(ctx, dict):
+        return
+    if tenant_id is not None and _safe_text(tenant_id):
+        ctx["tenant_id"] = _safe_text(tenant_id)
+    if flow_name is not None and _safe_text(flow_name):
+        ctx["flow_name"] = _safe_text(flow_name)
+    if path is not None and _safe_text(path):
+        ctx["path"] = _safe_text(path)
+
+
+def note_sheets_serving_source(source: str) -> None:
+    clean_source = _safe_text(source)
+    if not clean_source:
+        return
+    ctx = _SHEETS_REQUEST_CTX.get()
+    if not isinstance(ctx, dict):
+        return
+    ctx.setdefault("serving_sources", set()).add(clean_source)
+
+
+def finish_sheets_request_context(
+    *,
+    status_code: Optional[int] = None,
+    error: str = "",
+) -> Optional[Dict[str, Any]]:
+    ctx = _SHEETS_REQUEST_CTX.get()
+    if not isinstance(ctx, dict):
+        return None
+
+    duration_ms = max(0, int((time.time() - float(ctx.get("started_at_ts") or time.time())) * 1000))
+    summary = {
+        "request_id": _safe_text(ctx.get("request_id")),
+        "path": _safe_text(ctx.get("path")),
+        "flow_name": _safe_text(ctx.get("flow_name")),
+        "tenant_id": _safe_text(ctx.get("tenant_id")),
+        "status_code": int(status_code or 0) if status_code is not None else 0,
+        "total_sheet_reads": int(ctx.get("sheet_reads_count") or 0),
+        "worksheets_touched": sorted([w for w in ctx.get("worksheets_touched", set()) if _safe_text(w)]),
+        "spreadsheets_touched": sorted([s for s in ctx.get("spreadsheets_touched", set()) if _safe_text(s)]),
+        "duration_ms": duration_ms,
+        "had_429": bool(ctx.get("had_429")),
+        "serving_sources": sorted([s for s in ctx.get("serving_sources", set()) if _safe_text(s)]),
+        "reads": list(ctx.get("sheet_reads") or []),
+        "error": _safe_text(error),
+    }
+
+    with _RECENT_SHEETS_REQUESTS_LOCK:
+        _RECENT_SHEETS_REQUESTS.append(summary)
+
+    try:
+        log_event(
+            "sheets_request_summary",
+            request_id=summary["request_id"],
+            path=summary["path"],
+            flow_name=summary["flow_name"],
+            tenant_id=summary["tenant_id"],
+            status_code=summary["status_code"],
+            total_sheet_reads=summary["total_sheet_reads"],
+            worksheets_touched=summary["worksheets_touched"],
+            duration_ms=summary["duration_ms"],
+            had_429=summary["had_429"],
+            serving_sources=summary["serving_sources"],
+            error=summary["error"],
+        )
+    except Exception:
+        pass
+
+    _SHEETS_REQUEST_CTX.set(None)
+    return summary
+
+
+def get_recent_sheets_request_summaries(
+    *,
+    limit: int = 20,
+    min_reads: int = 0,
+    had_429_only: bool = False,
+) -> List[Dict[str, Any]]:
+    clean_limit = max(1, min(int(limit or 20), 100))
+    clean_min_reads = max(0, int(min_reads or 0))
+
+    with _RECENT_SHEETS_REQUESTS_LOCK:
+        items = list(_RECENT_SHEETS_REQUESTS)
+
+    items.reverse()
+    filtered: List[Dict[str, Any]] = []
+    for item in items:
+        if int(item.get("total_sheet_reads") or 0) < clean_min_reads:
+            continue
+        if had_429_only and not bool(item.get("had_429")):
+            continue
+        filtered.append(item)
+        if len(filtered) >= clean_limit:
+            break
+
+    return filtered
+
+
+def _record_sheets_read(
+    *,
+    spreadsheet_id: str,
+    worksheet: str,
+    operation: str,
+    duration_ms: int,
+    ok: bool,
+    error: str = "",
+    is_429: bool = False,
+) -> None:
+    ctx = _SHEETS_REQUEST_CTX.get()
+    request_id = ""
+    path = ""
+    flow_name = ""
+    tenant_id = ""
+
+    if isinstance(ctx, dict):
+        request_id = _safe_text(ctx.get("request_id"))
+        path = _safe_text(ctx.get("path"))
+        flow_name = _safe_text(ctx.get("flow_name"))
+        tenant_id = _safe_text(ctx.get("tenant_id"))
+        ctx["sheet_reads_count"] = int(ctx.get("sheet_reads_count") or 0) + 1
+        if _safe_text(worksheet):
+            ctx.setdefault("worksheets_touched", set()).add(_safe_text(worksheet))
+        if _safe_text(spreadsheet_id):
+            ctx.setdefault("spreadsheets_touched", set()).add(_safe_text(spreadsheet_id))
+        if is_429:
+            ctx["had_429"] = True
+
+        read_item = {
+            "spreadsheet_id": _safe_text(spreadsheet_id),
+            "worksheet": _safe_text(worksheet),
+            "operation": _safe_text(operation),
+            "duration_ms": int(duration_ms or 0),
+            "ok": bool(ok),
+            "is_429": bool(is_429),
+            "error": _safe_text(error),
+        }
+        ctx.setdefault("sheet_reads", []).append(read_item)
+
+    try:
+        log_event(
+            "sheets_read",
+            request_id=request_id,
+            path=path,
+            flow_name=flow_name,
+            tenant_id=tenant_id,
+            spreadsheet_id=_safe_text(spreadsheet_id),
+            worksheet=_safe_text(worksheet),
+            operation=_safe_text(operation),
+            duration_ms=int(duration_ms or 0),
+            ok=bool(ok),
+            is_429=bool(is_429),
+            error=_safe_text(error),
+        )
+    except Exception:
+        pass
+
+
+def _wrap_gspread_method(cls, method_name: str, operation_name: str, metadata_getter):
+    original = getattr(cls, method_name, None)
+    if original is None or getattr(original, "_sheet_obs_wrapped", False):
+        return
+
+    def _wrapped(self, *args, **kwargs):
+        started_at = time.time()
+        ok = False
+        error = ""
+        is_429 = False
+        try:
+            result = original(self, *args, **kwargs)
+            ok = True
+            return result
+        except Exception as e:
+            error = str(e)
+            is_429 = _is_quota_429_error(e)
+            raise
+        finally:
+            duration_ms = max(0, int((time.time() - started_at) * 1000))
+            spreadsheet_id, worksheet = metadata_getter(self, *args, **kwargs)
+            _record_sheets_read(
+                spreadsheet_id=_safe_text(spreadsheet_id),
+                worksheet=_safe_text(worksheet),
+                operation=operation_name,
+                duration_ms=duration_ms,
+                ok=ok,
+                error=error,
+                is_429=is_429,
+            )
+
+    setattr(_wrapped, "_sheet_obs_wrapped", True)
+    setattr(cls, method_name, _wrapped)
+
+
+def _install_gspread_read_instrumentation() -> None:
+    global _GSPREAD_INSTRUMENTATION_INSTALLED
+    if _GSPREAD_INSTRUMENTATION_INSTALLED:
+        return
+
+    _wrap_gspread_method(
+        gspread.Client,
+        "open_by_key",
+        "client.open_by_key",
+        lambda _self, spreadsheet_id, *args, **kwargs: (_safe_text(spreadsheet_id), ""),
+    )
+    _wrap_gspread_method(
+        gspread.Spreadsheet,
+        "worksheet",
+        "spreadsheet.worksheet_lookup",
+        lambda self, title, *args, **kwargs: (_safe_text(getattr(self, "id", "")), _safe_text(title)),
+    )
+    _wrap_gspread_method(
+        gspread.Spreadsheet,
+        "worksheets",
+        "spreadsheet.worksheets",
+        lambda self, *args, **kwargs: (_safe_text(getattr(self, "id", "")), ""),
+    )
+    _wrap_gspread_method(
+        gspread.Worksheet,
+        "get_all_values",
+        "worksheet.get_all_values",
+        lambda self, *args, **kwargs: (_safe_text(getattr(getattr(self, "spreadsheet", None), "id", "")), _safe_text(getattr(self, "title", ""))),
+    )
+    _wrap_gspread_method(
+        gspread.Worksheet,
+        "row_values",
+        "worksheet.row_values",
+        lambda self, *args, **kwargs: (_safe_text(getattr(getattr(self, "spreadsheet", None), "id", "")), _safe_text(getattr(self, "title", ""))),
+    )
+    _wrap_gspread_method(
+        gspread.Worksheet,
+        "col_values",
+        "worksheet.col_values",
+        lambda self, *args, **kwargs: (_safe_text(getattr(getattr(self, "spreadsheet", None), "id", "")), _safe_text(getattr(self, "title", ""))),
+    )
+    _wrap_gspread_method(
+        gspread.Worksheet,
+        "get",
+        "worksheet.get",
+        lambda self, *args, **kwargs: (_safe_text(getattr(getattr(self, "spreadsheet", None), "id", "")), _safe_text(getattr(self, "title", ""))),
+    )
+
+    _GSPREAD_INSTRUMENTATION_INSTALLED = True
+
+
+_install_gspread_read_instrumentation()
 
 
 def _sleep_before_retry(attempt_index: int) -> None:

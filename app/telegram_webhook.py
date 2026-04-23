@@ -6,7 +6,7 @@ from typing import Any, Dict
 from fastapi import APIRouter
 
 from app.tenants import get_tenant_or_404, resolve_bot_by_secret
-from app.sheets import get_gspread_client, open_spreadsheet_by_key
+from app.sheets import get_gspread_client, open_spreadsheet_by_key, set_sheets_observation_context
 from app.telegram_api import telegram_answer_callback, telegram_send_text
 from app.utils import normalize, log_event
 from app.webhook_helpers import safe_int, rate_limit_allow
@@ -72,6 +72,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         except Exception as e:
             alert_tenant_error(tenant_id=tenant_id, error=str(e))
             return {"ok": True}
+        set_sheets_observation_context(flow_name="telegram_webhook", tenant_id=str(tenant.get("tenant_id") or tenant_id).strip())
 
         # -------------------------
         # Bot resolve
@@ -111,6 +112,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         # -------------------------
         cb = update.get("callback_query")
         if cb:
+            set_sheets_observation_context(flow_name=f"telegram_webhook:{mode or 'unknown'}:callback")
             if not isinstance(cb, dict):
                 log_event("webhook_invalid_callback_payload", tenant_id=tenant_id, mode=mode)
                 return {"ok": True}
@@ -177,6 +179,7 @@ async def telegram_webhook(tenant_id: str, secret: str, update: Dict[str, Any]):
         # -------------------------
         msg = update.get("message") or update.get("edited_message")
         if msg:
+            set_sheets_observation_context(flow_name=f"telegram_webhook:{mode or 'unknown'}:message")
             if not isinstance(msg, dict):
                 log_event("webhook_invalid_message_payload", tenant_id=tenant_id, mode=mode)
                 return {"ok": True}

@@ -1,6 +1,7 @@
 # app/main_app.py
 
 import logging
+import uuid
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -8,6 +9,7 @@ from app.config import APP_NAME, APP_VERSION
 from app.api_routes import router as api_router
 from app.telegram_webhook import router as telegram_router
 from app.admin_diag import router as admin_diag_router
+from app.sheets import start_sheets_request_context, finish_sheets_request_context
 
 
 # -------------------------
@@ -50,6 +52,32 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.middleware("http")
+    async def sheets_observability_middleware(request, call_next):
+        request_id = (request.headers.get("x-request-id") or "").strip() or f"http_{uuid.uuid4().hex[:12]}"
+        tenant_id = (request.query_params.get("tenant_id") or "").strip()
+
+        start_sheets_request_context(
+            path=str(request.url.path or "").strip(),
+            flow_name=str(request.url.path or "").strip(),
+            tenant_id=tenant_id,
+            request_id=request_id,
+        )
+
+        try:
+            response = await call_next(request)
+        except Exception as e:
+            finish_sheets_request_context(status_code=500, error=str(e))
+            raise
+
+        try:
+            response.headers["X-Request-ID"] = request_id
+        except Exception:
+            pass
+
+        finish_sheets_request_context(status_code=int(getattr(response, "status_code", 200) or 200))
+        return response
 
     # -------------------------
     # Routers

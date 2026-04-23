@@ -6,7 +6,7 @@ from typing import Any, Dict, Optional, List, Tuple
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.sheets import get_gspread_client, open_spreadsheet_by_key
+from app.sheets import get_gspread_client, open_spreadsheet_by_key, get_recent_sheets_request_summaries
 from app.tenants import get_tenant_or_404, tenants_cache_info
 from app.utils import normalize
 from app.admin_settings import (
@@ -667,6 +667,28 @@ def menu_snapshot_diag(
         "ok": True,
         "tenant_id": tenant.get("tenant_id"),
         "menu_snapshot": get_menu_runtime_status(sh),
+    }
+
+
+@router.get("/sheets_recent")
+def sheets_recent_diag(
+    token: str = Query(...),
+    limit: int = Query(default=20),
+    min_reads: int = Query(default=1),
+    had_429_only: bool = Query(default=False),
+) -> Dict[str, Any]:
+    _require_admin_token(token)
+
+    requests = get_recent_sheets_request_summaries(
+        limit=limit,
+        min_reads=min_reads,
+        had_429_only=had_429_only,
+    )
+
+    return {
+        "ok": True,
+        "count": len(requests),
+        "requests": requests,
     }
 
 

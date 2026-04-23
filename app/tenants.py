@@ -6,7 +6,7 @@ import time
 from fastapi import HTTPException
 
 from app.config import TENANTS_SHEET_NAME
-from app.sheets import get_gspread_client, open_config_spreadsheet, invalidate_sheet_caches
+from app.sheets import get_gspread_client, open_config_spreadsheet, invalidate_sheet_caches, set_sheets_observation_context
 from app.utils import now_iso_utc, to_bool, normalize, log_event
 
 
@@ -355,10 +355,12 @@ def get_tenant_or_404(tenant_id: str, gc=None) -> Dict[str, Any]:
     tid = _norm_tenant_id(tenant_id)
     if not tid:
         raise HTTPException(status_code=400, detail="tenant_id is required")
+    set_sheets_observation_context(tenant_id=tid)
 
     tenants = load_tenants(gc=gc, force=False)
     t = tenants.get(tid)
     if t:
+        set_sheets_observation_context(tenant_id=tid)
         return t
 
     tenants = load_tenants(gc=gc, force=True)
@@ -371,6 +373,7 @@ def get_tenant_or_404(tenant_id: str, gc=None) -> Dict[str, Any]:
     except Exception:
         pass
 
+    set_sheets_observation_context(tenant_id=tid)
     return t
 
 

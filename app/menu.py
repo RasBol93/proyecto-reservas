@@ -6,7 +6,7 @@ import time
 
 from fastapi import HTTPException
 
-from app.sheets import get_ws, read_records_manual, detect_header_row
+from app.sheets import get_ws, read_records_manual, detect_header_row, note_sheets_serving_source
 from app.utils import to_bool, normalize, log_event
 from app.alerts import alert_system_error, alert_tenant_error
 from app.promotions import get_active_promotions
@@ -383,7 +383,9 @@ def _maybe_alert_transient_menu_failure(cache_key: str, error: Exception, *, ser
 
 
 def _set_last_menu_serve_source(cache_key: str, source: str) -> None:
-    _MENU_LAST_SERVE_SOURCE[cache_key] = str(source or "").strip()
+    clean_source = str(source or "").strip()
+    _MENU_LAST_SERVE_SOURCE[cache_key] = clean_source
+    note_sheets_serving_source(clean_source)
 
 
 def _get_last_menu_serve_source(cache_key: str) -> str:
