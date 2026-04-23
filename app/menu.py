@@ -1,4 +1,6 @@
 from typing import Any, Dict, List, Optional, Tuple
+import json
+from pathlib import Path
 import re
 import time
 
@@ -15,8 +17,17 @@ REQUIRED_MENU_HEADERS = ["sku", "name", "price", "active", "category"]
 # Cache simple por spreadsheet
 _MENU_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 _MENU_ADMIN_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
+_MENU_READ_COOLDOWN_UNTIL: Dict[str, float] = {}
+_MENU_TRANSIENT_ALERT_LAST_AT: Dict[str, float] = {}
+_MENU_LAST_SERVE_SOURCE: Dict[str, str] = {}
 
-MENU_CACHE_TTL_SECONDS = 90
+MENU_CACHE_TTL_SECONDS = 900
+MENU_CACHE_STALE_WINDOW_SECONDS = 900
+MENU_SNAPSHOT_MAX_AGE_SECONDS = 86400
+MENU_READ_FAILURE_COOLDOWN_SECONDS = 60
+MENU_TRANSIENT_ALERT_COOLDOWN_SECONDS = 180
+MENU_SNAPSHOT_VERSION = 1
+MENU_SNAPSHOT_DIRNAME = ".menu_snapshots"
 
 # Retry simple y corto para operaciones de red/Sheets
 _MENU_RETRY_ATTEMPTS = 3
@@ -201,8 +212,43 @@ def _cache_set(
     cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]],
     cache_key: str,
     idx: Dict[str, Dict[str, Any]],
+    *,
+    ts: Optional[float] = None,
 ) -> None:
-    cache[cache_key] = (time.time(), idx)
+    cache[cache_key] = (float(ts if ts is not None else time.time()), idx)
+
+
+def _cache_get_stale(
+    cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]],
+    cache_key: str,
+    *,
+    max_age_seconds: int,
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    now = time.time()
+    cached = cache.get(cache_key)
+    if not cached:
+        return None
+
+    ts, idx = cached
+    if max_age_seconds > 0 and (now - ts) <= max_age_seconds:
+        return idx
+
+    return None
+
+
+def _cache_age_seconds(
+    cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]],
+    cache_key: str,
+) -> Optional[int]:
+    cached = cache.get(cache_key)
+    if not cached:
+        return None
+
+    ts, _ = cached
+    try:
+        return max(0, int(time.time() - ts))
+    except Exception:
+        return None
 
 
 def _cache_invalidate(cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]], cache_key: str) -> None:
@@ -210,15 +256,210 @@ def _cache_invalidate(cache: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]],
         del cache[cache_key]
 
 
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _snapshot_dir() -> Path:
+    return _project_root() / MENU_SNAPSHOT_DIRNAME
+
+
+def _snapshot_path(cache_key: str) -> Path:
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(cache_key or "").strip()) or "unknown"
+    return _snapshot_dir() / f"{safe_key}.json"
+
+
+def _read_snapshot_payload(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    return payload
+
+
+def _load_menu_snapshot(cache_key: str) -> Optional[Tuple[float, Dict[str, Dict[str, Any]]]]:
+    path = _snapshot_path(cache_key)
+    if not path.exists():
+        return None
+
+    payload = _read_snapshot_payload(path)
+    if payload is None:
+        try:
+            log_event("menu_snapshot_read_failed", cache_key=cache_key, error_type="snapshot_payload_invalid", error="invalid snapshot payload")
+        except Exception:
+            pass
+        return None
+
+    if int(payload.get("version") or 0) != MENU_SNAPSHOT_VERSION:
+        return None
+
+    snapshot_key = str(payload.get("spreadsheet_id") or "").strip()
+    if snapshot_key != str(cache_key or "").strip():
+        return None
+
+    try:
+        generated_at_ts = float(payload.get("generated_at_ts") or 0)
+    except Exception:
+        return None
+
+    if generated_at_ts <= 0:
+        return None
+
+    age_seconds = max(0, int(time.time() - generated_at_ts))
+    if age_seconds > MENU_SNAPSHOT_MAX_AGE_SECONDS:
+        return None
+
+    menu_idx = payload.get("menu_idx")
+    if not isinstance(menu_idx, dict) or not menu_idx:
+        return None
+
+    return float(generated_at_ts), menu_idx
+
+
+def _persist_menu_snapshot(cache_key: str, idx: Dict[str, Dict[str, Any]], *, ts: Optional[float] = None) -> None:
+    snapshot_ts = float(ts if ts is not None else time.time())
+    payload = {
+        "version": MENU_SNAPSHOT_VERSION,
+        "spreadsheet_id": str(cache_key or "").strip(),
+        "generated_at_ts": snapshot_ts,
+        "menu_idx": idx,
+    }
+
+    snapshot_dir = _snapshot_dir()
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    path = _snapshot_path(cache_key)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def _set_menu_read_cooldown(cache_key: str) -> None:
+    _MENU_READ_COOLDOWN_UNTIL[cache_key] = time.time() + MENU_READ_FAILURE_COOLDOWN_SECONDS
+
+
+def _clear_menu_read_cooldown(cache_key: str) -> None:
+    _MENU_READ_COOLDOWN_UNTIL.pop(cache_key, None)
+
+
+def _is_menu_read_cooldown_active(cache_key: str) -> bool:
+    until = float(_MENU_READ_COOLDOWN_UNTIL.get(cache_key) or 0.0)
+    if until <= 0:
+        return False
+    if time.time() >= until:
+        _MENU_READ_COOLDOWN_UNTIL.pop(cache_key, None)
+        return False
+    return True
+
+
+def _cooldown_remaining_seconds(cache_key: str) -> int:
+    until = float(_MENU_READ_COOLDOWN_UNTIL.get(cache_key) or 0.0)
+    if until <= 0:
+        return 0
+    return max(0, int(until - time.time()))
+
+
+def _should_emit_transient_menu_alert(cache_key: str) -> bool:
+    now = time.time()
+    last = float(_MENU_TRANSIENT_ALERT_LAST_AT.get(cache_key) or 0.0)
+    if last > 0 and (now - last) < MENU_TRANSIENT_ALERT_COOLDOWN_SECONDS:
+        return False
+    _MENU_TRANSIENT_ALERT_LAST_AT[cache_key] = now
+    return True
+
+
+def _maybe_alert_transient_menu_failure(cache_key: str, error: Exception, *, served_stale: bool) -> None:
+    if not _should_emit_transient_menu_alert(cache_key):
+        return
+
+    alert_system_error(
+        error=str(error),
+        module="menu.load_menu_index_transient_stale" if served_stale else "menu.load_menu_index_transient",
+    )
+
+
+def _set_last_menu_serve_source(cache_key: str, source: str) -> None:
+    _MENU_LAST_SERVE_SOURCE[cache_key] = str(source or "").strip()
+
+
+def _get_last_menu_serve_source(cache_key: str) -> str:
+    return str(_MENU_LAST_SERVE_SOURCE.get(cache_key) or "").strip()
+
+
 def invalidate_menu_cache(orders_sh) -> None:
     ck = _cache_key_for_orders_sh(orders_sh)
     _cache_invalidate(_MENU_CACHE, ck)
     _cache_invalidate(_MENU_ADMIN_CACHE, ck)
+    _clear_menu_read_cooldown(ck)
+    _MENU_TRANSIENT_ALERT_LAST_AT.pop(ck, None)
+    _MENU_LAST_SERVE_SOURCE.pop(ck, None)
 
 
 def invalidate_all_menu_caches() -> None:
     _MENU_CACHE.clear()
     _MENU_ADMIN_CACHE.clear()
+    _MENU_READ_COOLDOWN_UNTIL.clear()
+    _MENU_TRANSIENT_ALERT_LAST_AT.clear()
+    _MENU_LAST_SERVE_SOURCE.clear()
+
+
+def get_menu_runtime_status(orders_sh) -> Dict[str, Any]:
+    ck = _cache_key_for_orders_sh(orders_sh)
+    path = _snapshot_path(ck)
+    payload = _read_snapshot_payload(path) if path.exists() else None
+    snapshot_valid = _load_menu_snapshot(ck) is not None
+
+    age_seconds: Optional[int] = None
+    snapshot_spreadsheet_id = ""
+    generated_at_ts: Optional[float] = None
+    rejection_reason = ""
+
+    if payload is None:
+        if path.exists():
+            rejection_reason = "invalid_payload"
+    else:
+        snapshot_spreadsheet_id = str(payload.get("spreadsheet_id") or "").strip()
+        try:
+            generated_at_ts = float(payload.get("generated_at_ts") or 0)
+        except Exception:
+            generated_at_ts = None
+
+        if generated_at_ts and generated_at_ts > 0:
+            try:
+                age_seconds = max(0, int(time.time() - generated_at_ts))
+            except Exception:
+                age_seconds = None
+
+        if not snapshot_valid:
+            if int(payload.get("version") or 0) != MENU_SNAPSHOT_VERSION:
+                rejection_reason = "version_mismatch"
+            elif snapshot_spreadsheet_id != str(ck or "").strip():
+                rejection_reason = "spreadsheet_id_mismatch"
+            elif not generated_at_ts or generated_at_ts <= 0:
+                rejection_reason = "generated_at_invalid"
+            elif age_seconds is not None and age_seconds > MENU_SNAPSHOT_MAX_AGE_SECONDS:
+                rejection_reason = "snapshot_too_old"
+            elif not isinstance(payload.get("menu_idx"), dict) or not payload.get("menu_idx"):
+                rejection_reason = "menu_idx_invalid"
+
+    return {
+        "spreadsheet_id": ck,
+        "snapshot_path": str(path),
+        "snapshot_exists": bool(path.exists()),
+        "snapshot_valid": bool(snapshot_valid),
+        "snapshot_age_seconds": age_seconds,
+        "snapshot_spreadsheet_id": snapshot_spreadsheet_id,
+        "last_served_from": _get_last_menu_serve_source(ck),
+        "memory_cache_age_seconds": _cache_age_seconds(_MENU_CACHE, ck),
+        "memory_cache_fresh": _cache_get(_MENU_CACHE, ck) is not None,
+        "cooldown_active": _is_menu_read_cooldown_active(ck),
+        "cooldown_remaining_seconds": _cooldown_remaining_seconds(ck),
+        "snapshot_rejection_reason": rejection_reason,
+    }
 
 
 def _get_menu_ws(orders_sh):
@@ -465,13 +706,51 @@ def _build_virtual_promotions_index(orders_sh, menu_idx: Dict[str, Dict[str, Any
 
 def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]:
     ck = _cache_key_for_orders_sh(orders_sh)
+    max_stale_age = MENU_CACHE_TTL_SECONDS + MENU_CACHE_STALE_WINDOW_SECONDS
 
     if not force:
         cached = _cache_get(_MENU_CACHE, ck)
         if cached is not None:
+            _set_last_menu_serve_source(ck, "memory")
             return cached
     else:
         _cache_invalidate(_MENU_CACHE, ck)
+
+    stale_cached = _cache_get_stale(_MENU_CACHE, ck, max_age_seconds=max_stale_age)
+    snapshot_cached = None if force else _load_menu_snapshot(ck)
+
+    if not force and snapshot_cached is not None:
+        snapshot_ts, snapshot_idx = snapshot_cached
+        _cache_set(_MENU_CACHE, ck, snapshot_idx, ts=snapshot_ts)
+        _set_last_menu_serve_source(ck, "snapshot")
+        try:
+            log_event(
+                "menu_loaded_from_snapshot",
+                cache_key=ck,
+                cache_age_seconds=max(0, int(time.time() - snapshot_ts)),
+                snapshot_max_age_seconds=MENU_SNAPSHOT_MAX_AGE_SECONDS,
+            )
+        except Exception:
+            pass
+        return snapshot_idx
+
+    if not force and _is_menu_read_cooldown_active(ck):
+        if stale_cached is not None:
+            try:
+                log_event(
+                    "menu_served_stale_during_cooldown",
+                    cache_key=ck,
+                    cache_age_seconds=_cache_age_seconds(_MENU_CACHE, ck),
+                    cooldown_remaining_seconds=_cooldown_remaining_seconds(ck),
+                    fresh_ttl_seconds=MENU_CACHE_TTL_SECONDS,
+                    stale_window_seconds=MENU_CACHE_STALE_WINDOW_SECONDS,
+                )
+            except Exception:
+                pass
+            _set_last_menu_serve_source(ck, "memory")
+            return stale_cached
+
+        raise HTTPException(status_code=503, detail="Menu temporarily unavailable")
 
     try:
         ws = _get_menu_ws(orders_sh)
@@ -550,7 +829,22 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
             idx.update(virtual_promos)
             stats["virtual_promotions"] = len(virtual_promos)
 
-        _cache_set(_MENU_CACHE, ck, idx)
+        now_ts = time.time()
+        _cache_set(_MENU_CACHE, ck, idx, ts=now_ts)
+        _set_last_menu_serve_source(ck, "sheets")
+        try:
+            _persist_menu_snapshot(ck, idx, ts=now_ts)
+        except Exception as e:
+            try:
+                log_event(
+                    "menu_snapshot_write_failed",
+                    cache_key=ck,
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+            except Exception:
+                pass
+        _clear_menu_read_cooldown(ck)
 
         try:
             log_event(
@@ -558,7 +852,9 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
                 worksheet_title=getattr(ws, "title", "unknown"),
                 items=len(idx),
                 stats=stats,
-                ttl_seconds=MENU_CACHE_TTL_SECONDS,
+                fresh_ttl_seconds=MENU_CACHE_TTL_SECONDS,
+                stale_window_seconds=MENU_CACHE_STALE_WINDOW_SECONDS,
+                snapshot_max_age_seconds=MENU_SNAPSHOT_MAX_AGE_SECONDS,
             )
         except Exception:
             pass
@@ -566,7 +862,49 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
         return idx
 
     except Exception as e:
-        alert_system_error(error=str(e), module="menu.load_menu_index")
+        is_transient = _should_retry_exception(e)
+        if is_transient:
+            _set_menu_read_cooldown(ck)
+            if stale_cached is not None:
+                try:
+                    log_event(
+                        "menu_load_failed_serving_stale",
+                        cache_key=ck,
+                        error_type=type(e).__name__,
+                        error=str(e),
+                        cache_age_seconds=_cache_age_seconds(_MENU_CACHE, ck),
+                        cooldown_seconds=MENU_READ_FAILURE_COOLDOWN_SECONDS,
+                        fresh_ttl_seconds=MENU_CACHE_TTL_SECONDS,
+                        stale_window_seconds=MENU_CACHE_STALE_WINDOW_SECONDS,
+                    )
+                except Exception:
+                    pass
+                _set_last_menu_serve_source(ck, "memory")
+                _maybe_alert_transient_menu_failure(ck, e, served_stale=True)
+                return stale_cached
+
+            if snapshot_cached is not None:
+                snapshot_ts, snapshot_idx = snapshot_cached
+                _cache_set(_MENU_CACHE, ck, snapshot_idx, ts=snapshot_ts)
+                _set_last_menu_serve_source(ck, "snapshot")
+                try:
+                    log_event(
+                        "menu_load_failed_serving_snapshot",
+                        cache_key=ck,
+                        error_type=type(e).__name__,
+                        error=str(e),
+                        snapshot_age_seconds=max(0, int(time.time() - snapshot_ts)),
+                        snapshot_max_age_seconds=MENU_SNAPSHOT_MAX_AGE_SECONDS,
+                        cooldown_seconds=MENU_READ_FAILURE_COOLDOWN_SECONDS,
+                    )
+                except Exception:
+                    pass
+                _maybe_alert_transient_menu_failure(ck, e, served_stale=True)
+                return snapshot_idx
+
+            _maybe_alert_transient_menu_failure(ck, e, served_stale=False)
+        else:
+            alert_system_error(error=str(e), module="menu.load_menu_index")
         raise
 
 

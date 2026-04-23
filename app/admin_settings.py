@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
@@ -19,6 +20,9 @@ from app.utils import normalize, to_bool, log_event
 
 ADMIN_SETTINGS_SHEET_NAME = "AdminSettings"
 REQUIRED_ADMIN_SETTINGS_HEADERS = ["key", "value", "active", "scope"]
+ADMIN_SETTINGS_CACHE_TTL_SECONDS = 90
+
+_ADMIN_SETTINGS_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 
 
 @dataclass
@@ -42,6 +46,36 @@ class BusinessStatus:
     today_date: str = ""
     today_slots: List[Tuple[str, str]] = field(default_factory=list)
     has_two_slots: bool = False
+
+
+def _cache_key(orders_sh) -> str:
+    try:
+        sid = getattr(orders_sh, "id", None)
+        if sid:
+            return str(sid)
+    except Exception:
+        pass
+    return str(id(orders_sh))
+
+
+def _cache_get(cache_key: str) -> Optional[Dict[str, Dict[str, Any]]]:
+    cached = _ADMIN_SETTINGS_CACHE.get(cache_key)
+    if not cached:
+        return None
+
+    ts, data = cached
+    if (time.time() - ts) <= ADMIN_SETTINGS_CACHE_TTL_SECONDS:
+        return data
+
+    return None
+
+
+def _cache_set(cache_key: str, data: Dict[str, Dict[str, Any]]) -> None:
+    _ADMIN_SETTINGS_CACHE[cache_key] = (time.time(), data)
+
+
+def invalidate_admin_settings_cache(orders_sh) -> None:
+    _ADMIN_SETTINGS_CACHE.pop(_cache_key(orders_sh), None)
 
 
 def _tz(tenant_tz: str):
@@ -181,7 +215,15 @@ def _settings_rows_to_map(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any
     return out
 
 
-def load_admin_settings(orders_sh) -> Dict[str, Dict[str, Any]]:
+def load_admin_settings(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]:
+    cache_key = _cache_key(orders_sh)
+    if force:
+        invalidate_admin_settings_cache(orders_sh)
+    else:
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
     ws = None
 
     try:
@@ -200,6 +242,7 @@ def load_admin_settings(orders_sh) -> Dict[str, Dict[str, Any]]:
 
     rows = read_records_manual(ws, required_headers=REQUIRED_ADMIN_SETTINGS_HEADERS)
     cfg = _settings_rows_to_map(rows)
+    _cache_set(cache_key, cfg)
 
     try:
         log_event(
@@ -370,6 +413,7 @@ def set_admin_setting_value(
             log_event("admin_setting_created", key=key, value=value, updated_by=updated_by)
         except Exception:
             pass
+        invalidate_admin_settings_cache(orders_sh)
         return {"ok": True, "key": normalize(key).replace(" ", "_"), "value": value, "created": True}
 
     _update_admin_setting_cells(
@@ -383,6 +427,8 @@ def set_admin_setting_value(
         log_event("admin_setting_updated", key=key, value=value, updated_by=updated_by)
     except Exception:
         pass
+
+    invalidate_admin_settings_cache(orders_sh)
 
     return {"ok": True, "key": normalize(key).replace(" ", "_"), "value": value, "created": False}
 

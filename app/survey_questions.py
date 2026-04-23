@@ -1,6 +1,7 @@
 # app/survey_questions.py
 
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.sheets import read_records_manual
 from app.utils import normalize, to_bool, log_event
@@ -15,8 +16,50 @@ from app.survey_core import (
 )
 
 
-def load_survey_questions(orders_sh) -> List[Dict[str, Any]]:
+SURVEY_QUESTIONS_CACHE_TTL_SECONDS = 90
+_SURVEY_QUESTIONS_CACHE: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+
+
+def _cache_key(orders_sh) -> str:
     try:
+        sid = getattr(orders_sh, "id", None)
+        if sid:
+            return str(sid)
+    except Exception:
+        pass
+    return str(id(orders_sh))
+
+
+def _cache_get(cache_key: str) -> Optional[List[Dict[str, Any]]]:
+    cached = _SURVEY_QUESTIONS_CACHE.get(cache_key)
+    if not cached:
+        return None
+
+    ts, data = cached
+    if (time.time() - ts) <= SURVEY_QUESTIONS_CACHE_TTL_SECONDS:
+        return data
+
+    return None
+
+
+def _cache_set(cache_key: str, data: List[Dict[str, Any]]) -> None:
+    _SURVEY_QUESTIONS_CACHE[cache_key] = (time.time(), data)
+
+
+def invalidate_survey_questions_cache(orders_sh) -> None:
+    _SURVEY_QUESTIONS_CACHE.pop(_cache_key(orders_sh), None)
+
+
+def load_survey_questions(orders_sh, force: bool = False) -> List[Dict[str, Any]]:
+    try:
+        cache_key = _cache_key(orders_sh)
+        if force:
+            invalidate_survey_questions_cache(orders_sh)
+        else:
+            cached = _cache_get(cache_key)
+            if cached is not None:
+                return cached
+
         ws = _ensure_ws(orders_sh, SURVEY_CONFIG_WS, SURVEY_CONFIG_HEADERS)
         rows = read_records_manual(ws, required_headers=SURVEY_CONFIG_HEADERS)
 
@@ -48,6 +91,7 @@ def load_survey_questions(orders_sh) -> List[Dict[str, Any]]:
             })
 
         questions.sort(key=lambda x: (int(x.get("order", 0)), _safe_str(x.get("question_id"))))
+        _cache_set(cache_key, questions)
         return questions
 
     except Exception as e:
@@ -107,6 +151,7 @@ def add_survey_question(orders_sh, question_text: str, question_type: str) -> Di
             ],
             value_input_option="USER_ENTERED",
         )
+        invalidate_survey_questions_cache(orders_sh)
 
         return {
             "ok": True,
@@ -162,6 +207,7 @@ def disable_survey_question(orders_sh, question_id: str) -> Dict[str, Any]:
             ],
             value_input_option="USER_ENTERED",
         )
+        invalidate_survey_questions_cache(orders_sh)
 
         return {"ok": True, "question_id": qid}
 

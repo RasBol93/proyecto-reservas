@@ -5,6 +5,11 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+try:
+    from gspread.exceptions import APIError, WorksheetNotFound
+except Exception:  # pragma: no cover
+    APIError = Exception  # type: ignore
+    WorksheetNotFound = Exception  # type: ignore
 
 from app.utils import log_event
 from app.alerts import (
@@ -30,9 +35,36 @@ _ALLOWED_PROOF_TYPES = {
     "external_url",
 }
 
+_ORDERS_WS_CACHE: Dict[str, Any] = {}
+_TRANSIENT_ORDERS_ERROR_SIGNALS = (
+    "429",
+    "quota",
+    "rate limit",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "service unavailable",
+    "internal error",
+    "bad gateway",
+    "gateway timeout",
+    "500",
+    "502",
+    "503",
+    "504",
+)
+
+
+class OrdersReadTemporarilyUnavailable(RuntimeError):
+    pass
+
 
 def _normalize_status(value: Any) -> str:
     return str(value or "").strip().upper()
+
+
+def _is_transient_orders_error_message(message: Any) -> bool:
+    lower_msg = str(message or "").lower()
+    return any(token in lower_msg for token in _TRANSIENT_ORDERS_ERROR_SIGNALS)
 
 
 def _is_allowed_status(status: str) -> bool:
@@ -60,11 +92,35 @@ def _get_orders_ws(orders_sh):
     Busca nombres permitidos de la hoja de pedidos.
     Ya no cae silenciosamente a la primera hoja.
     """
+    try:
+        spreadsheet_key = str(getattr(orders_sh, "id", None) or id(orders_sh))
+    except Exception:
+        spreadsheet_key = str(id(orders_sh))
+
+    cached = _ORDERS_WS_CACHE.get(spreadsheet_key)
+    if cached is not None:
+        return cached
+
     for ws_name in ("ORDERS", "Orders", "orders"):
         try:
-            return orders_sh.worksheet(ws_name)
-        except Exception:
-            pass
+            ws = orders_sh.worksheet(ws_name)
+            _ORDERS_WS_CACHE[spreadsheet_key] = ws
+            return ws
+        except WorksheetNotFound:
+            continue
+        except APIError as e:
+            msg = str(e or "")
+            if _is_transient_orders_error_message(msg):
+                raise OrdersReadTemporarilyUnavailable(f"ORDERS worksheet temporarily unavailable: {msg}") from e
+            raise RuntimeError(f"ORDERS worksheet access error: {msg}") from e
+        except Exception as e:
+            msg = str(e or "")
+            lower_msg = msg.lower()
+            if "worksheet" in lower_msg and "not found" in lower_msg:
+                continue
+            if _is_transient_orders_error_message(msg):
+                raise OrdersReadTemporarilyUnavailable(f"ORDERS worksheet temporarily unavailable: {msg}") from e
+            raise RuntimeError(f"ORDERS worksheet access error: {msg}") from e
     raise RuntimeError("ORDERS worksheet not found (accepted names: ORDERS, Orders, orders)")
 
 
@@ -193,13 +249,26 @@ def _safe_col_values(ws, col_index_1based: int) -> List[Any]:
         return []
 
 
-def _find_next_empty_row(ws, header_len: int) -> int:
+def _find_next_empty_row(ws, header: List[str]) -> int:
     """
     Busca la siguiente fila vacía real usando solo el ancho técnico del header.
     Esto evita que append_row se vaya a la derecha por rangos extraños de Google Sheets.
     """
+    header_len = len(header or [])
     if header_len <= 0:
         return 2
+
+    order_id_col = _find_col_idx(header, "order_id")
+    if order_id_col is not None:
+        values = _safe_col_values(ws, order_id_col + 1)
+        if not values or len(values) == 1:
+            return 2
+
+        for idx_0based, cell in enumerate(values[1:], start=2):
+            if not str(cell).strip():
+                return idx_0based
+
+        return len(values) + 1
 
     try:
         values = ws.get_all_values()
@@ -368,7 +437,7 @@ def append_order_row(
         }
 
         row = _build_row_by_header(header, data)
-        next_row = _find_next_empty_row(ws, len(header))
+        next_row = _find_next_empty_row(ws, header)
         _write_full_row(ws, next_row, row)
 
         log_event(
@@ -451,6 +520,64 @@ def get_order_by_id(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
         return None
 
     row = _safe_row_values(ws, ridx)
+    if not row:
+        return None
+    return _row_to_dict(header, row)
+
+
+def _strict_col_values(ws, col_index_1based: int) -> List[Any]:
+    try:
+        return ws.col_values(col_index_1based)
+    except Exception as e:
+        if _is_transient_orders_error_message(e):
+            raise OrdersReadTemporarilyUnavailable(f"ORDERS column temporarily unavailable: {e}") from e
+        raise
+
+
+def _strict_row_values(ws, row_index: int) -> List[Any]:
+    try:
+        return ws.row_values(row_index)
+    except Exception as e:
+        if _is_transient_orders_error_message(e):
+            raise OrdersReadTemporarilyUnavailable(f"ORDERS row temporarily unavailable: {e}") from e
+        raise
+
+
+def _strict_header(ws) -> List[str]:
+    try:
+        hdr = ws.row_values(1)
+    except Exception as e:
+        if _is_transient_orders_error_message(e):
+            raise OrdersReadTemporarilyUnavailable(f"ORDERS header temporarily unavailable: {e}") from e
+        raise
+    return [h.strip() for h in hdr if str(h).strip()]
+
+
+def get_order_by_id_strict(orders_sh, order_id: str) -> Optional[Dict[str, Any]]:
+    ws = _get_orders_ws(orders_sh)
+    header = _strict_header(ws)
+    if not header:
+        return None
+
+    oid_col = _find_col_idx(header, "order_id")
+    if oid_col is None:
+        return None
+
+    col_values = _strict_col_values(ws, oid_col + 1)
+    target = (order_id or "").strip()
+    if not target:
+        return None
+
+    ridx = None
+    for i in range(1, len(col_values)):
+        if str(col_values[i]).strip() == target:
+            ridx = i + 1
+            break
+
+    if ridx is None:
+        return None
+
+    row = _strict_row_values(ws, ridx)
     if not row:
         return None
     return _row_to_dict(header, row)

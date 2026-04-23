@@ -451,6 +451,30 @@ def handle_admin_orders_callback(
             status_after = _normalize_status((order_after or {}).get("status"))
 
             if status_after != "PAID":
+                try:
+                    time.sleep(0.25)
+                except Exception:
+                    pass
+
+                order_after_retry = get_order_by_id(orders_sh, order_id)
+                status_after_retry = _normalize_status((order_after_retry or {}).get("status"))
+
+                if status_after_retry == "PAID":
+                    order_after = order_after_retry
+                    status_after = status_after_retry
+                else:
+                    log_event(
+                        "admin_paid_postcheck_fallback",
+                        tenant_id=tenant_id,
+                        order_id=order_id,
+                        chat_id=chat_id,
+                        status_after=status_after_retry or status_after,
+                    )
+                    order_after = dict(order_before or {})
+                    order_after["status"] = "PAID"
+                    status_after = "PAID"
+
+            if status_after != "PAID":
                 log_event(
                     "admin_paid_postcheck_failed",
                     tenant_id=tenant_id,

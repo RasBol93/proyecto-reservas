@@ -38,7 +38,7 @@ def _send_home(bot_token: str, chat_id: int, orders_sh) -> bool:
     return telegram_send_text(
         bot_token,
         chat_id,
-        build_start_text(orders_sh),
+        build_start_text(orders_sh, content_map=content_map),
         build_dynamic_home_kb(content_map),
     )
 

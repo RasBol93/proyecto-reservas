@@ -14,7 +14,7 @@ from app.admin_settings import (
     REQUIRED_ADMIN_SETTINGS_HEADERS,
     resolve_business_status_dict,
 )
-from app.menu import load_menu_admin_index, group_menu_admin_by_category
+from app.menu import load_menu_admin_index, group_menu_admin_by_category, get_menu_runtime_status
 from app.orders import get_order_by_id
 from app.alerts import send_test_alert
 
@@ -644,6 +644,29 @@ def runtime_diag(
         "business_status": business,
         "menu_runtime": menu_runtime,
         "orders_runtime": orders_runtime,
+    }
+
+
+@router.get("/menu_snapshot")
+def menu_snapshot_diag(
+    tenant_id: str = Query(...),
+    token: str = Query(...),
+) -> Dict[str, Any]:
+    _require_admin_token(token)
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(tenant_id, gc=gc)
+
+    orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
+    if not orders_sheet_id:
+        raise HTTPException(status_code=500, detail="orders_sheet_id missing for tenant")
+
+    sh = open_spreadsheet_by_key(gc, orders_sheet_id)
+
+    return {
+        "ok": True,
+        "tenant_id": tenant.get("tenant_id"),
+        "menu_snapshot": get_menu_runtime_status(sh),
     }
 
 

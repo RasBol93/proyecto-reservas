@@ -178,7 +178,7 @@ def _send_home(bot_token: str, chat_id: int, orders_sh) -> bool:
     return telegram_send_text(
         bot_token,
         chat_id,
-        build_start_text(orders_sh),
+        build_start_text(orders_sh, content_map=content_map),
         build_dynamic_home_kb(content_map, orders_sh),
     )
 
@@ -899,7 +899,14 @@ def handle_client_callback(
                 return {"ok": True}
 
             try:
-                ok_sent = notify_admin_payment_reported(tenant, tenant_id, orders_sh, order_id, is_reminder=False)
+                ok_sent = notify_admin_payment_reported(
+                    tenant,
+                    tenant_id,
+                    orders_sh,
+                    order_id,
+                    is_reminder=False,
+                    order=order,
+                )
             except Exception as e:
                 log_event(
                     "notify_admin_payment_reported_error",
@@ -1076,7 +1083,7 @@ def handle_client_message(
                 proof_caption = ((msg.get("document") or {}).get("file_name") or "").strip()
 
         if proof_file_id and proof_type:
-            order_id = (sess.get("tmp") or {}).get("pending_order_id")
+            order_id = _get_pending_order_from_session(sess)
             if not order_id:
                 order_id = find_latest_pending_order_for_contact(
                     orders_sh=orders_sh,

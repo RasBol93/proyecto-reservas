@@ -3,7 +3,7 @@
 
 import mimetypes
 import threading
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
@@ -217,6 +217,7 @@ def _notify_admin_payment_reported_sync(
     orders_sh,
     order_id: str,
     is_reminder: bool = False,
+    order: Optional[Dict[str, Any]] = None,
 ) -> bool:
     try:
         admin_token = get_admin_bot_token(tenant)
@@ -231,10 +232,15 @@ def _notify_admin_payment_reported_sync(
             alert_payment_failed(tenant_id=tenant_id, error="Missing order_id")
             return False
 
-        order = get_order_by_id(orders_sh, clean_order_id)
-        if not order:
+        order_data = dict(order) if isinstance(order, dict) else None
+        if not order_data:
+            order_data = get_order_by_id(orders_sh, clean_order_id)
+
+        if not order_data:
             telegram_send_text(admin_token, admin_chat_id, f"\u26a0\ufe0f Pedido {clean_order_id} no encontrado.")
             return False
+
+        order = order_data
 
         items_snapshot = parse_items_field(order.get("items_snapshot"))
 
@@ -334,6 +340,7 @@ def _notify_admin_payment_reported_fire_and_forget(
     orders_sh,
     order_id: str,
     is_reminder: bool = False,
+    order: Optional[Dict[str, Any]] = None,
 ) -> None:
     try:
         _notify_admin_payment_reported_sync(
@@ -342,6 +349,7 @@ def _notify_admin_payment_reported_fire_and_forget(
             orders_sh=orders_sh,
             order_id=order_id,
             is_reminder=is_reminder,
+            order=order,
         )
     except Exception as e:
         log_event(
@@ -358,6 +366,7 @@ def notify_admin_payment_reported(
     orders_sh,
     order_id: str,
     is_reminder: bool = False,
+    order: Optional[Dict[str, Any]] = None,
 ) -> bool:
     try:
         admin_token = get_admin_bot_token(tenant)
@@ -372,8 +381,11 @@ def notify_admin_payment_reported(
             alert_payment_failed(tenant_id=tenant_id, error="Missing order_id")
             return False
 
-        order = get_order_by_id(orders_sh, clean_order_id)
-        if not order:
+        order_data = dict(order) if isinstance(order, dict) else None
+        if not order_data:
+            order_data = get_order_by_id(orders_sh, clean_order_id)
+
+        if not order_data:
             telegram_send_text(admin_token, admin_chat_id, f"\u26a0\ufe0f Pedido {clean_order_id} no encontrado.")
             return False
 
@@ -385,6 +397,7 @@ def notify_admin_payment_reported(
                 "orders_sh": orders_sh,
                 "order_id": clean_order_id,
                 "is_reminder": bool(is_reminder),
+                "order": order_data,
             },
             daemon=True,
         )

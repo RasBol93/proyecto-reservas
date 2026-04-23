@@ -1,6 +1,7 @@
 # app/survey_settings.py
 
-from typing import Dict
+import time
+from typing import Dict, Optional, Tuple
 
 from app.sheets import read_records_manual
 from app.utils import normalize, to_bool, log_event
@@ -14,8 +15,50 @@ from app.survey_core import (
 )
 
 
-def load_survey_settings(orders_sh) -> Dict[str, str]:
+SURVEY_SETTINGS_CACHE_TTL_SECONDS = 90
+_SURVEY_SETTINGS_CACHE: Dict[str, Tuple[float, Dict[str, str]]] = {}
+
+
+def _cache_key(orders_sh) -> str:
     try:
+        sid = getattr(orders_sh, "id", None)
+        if sid:
+            return str(sid)
+    except Exception:
+        pass
+    return str(id(orders_sh))
+
+
+def _cache_get(cache_key: str) -> Optional[Dict[str, str]]:
+    cached = _SURVEY_SETTINGS_CACHE.get(cache_key)
+    if not cached:
+        return None
+
+    ts, data = cached
+    if (time.time() - ts) <= SURVEY_SETTINGS_CACHE_TTL_SECONDS:
+        return data
+
+    return None
+
+
+def _cache_set(cache_key: str, data: Dict[str, str]) -> None:
+    _SURVEY_SETTINGS_CACHE[cache_key] = (time.time(), data)
+
+
+def invalidate_survey_settings_cache(orders_sh) -> None:
+    _SURVEY_SETTINGS_CACHE.pop(_cache_key(orders_sh), None)
+
+
+def load_survey_settings(orders_sh, force: bool = False) -> Dict[str, str]:
+    try:
+        cache_key = _cache_key(orders_sh)
+        if force:
+            invalidate_survey_settings_cache(orders_sh)
+        else:
+            cached = _cache_get(cache_key)
+            if cached is not None:
+                return cached
+
         ws = _ensure_ws(orders_sh, SURVEY_SETTINGS_WS, SURVEY_SETTINGS_HEADERS)
         rows = read_records_manual(ws, required_headers=SURVEY_SETTINGS_HEADERS)
 
@@ -31,6 +74,7 @@ def load_survey_settings(orders_sh) -> Dict[str, str]:
                 continue
 
             out[key] = value
+        _cache_set(cache_key, out)
 
         return out
 
@@ -97,6 +141,7 @@ def set_survey_setting(orders_sh, key: str, value: str, active: bool = True) -> 
             ],
             value_input_option="USER_ENTERED",
         )
+        invalidate_survey_settings_cache(orders_sh)
         return True
     except Exception as e:
         log_event(

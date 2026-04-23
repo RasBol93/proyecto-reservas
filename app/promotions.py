@@ -31,7 +31,7 @@ ALLOWED_PROMO_TYPES = {
 }
 
 _PROMO_CACHE: Dict[str, tuple] = {}
-PROMO_CACHE_TTL_SECONDS = 60
+PROMO_CACHE_TTL_SECONDS = 180
 
 
 # -------------------------

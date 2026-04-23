@@ -32,6 +32,8 @@ from app.orders import (
     gen_order_id,
     build_items_snapshot,
     get_order_by_id,
+    get_order_by_id_strict,
+    OrdersReadTemporarilyUnavailable,
 )
 from app.payment_flow import notify_admin_payment_reported
 from app.r2_storage import generate_payment_proof_presigned_upload, upload_payment_proof_bytes
@@ -85,6 +87,22 @@ def _serialize_pickup_slots(slots):
 
 def _get_order_for_tenant_or_404(orders_sh, tenant_id: str, order_id: str):
     order = get_order_by_id(orders_sh, order_id)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    order_tenant_id = str(order.get("tenant_id") or "").strip()
+    if order_tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return order
+
+
+def _get_order_for_tenant_or_404_strict(orders_sh, tenant_id: str, order_id: str):
+    try:
+        order = get_order_by_id_strict(orders_sh, order_id)
+    except OrdersReadTemporarilyUnavailable:
+        raise HTTPException(status_code=503, detail="Order status temporarily unavailable")
+
     if not order:
         raise HTTPException(status_code=404, detail="Order not found")
 
@@ -188,6 +206,7 @@ class OrderCreateOut(BaseModel):
 
 
 class MarkPaidIn(BaseModel):
+    token: str
     tenant_id: str
     order_id: str
     admin_chat_id: str
@@ -247,8 +266,6 @@ class OrderStatusOut(BaseModel):
     is_paid: bool
     payment_confirmed_at: str
     requested_time: str
-    customer_name: str
-    customer_contact: str
     currency: str
     total_amount: float
     total_qty: int
@@ -399,6 +416,7 @@ def create_order(payload: OrderCreateIn):
 
 @router.post("/orders/mark_paid", response_model=MarkPaidOut)
 def mark_paid(payload: MarkPaidIn):
+    require_admin_token(payload.token)
     validate_tenant_id(payload.tenant_id)
     validate_order_id(payload.order_id)
     rate_limiter.hit(f"mark_paid:{payload.tenant_id}", RL_MARKPAID_PER_MIN)
@@ -410,6 +428,8 @@ def mark_paid(payload: MarkPaidIn):
         raise HTTPException(status_code=403, detail="Invalid admin_chat_id")
 
     orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
+    resolved_tenant_id = str(tenant.get("tenant_id") or payload.tenant_id).strip()
+    _get_order_for_tenant_or_404(orders_sh, resolved_tenant_id, payload.order_id)
 
     result = update_order_status(orders_sh, payload.order_id, "PAID")
 
@@ -513,12 +533,18 @@ def set_order_payment_proof(payload: OrderPaymentProofIn):
             detail=f"Could not persist payment proof: {str(result.get('error') or 'sheet write failed')}",
         )
 
+    order_with_proof = dict(order)
+    order_with_proof["payment_proof_file_id"] = clean_proof_reference
+    order_with_proof["payment_proof_type"] = clean_proof_type
+    order_with_proof["payment_proof_caption"] = str(payload.proof_caption or "").strip()
+
     notified_admin = notify_admin_payment_reported(
         tenant=tenant,
         tenant_id=resolved_tenant_id,
         orders_sh=orders_sh,
         order_id=payload.order_id,
         is_reminder=False,
+        order=order_with_proof,
     )
 
     if not notified_admin:
@@ -550,7 +576,10 @@ def get_order_status(
 
     orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
     resolved_tenant_id = str(tenant.get("tenant_id") or tenant_id).strip()
-    order = _get_order_for_tenant_or_404(orders_sh, resolved_tenant_id, order_id)
+    order = _get_order_for_tenant_or_404_strict(orders_sh, resolved_tenant_id, order_id)
+    order_source = str(order.get("source") or "").strip().lower()
+    if order_source not in {"webapp", "api"}:
+        raise HTTPException(status_code=404, detail="Order not found")
 
     items, detail_lines, total_amount, total_qty = _serialize_order_snapshot(order)
     raw_status = str(order.get("status") or "").strip().upper()
@@ -568,8 +597,6 @@ def get_order_status(
         is_paid=is_paid,
         payment_confirmed_at=str(order.get("payment_confirmed_at") or "").strip(),
         requested_time=str(order.get("requested_time") or "").strip(),
-        customer_name=str(order.get("customer_name") or "").strip(),
-        customer_contact=str(order.get("customer_contact") or "").strip(),
         currency=str(order.get("currency") or "BOB").strip() or "BOB",
         total_amount=total_amount,
         total_qty=total_qty,
@@ -613,6 +640,7 @@ def report_order_paid(payload: OrderReportPaidIn):
         orders_sh=orders_sh,
         order_id=payload.order_id,
         is_reminder=False,
+        order=order,
     )
 
     if not notified_admin:
