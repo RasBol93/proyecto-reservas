@@ -18,6 +18,8 @@ from app.utils import now_iso_utc, to_bool, normalize, log_event
 _TENANTS_CACHE: Dict[str, Dict[str, Any]] = {}   # key = tenant_id_normalizado
 _TENANTS_CACHE_AT: Optional[str] = None
 _TENANTS_CACHE_AT_TS: Optional[float] = None  # epoch seconds
+_TENANTS_LAST_SERVE_SOURCE: str = ""
+_TENANTS_LAST_SNAPSHOT_REJECTION_REASON: str = ""
 
 # TTL opcional (en segundos). 0 = sin TTL (solo self-heal por miss)
 TENANTS_CACHE_TTL_SECONDS = 180  # 3 min
@@ -41,6 +43,7 @@ def invalidate_tenants_cache() -> None:
     _TENANTS_CACHE = {}
     _TENANTS_CACHE_AT = None
     _TENANTS_CACHE_AT_TS = None
+    _set_last_tenants_serve_source("")
 
 
 def _project_root() -> Path:
@@ -96,6 +99,57 @@ def _load_tenants_snapshot(config_spreadsheet_id: str) -> Optional[Tuple[float, 
     return generated_at_ts, tenants
 
 
+def _inspect_tenants_snapshot(config_spreadsheet_id: str) -> Dict[str, Any]:
+    path = _snapshot_path(config_spreadsheet_id)
+    payload = _read_snapshot_payload(path) if path.exists() else None
+    snapshot_valid = _load_tenants_snapshot(config_spreadsheet_id) is not None
+
+    age_seconds: Optional[int] = None
+    snapshot_config_spreadsheet_id = ""
+    generated_at_ts: Optional[float] = None
+    rejection_reason = ""
+
+    if payload is None:
+        if path.exists():
+            rejection_reason = "invalid_shape"
+        else:
+            rejection_reason = "missing"
+    else:
+        snapshot_config_spreadsheet_id = str(payload.get("config_spreadsheet_id") or "").strip()
+        try:
+            generated_at_ts = float(payload.get("generated_at_ts") or 0)
+        except Exception:
+            generated_at_ts = None
+
+        if generated_at_ts and generated_at_ts > 0:
+            try:
+                age_seconds = max(0, int(time.time() - generated_at_ts))
+            except Exception:
+                age_seconds = None
+
+        if not snapshot_valid:
+            if int(payload.get("version") or 0) != TENANTS_SNAPSHOT_VERSION:
+                rejection_reason = "invalid_version"
+            elif snapshot_config_spreadsheet_id != str(config_spreadsheet_id or "").strip():
+                rejection_reason = "id_mismatch"
+            elif generated_at_ts is None or generated_at_ts <= 0:
+                rejection_reason = "invalid_shape"
+            elif age_seconds is not None and age_seconds > TENANTS_SNAPSHOT_MAX_AGE_SECONDS:
+                rejection_reason = "too_old"
+            elif not isinstance(payload.get("tenants"), dict):
+                rejection_reason = "invalid_shape"
+
+    return {
+        "snapshot_path": str(path),
+        "snapshot_exists": path.exists(),
+        "snapshot_valid": bool(snapshot_valid),
+        "snapshot_age_seconds": age_seconds,
+        "config_spreadsheet_id": str(config_spreadsheet_id or "").strip(),
+        "snapshot_config_spreadsheet_id": snapshot_config_spreadsheet_id,
+        "snapshot_rejection_reason": rejection_reason,
+    }
+
+
 def _persist_tenants_snapshot(config_spreadsheet_id: str, tenants: Dict[str, Dict[str, Any]], *, ts: Optional[float] = None) -> None:
     snapshot_ts = float(ts if ts is not None else time.time())
     payload = {
@@ -112,6 +166,39 @@ def _persist_tenants_snapshot(config_spreadsheet_id: str, tenants: Dict[str, Dic
     temp_path = path.with_suffix(path.suffix + ".tmp")
     temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     temp_path.replace(path)
+
+
+def _set_last_tenants_serve_source(source: str) -> None:
+    global _TENANTS_LAST_SERVE_SOURCE
+    _TENANTS_LAST_SERVE_SOURCE = str(source or "").strip()
+
+
+def _set_last_tenants_snapshot_rejection_reason(reason: str) -> None:
+    global _TENANTS_LAST_SNAPSHOT_REJECTION_REASON
+    _TENANTS_LAST_SNAPSHOT_REJECTION_REASON = str(reason or "").strip()
+
+
+def get_tenants_runtime_status() -> Dict[str, Any]:
+    config_spreadsheet_id = env_required(ENV_CONFIG_SPREADSHEET_ID).strip()
+    snapshot_info = _inspect_tenants_snapshot(config_spreadsheet_id)
+
+    cache_present = bool(_TENANTS_CACHE)
+    cache_age_seconds: Optional[int] = None
+    if cache_present and _TENANTS_CACHE_AT_TS is not None:
+        try:
+            cache_age_seconds = max(0, int(time.time() - _TENANTS_CACHE_AT_TS))
+        except Exception:
+            cache_age_seconds = None
+
+    return {
+        **snapshot_info,
+        "cache_present": cache_present,
+        "cache_age_seconds": cache_age_seconds,
+        "last_served_from": _TENANTS_LAST_SERVE_SOURCE,
+        "last_snapshot_rejection_reason": _TENANTS_LAST_SNAPSHOT_REJECTION_REASON,
+        "ttl_seconds": TENANTS_CACHE_TTL_SECONDS,
+        "snapshot_max_age_seconds": TENANTS_SNAPSHOT_MAX_AGE_SECONDS,
+    }
 
 
 def invalidate_all_tenant_related_caches() -> None:
@@ -271,12 +358,35 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
     snapshot_cached = None
     try:
         config_spreadsheet_id = env_required(ENV_CONFIG_SPREADSHEET_ID).strip()
+        _set_last_tenants_snapshot_rejection_reason("")
 
         if force:
             invalidate_tenants_cache()
 
         if not force and _cache_is_fresh():
+            _set_last_tenants_serve_source("memory")
+            try:
+                log_event("tenants_served_from_memory", tenants_count=len(_TENANTS_CACHE))
+            except Exception:
+                pass
             return _TENANTS_CACHE
+
+        snapshot_info = _inspect_tenants_snapshot(config_spreadsheet_id)
+        rejection_reason = str(snapshot_info.get("snapshot_rejection_reason") or "").strip()
+        if not force and rejection_reason:
+            _set_last_tenants_snapshot_rejection_reason(rejection_reason)
+            try:
+                log_event(
+                    "tenants_snapshot_rejected",
+                    reason=rejection_reason,
+                    snapshot_path=snapshot_info.get("snapshot_path"),
+                    snapshot_exists=bool(snapshot_info.get("snapshot_exists")),
+                    snapshot_age_seconds=snapshot_info.get("snapshot_age_seconds"),
+                    config_spreadsheet_id=config_spreadsheet_id,
+                    snapshot_config_spreadsheet_id=snapshot_info.get("snapshot_config_spreadsheet_id"),
+                )
+            except Exception:
+                pass
 
         snapshot_cached = None if force else _load_tenants_snapshot(config_spreadsheet_id)
         if not force and snapshot_cached is not None:
@@ -284,6 +394,7 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
             _TENANTS_CACHE = snapshot_tenants
             _TENANTS_CACHE_AT = now_iso_utc()
             _TENANTS_CACHE_AT_TS = snapshot_ts
+            _set_last_tenants_serve_source("snapshot")
             try:
                 log_event(
                     "tenants_loaded_from_snapshot",
@@ -311,6 +422,11 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
             _TENANTS_CACHE = {}
             _TENANTS_CACHE_AT = now_iso_utc()
             _TENANTS_CACHE_AT_TS = time.time()
+            _set_last_tenants_serve_source("sheets")
+            try:
+                log_event("tenants_served_from_sheets", tenants_count=0)
+            except Exception:
+                pass
             return _TENANTS_CACHE
 
         header_idx = _detect_header_row(
@@ -418,6 +534,11 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
         _TENANTS_CACHE = tenants
         _TENANTS_CACHE_AT = now_iso_utc()
         _TENANTS_CACHE_AT_TS = loaded_at_ts
+        _set_last_tenants_serve_source("sheets")
+        try:
+            log_event("tenants_served_from_sheets", tenants_count=len(tenants))
+        except Exception:
+            pass
         try:
             _persist_tenants_snapshot(config_spreadsheet_id, tenants, ts=loaded_at_ts)
         except Exception as e:
@@ -451,6 +572,7 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
             _TENANTS_CACHE = snapshot_tenants
             _TENANTS_CACHE_AT = now_iso_utc()
             _TENANTS_CACHE_AT_TS = snapshot_ts
+            _set_last_tenants_serve_source("snapshot")
             try:
                 log_event(
                     "tenants_load_failed_serving_snapshot",

@@ -33,6 +33,8 @@ ALLOWED_PROMO_TYPES = {
 }
 
 _PROMO_CACHE: Dict[str, tuple] = {}
+_PROMO_LAST_SERVE_SOURCE: Dict[str, str] = {}
+_PROMO_LAST_SNAPSHOT_REJECTION_REASON: Dict[str, str] = {}
 PROMO_CACHE_TTL_SECONDS = 180
 PROMO_SNAPSHOT_MAX_AGE_SECONDS = 86400
 PROMO_SNAPSHOT_VERSION = 1
@@ -69,6 +71,8 @@ def _cache_set(cache_key: str, data):
 def invalidate_promotions_cache(orders_sh):
     ck = _cache_key(orders_sh)
     _PROMO_CACHE.pop(ck, None)
+    _PROMO_LAST_SERVE_SOURCE.pop(ck, None)
+    _PROMO_LAST_SNAPSHOT_REJECTION_REASON.pop(ck, None)
     try:
         _snapshot_path(ck).unlink(missing_ok=True)
     except Exception:
@@ -77,6 +81,8 @@ def invalidate_promotions_cache(orders_sh):
 
 def invalidate_all_promotions_cache():
     _PROMO_CACHE.clear()
+    _PROMO_LAST_SERVE_SOURCE.clear()
+    _PROMO_LAST_SNAPSHOT_REJECTION_REASON.clear()
     try:
         snapshot_dir = _snapshot_dir()
         if snapshot_dir.exists():
@@ -149,6 +155,55 @@ def _load_promotions_snapshot(cache_key: str) -> Optional[Tuple[float, List[Dict
     return float(generated_at_ts), promos
 
 
+def _inspect_promotions_snapshot(cache_key: str) -> Dict[str, Any]:
+    path = _snapshot_path(cache_key)
+    payload = _read_snapshot_payload(path) if path.exists() else None
+    snapshot_valid = _load_promotions_snapshot(cache_key) is not None
+
+    age_seconds: Optional[int] = None
+    snapshot_spreadsheet_id = ""
+    generated_at_ts: Optional[float] = None
+    rejection_reason = ""
+
+    if payload is None:
+        if path.exists():
+            rejection_reason = "invalid_shape"
+        else:
+            rejection_reason = "missing"
+    else:
+        snapshot_spreadsheet_id = str(payload.get("spreadsheet_id") or "").strip()
+        try:
+            generated_at_ts = float(payload.get("generated_at_ts") or 0)
+        except Exception:
+            generated_at_ts = None
+        if generated_at_ts and generated_at_ts > 0:
+            try:
+                age_seconds = max(0, int(time.time() - generated_at_ts))
+            except Exception:
+                age_seconds = None
+        if not snapshot_valid:
+            if int(payload.get("version") or 0) != PROMO_SNAPSHOT_VERSION:
+                rejection_reason = "invalid_version"
+            elif snapshot_spreadsheet_id != str(cache_key or "").strip():
+                rejection_reason = "id_mismatch"
+            elif generated_at_ts is None or generated_at_ts <= 0:
+                rejection_reason = "invalid_shape"
+            elif age_seconds is not None and age_seconds > PROMO_SNAPSHOT_MAX_AGE_SECONDS:
+                rejection_reason = "too_old"
+            elif not isinstance(payload.get("promotions"), list):
+                rejection_reason = "invalid_shape"
+
+    return {
+        "snapshot_path": str(path),
+        "snapshot_exists": path.exists(),
+        "snapshot_valid": bool(snapshot_valid),
+        "snapshot_age_seconds": age_seconds,
+        "spreadsheet_id": str(cache_key or "").strip(),
+        "snapshot_spreadsheet_id": snapshot_spreadsheet_id,
+        "snapshot_rejection_reason": rejection_reason,
+    }
+
+
 def _persist_promotions_snapshot(
     cache_key: str,
     promotions: List[Dict[str, Any]],
@@ -172,6 +227,37 @@ def _persist_promotions_snapshot(
         encoding="utf-8",
     )
     tmp_path.replace(path)
+
+
+def _set_last_promotions_serve_source(cache_key: str, source: str) -> None:
+    _PROMO_LAST_SERVE_SOURCE[cache_key] = str(source or "").strip()
+
+
+def _set_last_promotions_snapshot_rejection_reason(cache_key: str, reason: str) -> None:
+    _PROMO_LAST_SNAPSHOT_REJECTION_REASON[cache_key] = str(reason or "").strip()
+
+
+def get_promotions_runtime_status(orders_sh) -> Dict[str, Any]:
+    cache_key = _cache_key(orders_sh)
+    snapshot_info = _inspect_promotions_snapshot(cache_key)
+
+    cache_present = cache_key in _PROMO_CACHE
+    cache_age_seconds: Optional[int] = None
+    if cache_present:
+        try:
+            cache_age_seconds = max(0, int(time.time() - _PROMO_CACHE[cache_key][0]))
+        except Exception:
+            cache_age_seconds = None
+
+    return {
+        **snapshot_info,
+        "cache_present": cache_present,
+        "cache_age_seconds": cache_age_seconds,
+        "last_served_from": str(_PROMO_LAST_SERVE_SOURCE.get(cache_key) or "").strip(),
+        "last_snapshot_rejection_reason": str(_PROMO_LAST_SNAPSHOT_REJECTION_REASON.get(cache_key) or "").strip(),
+        "ttl_seconds": PROMO_CACHE_TTL_SECONDS,
+        "snapshot_max_age_seconds": PROMO_SNAPSHOT_MAX_AGE_SECONDS,
+    }
 
 
 # -------------------------
@@ -464,16 +550,40 @@ def get_promotion_by_id(orders_sh, promo_id: str) -> Optional[Dict[str, Any]]:
 def load_promotions(orders_sh, force: bool = False) -> List[Dict[str, Any]]:
     ck = _cache_key(orders_sh)
     snapshot_cached = None
+    _set_last_promotions_snapshot_rejection_reason(ck, "")
 
     if not force:
         cached = _cache_get(ck)
         if cached is not None:
+            _set_last_promotions_serve_source(ck, "memory")
+            try:
+                log_event("promotions_served_from_memory", cache_key=ck, promotions_count=len(cached))
+            except Exception:
+                pass
             return cached
+
+        snapshot_info = _inspect_promotions_snapshot(ck)
+        rejection_reason = str(snapshot_info.get("snapshot_rejection_reason") or "").strip()
+        if rejection_reason:
+            _set_last_promotions_snapshot_rejection_reason(ck, rejection_reason)
+            try:
+                log_event(
+                    "promotions_snapshot_rejected",
+                    reason=rejection_reason,
+                    snapshot_path=snapshot_info.get("snapshot_path"),
+                    snapshot_exists=bool(snapshot_info.get("snapshot_exists")),
+                    snapshot_age_seconds=snapshot_info.get("snapshot_age_seconds"),
+                    spreadsheet_id=ck,
+                    snapshot_spreadsheet_id=snapshot_info.get("snapshot_spreadsheet_id"),
+                )
+            except Exception:
+                pass
 
         snapshot_cached = _load_promotions_snapshot(ck)
         if snapshot_cached is not None:
             snapshot_ts, snapshot_promos = snapshot_cached
             _PROMO_CACHE[ck] = (float(snapshot_ts), snapshot_promos)
+            _set_last_promotions_serve_source(ck, "snapshot")
             try:
                 log_event(
                     "promotions_loaded_from_snapshot",
@@ -526,6 +636,11 @@ def load_promotions(orders_sh, force: bool = False) -> List[Dict[str, Any]]:
         promos = sorted(promos, key=_promo_sort_key)
         now_ts = time.time()
         _PROMO_CACHE[ck] = (now_ts, promos)
+        _set_last_promotions_serve_source(ck, "sheets")
+        try:
+            log_event("promotions_served_from_sheets", cache_key=ck, promotions_count=len(promos))
+        except Exception:
+            pass
         try:
             _persist_promotions_snapshot(ck, promos, ts=now_ts)
         except Exception as e:
@@ -544,6 +659,7 @@ def load_promotions(orders_sh, force: bool = False) -> List[Dict[str, Any]]:
         if not force and snapshot_cached is not None:
             snapshot_ts, snapshot_promos = snapshot_cached
             _PROMO_CACHE[ck] = (float(snapshot_ts), snapshot_promos)
+            _set_last_promotions_serve_source(ck, "snapshot")
             try:
                 log_event(
                     "promotions_load_failed_serving_snapshot",
