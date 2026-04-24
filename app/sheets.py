@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import gspread
 
 from app.config import ENV_GCP_CREDS_JSON, ENV_CONFIG_SPREADSHEET_ID, env_required
-from app.utils import normalize, log_event
+from app.utils import normalize, log_event, now_iso_utc
 from app.alerts import alert_system_error, alert_sheet_error
 
 
@@ -26,6 +26,8 @@ _WORKSHEET_CACHE: Dict[Tuple[str, str], gspread.Worksheet] = {}
 _SHEETS_REQUEST_CTX: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar("sheets_request_ctx", default=None)
 _RECENT_SHEETS_REQUESTS: deque[Dict[str, Any]] = deque(maxlen=200)
 _RECENT_SHEETS_REQUESTS_LOCK = threading.Lock()
+_RECENT_SHEETS_REQUESTS_RESET_AT: str = ""
+_RECENT_SHEETS_REQUESTS_RESET_GENERATION: int = 0
 _GSPREAD_INSTRUMENTATION_INSTALLED = False
 
 
@@ -64,6 +66,8 @@ def start_sheets_request_context(
     request_id: str = "",
 ) -> str:
     rid = _safe_text(request_id) or f"req_{uuid.uuid4().hex[:12]}"
+    with _RECENT_SHEETS_REQUESTS_LOCK:
+        reset_generation = int(_RECENT_SHEETS_REQUESTS_RESET_GENERATION)
     ctx = {
         "request_id": rid,
         "path": _safe_text(path),
@@ -76,6 +80,7 @@ def start_sheets_request_context(
         "spreadsheets_touched": set(),
         "had_429": False,
         "serving_sources": set(),
+        "recent_reset_generation": reset_generation,
     }
     _SHEETS_REQUEST_CTX.set(ctx)
     return rid
@@ -135,7 +140,10 @@ def finish_sheets_request_context(
     }
 
     with _RECENT_SHEETS_REQUESTS_LOCK:
-        _RECENT_SHEETS_REQUESTS.append(summary)
+        _RECENT_SHEETS_REQUESTS.append({
+            "summary": summary,
+            "reset_generation": int(ctx.get("recent_reset_generation") or 0),
+        })
 
     try:
         log_event(
@@ -174,15 +182,82 @@ def get_recent_sheets_request_summaries(
     items.reverse()
     filtered: List[Dict[str, Any]] = []
     for item in items:
-        if int(item.get("total_sheet_reads") or 0) < clean_min_reads:
+        summary = item.get("summary") if isinstance(item, dict) else None
+        if not isinstance(summary, dict):
             continue
-        if had_429_only and not bool(item.get("had_429")):
+        if int(summary.get("total_sheet_reads") or 0) < clean_min_reads:
             continue
-        filtered.append(item)
+        if had_429_only and not bool(summary.get("had_429")):
+            continue
+        filtered.append(summary)
         if len(filtered) >= clean_limit:
             break
 
     return filtered
+
+
+def reset_recent_sheets_request_summaries() -> Dict[str, Any]:
+    global _RECENT_SHEETS_REQUESTS_RESET_AT, _RECENT_SHEETS_REQUESTS_RESET_GENERATION
+    with _RECENT_SHEETS_REQUESTS_LOCK:
+        cleared_count = len(_RECENT_SHEETS_REQUESTS)
+        _RECENT_SHEETS_REQUESTS.clear()
+        _RECENT_SHEETS_REQUESTS_RESET_GENERATION += 1
+        _RECENT_SHEETS_REQUESTS_RESET_AT = now_iso_utc()
+        reset_generation = int(_RECENT_SHEETS_REQUESTS_RESET_GENERATION)
+        reset_at = _RECENT_SHEETS_REQUESTS_RESET_AT
+
+    try:
+        log_event(
+            "sheets_recent_reset",
+            cleared_count=cleared_count,
+            reset_at=reset_at,
+            reset_generation=reset_generation,
+        )
+    except Exception:
+        pass
+
+    return {
+        "cleared_count": cleared_count,
+        "reset_at": reset_at,
+    }
+
+
+def get_recent_sheets_request_summaries_since_reset(
+    *,
+    limit: int = 20,
+    min_reads: int = 0,
+    had_429_only: bool = False,
+) -> Dict[str, Any]:
+    clean_limit = max(1, min(int(limit or 20), 100))
+    clean_min_reads = max(0, int(min_reads or 0))
+
+    with _RECENT_SHEETS_REQUESTS_LOCK:
+        items = list(_RECENT_SHEETS_REQUESTS)
+        current_generation = int(_RECENT_SHEETS_REQUESTS_RESET_GENERATION)
+        reset_at = _RECENT_SHEETS_REQUESTS_RESET_AT
+
+    items.reverse()
+    filtered: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if int(item.get("reset_generation") or 0) < current_generation:
+            continue
+        summary = item.get("summary")
+        if not isinstance(summary, dict):
+            continue
+        if int(summary.get("total_sheet_reads") or 0) < clean_min_reads:
+            continue
+        if had_429_only and not bool(summary.get("had_429")):
+            continue
+        filtered.append(summary)
+        if len(filtered) >= clean_limit:
+            break
+
+    return {
+        "reset_at": str(reset_at or "").strip(),
+        "requests": filtered,
+    }
 
 
 def _record_sheets_read(

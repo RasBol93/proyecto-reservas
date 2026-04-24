@@ -6,7 +6,13 @@ from typing import Any, Dict, Optional, List, Tuple
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.sheets import get_gspread_client, open_spreadsheet_by_key, get_recent_sheets_request_summaries
+from app.sheets import (
+    get_gspread_client,
+    open_spreadsheet_by_key,
+    get_recent_sheets_request_summaries,
+    get_recent_sheets_request_summaries_since_reset,
+    reset_recent_sheets_request_summaries,
+)
 from app.tenants import get_tenant_or_404, tenants_cache_info, get_tenants_runtime_status, load_tenants
 from app.utils import normalize
 from app.admin_settings import (
@@ -882,6 +888,45 @@ def sheets_recent_diag(
 
     return {
         "ok": True,
+        "count": len(requests),
+        "requests": requests,
+    }
+
+
+@router.post("/reset_sheets_recent")
+def reset_sheets_recent_diag(
+    token: str = Query(...),
+) -> Dict[str, Any]:
+    _require_admin_token(token)
+
+    result = reset_recent_sheets_request_summaries()
+    return {
+        "ok": True,
+        "cleared_count": int(result.get("cleared_count") or 0),
+        "reset_at": str(result.get("reset_at") or "").strip(),
+        "message": "Sheets recent buffer reset successfully.",
+    }
+
+
+@router.get("/sheets_recent_since_reset")
+def sheets_recent_since_reset_diag(
+    token: str = Query(...),
+    limit: int = Query(default=20),
+    min_reads: int = Query(default=1),
+    had_429_only: bool = Query(default=False),
+) -> Dict[str, Any]:
+    _require_admin_token(token)
+
+    result = get_recent_sheets_request_summaries_since_reset(
+        limit=limit,
+        min_reads=min_reads,
+        had_429_only=had_429_only,
+    )
+    requests = result.get("requests") or []
+
+    return {
+        "ok": True,
+        "reset_at": str(result.get("reset_at") or "").strip(),
         "count": len(requests),
         "requests": requests,
     }
