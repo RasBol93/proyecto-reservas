@@ -675,12 +675,15 @@ def menu_snapshot_diag(
 
 def _warm_component_result(*, warmed: bool, runtime_status: Optional[Dict[str, Any]] = None, error: str = "") -> Dict[str, Any]:
     status = dict(runtime_status or {})
+    snapshot_valid = bool(status.get("snapshot_valid"))
+    cache_present = bool(status.get("cache_present"))
     return {
         "warmed": bool(warmed),
         "error": str(error or "").strip(),
         "last_served_from": str(status.get("last_served_from") or "").strip(),
-        "snapshot_valid": bool(status.get("snapshot_valid")),
-        "cache_present": bool(status.get("cache_present")),
+        "snapshot_valid": snapshot_valid,
+        "cache_present": cache_present,
+        "ready_for_serving": bool(snapshot_valid or cache_present),
         "snapshot_age_seconds": status.get("snapshot_age_seconds"),
         "snapshot_path": str(status.get("snapshot_path") or "").strip(),
         "details": status,
@@ -778,13 +781,29 @@ def warm_config_diag(
         bool(menu_result.get("warmed")),
     ])
 
-    return {
-        "ok": ok,
-        "tenant_id": (tenant.get("tenant_id") if isinstance(tenant, dict) else tenant_id),
+    component_results = {
         "tenants": tenants_result,
         "admin_settings": admin_settings_result,
         "promotions": promotions_result,
         "menu": menu_result,
+    }
+    ready_components = [
+        name for name, result in component_results.items()
+        if bool(result.get("ready_for_serving"))
+    ]
+    failed_components = [
+        name for name, result in component_results.items()
+        if not bool(result.get("warmed"))
+    ]
+
+    return {
+        "ok": ok,
+        "requested_tenant_id": tenant_id,
+        "resolved_tenant_id": (tenant.get("tenant_id") if isinstance(tenant, dict) else tenant_id),
+        "all_components_warmed": ok,
+        "ready_components": ready_components,
+        "failed_components": failed_components,
+        **component_results,
     }
 
 
