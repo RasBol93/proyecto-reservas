@@ -736,6 +736,20 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
             pass
         return snapshot_idx
 
+    if not force and stale_cached is not None:
+        try:
+            log_event(
+                "menu_served_from_stale_memory",
+                cache_key=ck,
+                cache_age_seconds=_cache_age_seconds(_MENU_CACHE, ck),
+                fresh_ttl_seconds=MENU_CACHE_TTL_SECONDS,
+                stale_window_seconds=MENU_CACHE_STALE_WINDOW_SECONDS,
+            )
+        except Exception:
+            pass
+        _set_last_menu_serve_source(ck, "memory")
+        return stale_cached
+
     if not force and _is_menu_read_cooldown_active(ck):
         if stale_cached is not None:
             try:
