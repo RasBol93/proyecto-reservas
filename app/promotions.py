@@ -1,7 +1,9 @@
 # app/promotions.py — lectura y gestión robusta de promociones (v2)
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import json
+from pathlib import Path
+import re
 import time
 
 from fastapi import HTTPException
@@ -32,6 +34,9 @@ ALLOWED_PROMO_TYPES = {
 
 _PROMO_CACHE: Dict[str, tuple] = {}
 PROMO_CACHE_TTL_SECONDS = 180
+PROMO_SNAPSHOT_MAX_AGE_SECONDS = 86400
+PROMO_SNAPSHOT_VERSION = 1
+PROMO_SNAPSHOT_DIRNAME = ".promotions_snapshots"
 
 
 # -------------------------
@@ -64,10 +69,109 @@ def _cache_set(cache_key: str, data):
 def invalidate_promotions_cache(orders_sh):
     ck = _cache_key(orders_sh)
     _PROMO_CACHE.pop(ck, None)
+    try:
+        _snapshot_path(ck).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def invalidate_all_promotions_cache():
     _PROMO_CACHE.clear()
+    try:
+        snapshot_dir = _snapshot_dir()
+        if snapshot_dir.exists():
+            for path in snapshot_dir.glob("*.json"):
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _snapshot_dir() -> Path:
+    return _project_root() / PROMO_SNAPSHOT_DIRNAME
+
+
+def _snapshot_path(cache_key: str) -> Path:
+    safe_key = re.sub(r"[^A-Za-z0-9_.-]", "_", str(cache_key or "").strip()) or "unknown"
+    return _snapshot_dir() / f"{safe_key}.json"
+
+
+def _read_snapshot_payload(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    return payload
+
+
+def _load_promotions_snapshot(cache_key: str) -> Optional[Tuple[float, List[Dict[str, Any]]]]:
+    path = _snapshot_path(cache_key)
+    if not path.exists():
+        return None
+
+    payload = _read_snapshot_payload(path)
+    if payload is None:
+        return None
+
+    if int(payload.get("version") or 0) != PROMO_SNAPSHOT_VERSION:
+        return None
+
+    snapshot_key = str(payload.get("spreadsheet_id") or "").strip()
+    if snapshot_key != str(cache_key or "").strip():
+        return None
+
+    try:
+        generated_at_ts = float(payload.get("generated_at_ts") or 0)
+    except Exception:
+        return None
+
+    if generated_at_ts <= 0:
+        return None
+
+    age_seconds = max(0, int(time.time() - generated_at_ts))
+    if age_seconds > PROMO_SNAPSHOT_MAX_AGE_SECONDS:
+        return None
+
+    promos = payload.get("promotions")
+    if not isinstance(promos, list):
+        return None
+
+    return float(generated_at_ts), promos
+
+
+def _persist_promotions_snapshot(
+    cache_key: str,
+    promotions: List[Dict[str, Any]],
+    *,
+    ts: Optional[float] = None,
+) -> None:
+    snapshot_dir = _snapshot_dir()
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    path = _snapshot_path(cache_key)
+    tmp_path = path.with_suffix(".tmp")
+
+    payload = {
+        "version": PROMO_SNAPSHOT_VERSION,
+        "spreadsheet_id": str(cache_key or "").strip(),
+        "generated_at_ts": float(ts if ts is not None else time.time()),
+        "promotions": promotions,
+    }
+
+    tmp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
 
 
 # -------------------------
@@ -359,11 +463,27 @@ def get_promotion_by_id(orders_sh, promo_id: str) -> Optional[Dict[str, Any]]:
 
 def load_promotions(orders_sh, force: bool = False) -> List[Dict[str, Any]]:
     ck = _cache_key(orders_sh)
+    snapshot_cached = None
 
     if not force:
         cached = _cache_get(ck)
         if cached is not None:
             return cached
+
+        snapshot_cached = _load_promotions_snapshot(ck)
+        if snapshot_cached is not None:
+            snapshot_ts, snapshot_promos = snapshot_cached
+            _PROMO_CACHE[ck] = (float(snapshot_ts), snapshot_promos)
+            try:
+                log_event(
+                    "promotions_loaded_from_snapshot",
+                    cache_key=ck,
+                    cache_age_seconds=max(0, int(time.time() - snapshot_ts)),
+                    snapshot_max_age_seconds=PROMO_SNAPSHOT_MAX_AGE_SECONDS,
+                )
+            except Exception:
+                pass
+            return snapshot_promos
 
     try:
         ws = _get_promotions_ws(orders_sh)
@@ -404,10 +524,39 @@ def load_promotions(orders_sh, force: bool = False) -> List[Dict[str, Any]]:
                 continue
 
         promos = sorted(promos, key=_promo_sort_key)
-        _cache_set(ck, promos)
+        now_ts = time.time()
+        _PROMO_CACHE[ck] = (now_ts, promos)
+        try:
+            _persist_promotions_snapshot(ck, promos, ts=now_ts)
+        except Exception as e:
+            try:
+                log_event(
+                    "promotions_snapshot_write_failed",
+                    cache_key=ck,
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+            except Exception:
+                pass
         return promos
 
     except Exception as e:
+        if not force and snapshot_cached is not None:
+            snapshot_ts, snapshot_promos = snapshot_cached
+            _PROMO_CACHE[ck] = (float(snapshot_ts), snapshot_promos)
+            try:
+                log_event(
+                    "promotions_load_failed_serving_snapshot",
+                    cache_key=ck,
+                    cache_age_seconds=max(0, int(time.time() - snapshot_ts)),
+                    snapshot_max_age_seconds=PROMO_SNAPSHOT_MAX_AGE_SECONDS,
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+            except Exception:
+                pass
+            return snapshot_promos
+
         alert_system_error(error=str(e), module="promotions.load")
         return []
 
