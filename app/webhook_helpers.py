@@ -462,9 +462,9 @@ def _default_business_status(tenant_tz: str) -> Dict[str, Any]:
     }
 
 
-def get_business_status_safe(orders_sh, tenant_tz: str) -> Dict[str, Any]:
+def get_business_status_safe(orders_sh, tenant_tz: str, settings_map=None) -> Dict[str, Any]:
     try:
-        res = resolve_business_status(orders_sh=orders_sh, tenant_tz=tenant_tz)
+        res = resolve_business_status(orders_sh=orders_sh, tenant_tz=tenant_tz, settings_map=settings_map)
         if hasattr(res, "__dict__"):
             return res.__dict__
         if isinstance(res, dict):

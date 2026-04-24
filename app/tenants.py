@@ -1,11 +1,13 @@
 # app/tenants.py
 
+import json
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 import time
 
 from fastapi import HTTPException
 
-from app.config import TENANTS_SHEET_NAME
+from app.config import TENANTS_SHEET_NAME, ENV_CONFIG_SPREADSHEET_ID, env_required
 from app.sheets import get_gspread_client, open_config_spreadsheet, invalidate_sheet_caches, set_sheets_observation_context
 from app.utils import now_iso_utc, to_bool, normalize, log_event
 
@@ -19,6 +21,9 @@ _TENANTS_CACHE_AT_TS: Optional[float] = None  # epoch seconds
 
 # TTL opcional (en segundos). 0 = sin TTL (solo self-heal por miss)
 TENANTS_CACHE_TTL_SECONDS = 180  # 3 min
+TENANTS_SNAPSHOT_MAX_AGE_SECONDS = 86400
+TENANTS_SNAPSHOT_VERSION = 1
+TENANTS_SNAPSHOT_DIRNAME = ".tenants_snapshots"
 
 
 def tenants_cache_info() -> Dict[str, Any]:
@@ -36,6 +41,77 @@ def invalidate_tenants_cache() -> None:
     _TENANTS_CACHE = {}
     _TENANTS_CACHE_AT = None
     _TENANTS_CACHE_AT_TS = None
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _snapshot_dir() -> Path:
+    return _project_root() / TENANTS_SNAPSHOT_DIRNAME
+
+
+def _snapshot_path(config_spreadsheet_id: str) -> Path:
+    clean_id = str(config_spreadsheet_id or "").strip() or "config"
+    safe_id = normalize(clean_id).replace(" ", "_") or "config"
+    return _snapshot_dir() / f"{safe_id}.json"
+
+
+def _read_snapshot_payload(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _load_tenants_snapshot(config_spreadsheet_id: str) -> Optional[Tuple[float, Dict[str, Dict[str, Any]]]]:
+    path = _snapshot_path(config_spreadsheet_id)
+    if not path.exists():
+        return None
+
+    payload = _read_snapshot_payload(path)
+    if payload is None:
+        return None
+    if int(payload.get("version") or 0) != TENANTS_SNAPSHOT_VERSION:
+        return None
+    if str(payload.get("config_spreadsheet_id") or "").strip() != str(config_spreadsheet_id or "").strip():
+        return None
+
+    try:
+        generated_at_ts = float(payload.get("generated_at_ts") or 0)
+    except Exception:
+        return None
+    if generated_at_ts <= 0:
+        return None
+    if (time.time() - generated_at_ts) > TENANTS_SNAPSHOT_MAX_AGE_SECONDS:
+        return None
+
+    tenants = payload.get("tenants")
+    if not isinstance(tenants, dict):
+        return None
+
+    return generated_at_ts, tenants
+
+
+def _persist_tenants_snapshot(config_spreadsheet_id: str, tenants: Dict[str, Dict[str, Any]], *, ts: Optional[float] = None) -> None:
+    snapshot_ts = float(ts if ts is not None else time.time())
+    payload = {
+        "version": TENANTS_SNAPSHOT_VERSION,
+        "config_spreadsheet_id": str(config_spreadsheet_id or "").strip(),
+        "generated_at_ts": snapshot_ts,
+        "tenants": tenants,
+    }
+
+    snapshot_dir = _snapshot_dir()
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    path = _snapshot_path(config_spreadsheet_id)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(path)
 
 
 def invalidate_all_tenant_related_caches() -> None:
@@ -192,11 +268,31 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
     """
     global _TENANTS_CACHE, _TENANTS_CACHE_AT, _TENANTS_CACHE_AT_TS
 
+    snapshot_cached = None
     try:
+        config_spreadsheet_id = env_required(ENV_CONFIG_SPREADSHEET_ID).strip()
+
         if force:
             invalidate_tenants_cache()
 
         if not force and _cache_is_fresh():
+            return _TENANTS_CACHE
+
+        snapshot_cached = None if force else _load_tenants_snapshot(config_spreadsheet_id)
+        if not force and snapshot_cached is not None:
+            snapshot_ts, snapshot_tenants = snapshot_cached
+            _TENANTS_CACHE = snapshot_tenants
+            _TENANTS_CACHE_AT = now_iso_utc()
+            _TENANTS_CACHE_AT_TS = snapshot_ts
+            try:
+                log_event(
+                    "tenants_loaded_from_snapshot",
+                    tenants_count=len(snapshot_tenants),
+                    snapshot_age_seconds=max(0, int(time.time() - snapshot_ts)),
+                    snapshot_max_age_seconds=TENANTS_SNAPSHOT_MAX_AGE_SECONDS,
+                )
+            except Exception:
+                pass
             return _TENANTS_CACHE
 
         if gc is None:
@@ -318,9 +414,21 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
 
             tenants[tid] = tenant_obj
 
+        loaded_at_ts = time.time()
         _TENANTS_CACHE = tenants
         _TENANTS_CACHE_AT = now_iso_utc()
-        _TENANTS_CACHE_AT_TS = time.time()
+        _TENANTS_CACHE_AT_TS = loaded_at_ts
+        try:
+            _persist_tenants_snapshot(config_spreadsheet_id, tenants, ts=loaded_at_ts)
+        except Exception as e:
+            try:
+                log_event(
+                    "tenants_snapshot_write_failed",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+            except Exception:
+                pass
 
         try:
             log_event(
@@ -338,6 +446,22 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
     except HTTPException:
         raise
     except Exception as e:
+        if snapshot_cached is not None:
+            snapshot_ts, snapshot_tenants = snapshot_cached
+            _TENANTS_CACHE = snapshot_tenants
+            _TENANTS_CACHE_AT = now_iso_utc()
+            _TENANTS_CACHE_AT_TS = snapshot_ts
+            try:
+                log_event(
+                    "tenants_load_failed_serving_snapshot",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                    snapshot_age_seconds=max(0, int(time.time() - snapshot_ts)),
+                )
+            except Exception:
+                pass
+            return _TENANTS_CACHE
+
         log_event(
             "tenants_load_error",
             error_type=type(e).__name__,

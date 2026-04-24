@@ -58,9 +58,9 @@ def _round_up_datetime(dt: datetime, interval: int) -> datetime:
     return dt.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
 
-def get_pickup_config(orders_sh) -> Dict[str, int]:
+def get_pickup_config(orders_sh, settings_map: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, int]:
     try:
-        settings = load_admin_settings(orders_sh)
+        settings = settings_map if isinstance(settings_map, dict) else load_admin_settings(orders_sh)
         interval = _safe_int(
             get_admin_setting_value(settings, "pickup_interval_minutes", str(DEFAULT_PICKUP_INTERVAL_MINUTES)),
             DEFAULT_PICKUP_INTERVAL_MINUTES,
@@ -90,8 +90,8 @@ def _build_pickup_base_response(ctx: Dict[str, Any], interval: int) -> Dict[str,
     }
 
 
-def _get_today_business_window(orders_sh, tenant_tz: str):
-    bs = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz)
+def _get_today_business_window(orders_sh, tenant_tz: str, settings_map: Optional[Dict[str, Dict[str, Any]]] = None):
+    bs = get_business_status_safe(orders_sh=orders_sh, tenant_tz=tenant_tz, settings_map=settings_map)
 
     now = _now_local(tenant_tz)
 
@@ -153,8 +153,9 @@ def _get_today_business_window(orders_sh, tenant_tz: str):
 
 
 def generate_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
-    cfg = get_pickup_config(orders_sh)
-    ctx = _get_today_business_window(orders_sh, tenant_tz)
+    settings = load_admin_settings(orders_sh)
+    cfg = get_pickup_config(orders_sh, settings_map=settings)
+    ctx = _get_today_business_window(orders_sh, tenant_tz, settings_map=settings)
     interval = max(1, int(cfg["pickup_interval_minutes"]))
     base_response = _build_pickup_base_response(ctx, interval)
 
@@ -228,8 +229,9 @@ def generate_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
 
 
 def generate_public_pickup_slots(orders_sh, tenant_tz: str) -> Dict[str, Any]:
-    cfg = get_pickup_config(orders_sh)
-    ctx = _get_today_business_window(orders_sh, tenant_tz)
+    settings = load_admin_settings(orders_sh)
+    cfg = get_pickup_config(orders_sh, settings_map=settings)
+    ctx = _get_today_business_window(orders_sh, tenant_tz, settings_map=settings)
     interval = max(1, int(cfg["pickup_interval_minutes"]))
     base_response = _build_pickup_base_response(ctx, interval)
 

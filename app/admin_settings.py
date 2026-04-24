@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import json
+from pathlib import Path
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -21,6 +23,9 @@ from app.utils import normalize, to_bool, log_event
 ADMIN_SETTINGS_SHEET_NAME = "AdminSettings"
 REQUIRED_ADMIN_SETTINGS_HEADERS = ["key", "value", "active", "scope"]
 ADMIN_SETTINGS_CACHE_TTL_SECONDS = 90
+ADMIN_SETTINGS_SNAPSHOT_MAX_AGE_SECONDS = 86400
+ADMIN_SETTINGS_SNAPSHOT_VERSION = 1
+ADMIN_SETTINGS_SNAPSHOT_DIRNAME = ".admin_settings_snapshots"
 
 _ADMIN_SETTINGS_CACHE: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 
@@ -75,7 +80,82 @@ def _cache_set(cache_key: str, data: Dict[str, Dict[str, Any]]) -> None:
 
 
 def invalidate_admin_settings_cache(orders_sh) -> None:
-    _ADMIN_SETTINGS_CACHE.pop(_cache_key(orders_sh), None)
+    cache_key = _cache_key(orders_sh)
+    _ADMIN_SETTINGS_CACHE.pop(cache_key, None)
+    try:
+        _snapshot_path(cache_key).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _snapshot_dir() -> Path:
+    return _project_root() / ADMIN_SETTINGS_SNAPSHOT_DIRNAME
+
+
+def _snapshot_path(cache_key: str) -> Path:
+    safe_key = normalize(cache_key).replace(" ", "_") or "unknown"
+    return _snapshot_dir() / f"{safe_key}.json"
+
+
+def _read_snapshot_payload(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _load_admin_settings_snapshot(cache_key: str) -> Optional[Tuple[float, Dict[str, Dict[str, Any]]]]:
+    path = _snapshot_path(cache_key)
+    if not path.exists():
+        return None
+
+    payload = _read_snapshot_payload(path)
+    if payload is None:
+        return None
+    if int(payload.get("version") or 0) != ADMIN_SETTINGS_SNAPSHOT_VERSION:
+        return None
+    if str(payload.get("spreadsheet_id") or "").strip() != str(cache_key or "").strip():
+        return None
+
+    try:
+        generated_at_ts = float(payload.get("generated_at_ts") or 0)
+    except Exception:
+        return None
+    if generated_at_ts <= 0:
+        return None
+    if (time.time() - generated_at_ts) > ADMIN_SETTINGS_SNAPSHOT_MAX_AGE_SECONDS:
+        return None
+
+    settings_map = payload.get("settings_map")
+    if not isinstance(settings_map, dict):
+        return None
+
+    return generated_at_ts, settings_map
+
+
+def _persist_admin_settings_snapshot(cache_key: str, settings_map: Dict[str, Dict[str, Any]], *, ts: Optional[float] = None) -> None:
+    snapshot_ts = float(ts if ts is not None else time.time())
+    payload = {
+        "version": ADMIN_SETTINGS_SNAPSHOT_VERSION,
+        "spreadsheet_id": str(cache_key or "").strip(),
+        "generated_at_ts": snapshot_ts,
+        "settings_map": settings_map,
+    }
+
+    snapshot_dir = _snapshot_dir()
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    path = _snapshot_path(cache_key)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temp_path.replace(path)
 
 
 def _tz(tenant_tz: str):
@@ -217,44 +297,87 @@ def _settings_rows_to_map(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any
 
 def load_admin_settings(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]:
     cache_key = _cache_key(orders_sh)
+    snapshot_cached = None
     if force:
         invalidate_admin_settings_cache(orders_sh)
     else:
         cached = _cache_get(cache_key)
         if cached is not None:
             return cached
-
-    ws = None
+        snapshot_cached = _load_admin_settings_snapshot(cache_key)
+        if snapshot_cached is not None:
+            snapshot_ts, snapshot_settings = snapshot_cached
+            _ADMIN_SETTINGS_CACHE[cache_key] = (snapshot_ts, snapshot_settings)
+            try:
+                log_event(
+                    "admin_settings_loaded_from_snapshot",
+                    snapshot_age_seconds=max(0, int(time.time() - snapshot_ts)),
+                    snapshot_max_age_seconds=ADMIN_SETTINGS_SNAPSHOT_MAX_AGE_SECONDS,
+                    active_keys=len(snapshot_settings),
+                )
+            except Exception:
+                pass
+            return snapshot_settings
 
     try:
-        ws = get_ws(orders_sh, ADMIN_SETTINGS_SHEET_NAME)
-    except Exception:
         ws = None
 
-    if ws is None:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "AdminSettings worksheet not found. "
-                "Expected a tab named 'AdminSettings' with headers: key, value, active, scope"
-            ),
-        )
+        try:
+            ws = get_ws(orders_sh, ADMIN_SETTINGS_SHEET_NAME)
+        except Exception:
+            ws = None
 
-    rows = read_records_manual(ws, required_headers=REQUIRED_ADMIN_SETTINGS_HEADERS)
-    cfg = _settings_rows_to_map(rows)
-    _cache_set(cache_key, cfg)
+        if ws is None:
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "AdminSettings worksheet not found. "
+                    "Expected a tab named 'AdminSettings' with headers: key, value, active, scope"
+                ),
+            )
 
-    try:
-        log_event(
-            "admin_settings_loaded",
-            worksheet_title=getattr(ws, "title", "unknown"),
-            active_keys=len(cfg),
-            keys=sorted(list(cfg.keys()))[:50],
-        )
-    except Exception:
-        pass
+        rows = read_records_manual(ws, required_headers=REQUIRED_ADMIN_SETTINGS_HEADERS)
+        cfg = _settings_rows_to_map(rows)
+        loaded_at_ts = time.time()
+        _ADMIN_SETTINGS_CACHE[cache_key] = (loaded_at_ts, cfg)
+        try:
+            _persist_admin_settings_snapshot(cache_key, cfg, ts=loaded_at_ts)
+        except Exception as e:
+            try:
+                log_event(
+                    "admin_settings_snapshot_write_failed",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+            except Exception:
+                pass
 
-    return cfg
+        try:
+            log_event(
+                "admin_settings_loaded",
+                worksheet_title=getattr(ws, "title", "unknown"),
+                active_keys=len(cfg),
+                keys=sorted(list(cfg.keys()))[:50],
+            )
+        except Exception:
+            pass
+
+        return cfg
+    except Exception as e:
+        if snapshot_cached is not None:
+            snapshot_ts, snapshot_settings = snapshot_cached
+            _ADMIN_SETTINGS_CACHE[cache_key] = (snapshot_ts, snapshot_settings)
+            try:
+                log_event(
+                    "admin_settings_load_failed_serving_snapshot",
+                    error_type=type(e).__name__,
+                    error=str(e),
+                    snapshot_age_seconds=max(0, int(time.time() - snapshot_ts)),
+                )
+            except Exception:
+                pass
+            return snapshot_settings
+        raise
 
 
 def get_admin_settings_ws(orders_sh):
@@ -496,8 +619,12 @@ def set_today_mode(
     return {"ok": True, "today_mode": mode, "today_date": today_str}
 
 
-def resolve_business_status(orders_sh, tenant_tz: str = "America/La_Paz") -> BusinessStatus:
-    settings = load_admin_settings(orders_sh)
+def resolve_business_status(
+    orders_sh,
+    tenant_tz: str = "America/La_Paz",
+    settings_map: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> BusinessStatus:
+    settings = settings_map if isinstance(settings_map, dict) else load_admin_settings(orders_sh)
     now_local = _now_local(tenant_tz)
     weekday_code = _weekday_code_es(now_local)
     now_min = _now_minutes(now_local)
@@ -614,8 +741,12 @@ def resolve_business_status(orders_sh, tenant_tz: str = "America/La_Paz") -> Bus
     )
 
 
-def resolve_business_status_dict(orders_sh, tenant_tz: str = "America/La_Paz") -> Dict[str, Any]:
-    s = resolve_business_status(orders_sh=orders_sh, tenant_tz=tenant_tz)
+def resolve_business_status_dict(
+    orders_sh,
+    tenant_tz: str = "America/La_Paz",
+    settings_map: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    s = resolve_business_status(orders_sh=orders_sh, tenant_tz=tenant_tz, settings_map=settings_map)
     return {
         "tenant_tz": s.tenant_tz,
         "now_local_iso": s.now_local_iso,
