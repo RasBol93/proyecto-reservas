@@ -13,19 +13,19 @@ from app.sheets import (
     get_recent_sheets_request_summaries_since_reset,
     reset_recent_sheets_request_summaries,
 )
-from app.tenants import get_tenant_or_404, tenants_cache_info, get_tenants_runtime_status, load_tenants
+from app.tenants import get_tenant_or_404, tenants_cache_info, get_tenants_runtime_status
 from app.utils import normalize
 from app.admin_settings import (
     ADMIN_SETTINGS_SHEET_NAME,
     REQUIRED_ADMIN_SETTINGS_HEADERS,
     get_admin_settings_runtime_status,
-    load_admin_settings,
     resolve_business_status_dict,
 )
-from app.menu import load_menu_admin_index, group_menu_admin_by_category, get_menu_runtime_status, load_menu_index
+from app.menu import load_menu_admin_index, group_menu_admin_by_category, get_menu_runtime_status
 from app.orders import get_order_by_id
 from app.alerts import send_test_alert
-from app.promotions import get_promotions_runtime_status, load_promotions
+from app.promotions import get_promotions_runtime_status
+from app.config_warm import warm_tenant_config
 
 router = APIRouter(prefix="/admin/diag", tags=["admin"])
 
@@ -679,138 +679,19 @@ def menu_snapshot_diag(
     }
 
 
-def _warm_component_result(*, warmed: bool, runtime_status: Optional[Dict[str, Any]] = None, error: str = "") -> Dict[str, Any]:
-    status = dict(runtime_status or {})
-    snapshot_valid = bool(status.get("snapshot_valid"))
-    cache_present = bool(status.get("cache_present"))
-    return {
-        "warmed": bool(warmed),
-        "error": str(error or "").strip(),
-        "last_served_from": str(status.get("last_served_from") or "").strip(),
-        "snapshot_valid": snapshot_valid,
-        "cache_present": cache_present,
-        "ready_for_serving": bool(snapshot_valid or cache_present),
-        "snapshot_age_seconds": status.get("snapshot_age_seconds"),
-        "snapshot_path": str(status.get("snapshot_path") or "").strip(),
-        "details": status,
-    }
-
-
 @router.post("/warm_config")
 def warm_config_diag(
     tenant_id: str = Query(...),
     token: str = Query(...),
 ) -> Dict[str, Any]:
     _require_admin_token(token)
-
     gc = get_gspread_client()
-
-    tenants_result: Dict[str, Any]
-    admin_settings_result: Dict[str, Any]
-    promotions_result: Dict[str, Any]
-    menu_result: Dict[str, Any]
-
-    try:
-        load_tenants(gc=gc, force=True)
-        tenants_result = _warm_component_result(
-            warmed=True,
-            runtime_status=get_tenants_runtime_status(),
-        )
-    except Exception as e:
-        tenants_result = _warm_component_result(
-            warmed=False,
-            runtime_status=get_tenants_runtime_status(),
-            error=str(e),
-        )
-
-    tenant = None
-    orders_sh = None
-    tenant_error = ""
-
-    try:
-        tenant = get_tenant_or_404(tenant_id, gc=gc)
-        orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
-        if not orders_sheet_id:
-            raise HTTPException(status_code=500, detail="orders_sheet_id missing for tenant")
-        orders_sh = open_spreadsheet_by_key(gc, orders_sheet_id)
-    except Exception as e:
-        tenant_error = str(e)
-
-    if orders_sh is None:
-        admin_settings_result = _warm_component_result(warmed=False, error=tenant_error)
-        promotions_result = _warm_component_result(warmed=False, error=tenant_error)
-        menu_result = _warm_component_result(warmed=False, error=tenant_error)
-    else:
-        try:
-            load_admin_settings(orders_sh, force=True)
-            admin_settings_result = _warm_component_result(
-                warmed=True,
-                runtime_status=get_admin_settings_runtime_status(orders_sh),
-            )
-        except Exception as e:
-            admin_settings_result = _warm_component_result(
-                warmed=False,
-                runtime_status=get_admin_settings_runtime_status(orders_sh),
-                error=str(e),
-            )
-
-        try:
-            load_promotions(orders_sh, force=True)
-            promotions_result = _warm_component_result(
-                warmed=True,
-                runtime_status=get_promotions_runtime_status(orders_sh),
-            )
-        except Exception as e:
-            promotions_result = _warm_component_result(
-                warmed=False,
-                runtime_status=get_promotions_runtime_status(orders_sh),
-                error=str(e),
-            )
-
-        try:
-            load_menu_index(orders_sh, force=True)
-            menu_result = _warm_component_result(
-                warmed=True,
-                runtime_status=get_menu_runtime_status(orders_sh),
-            )
-        except Exception as e:
-            menu_result = _warm_component_result(
-                warmed=False,
-                runtime_status=get_menu_runtime_status(orders_sh),
-                error=str(e),
-            )
-
-    ok = all([
-        bool(tenants_result.get("warmed")),
-        bool(admin_settings_result.get("warmed")),
-        bool(promotions_result.get("warmed")),
-        bool(menu_result.get("warmed")),
-    ])
-
-    component_results = {
-        "tenants": tenants_result,
-        "admin_settings": admin_settings_result,
-        "promotions": promotions_result,
-        "menu": menu_result,
-    }
-    ready_components = [
-        name for name, result in component_results.items()
-        if bool(result.get("ready_for_serving"))
-    ]
-    failed_components = [
-        name for name, result in component_results.items()
-        if not bool(result.get("warmed"))
-    ]
-
-    return {
-        "ok": ok,
-        "requested_tenant_id": tenant_id,
-        "resolved_tenant_id": (tenant.get("tenant_id") if isinstance(tenant, dict) else tenant_id),
-        "all_components_warmed": ok,
-        "ready_components": ready_components,
-        "failed_components": failed_components,
-        **component_results,
-    }
+    return warm_tenant_config(
+        tenant_id=tenant_id,
+        gc=gc,
+        force=True,
+        trigger="manual",
+    )
 
 
 @router.get("/tenants_snapshot")

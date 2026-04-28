@@ -40,6 +40,7 @@ from app.orders import (
 from app.payment_flow import notify_admin_payment_reported
 from app.r2_storage import generate_payment_proof_presigned_upload, upload_payment_proof_bytes
 from app.webhook_helpers import parse_items_field, fmt_snapshot_lines
+from app.config_warm import maybe_auto_warm_tenant_config
 
 from app.validators import (
     validate_tenant_id,
@@ -347,6 +348,13 @@ def get_menu(tenant_id: str = Query(...)):
         raise HTTPException(status_code=400, detail="Orders not enabled")
 
     orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
+    maybe_auto_warm_tenant_config(
+        tenant_id=str(tenant.get("tenant_id") or tenant_id).strip(),
+        gc=gc,
+        tenant=tenant,
+        orders_sh=orders_sh,
+        trigger="/menu",
+    )
 
     menu_idx = load_menu_index(orders_sh)
     categories = group_menu_by_category(menu_idx)
@@ -366,6 +374,13 @@ def get_pickup_slots(tenant_id: str = Query(...)):
         raise HTTPException(status_code=400, detail="Orders not enabled")
 
     orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
+    maybe_auto_warm_tenant_config(
+        tenant_id=str(tenant.get("tenant_id") or tenant_id).strip(),
+        gc=gc,
+        tenant=tenant,
+        orders_sh=orders_sh,
+        trigger="/pickup/slots",
+    )
     tenant_tz = str(tenant.get("timezone") or "America/La_Paz").strip() or "America/La_Paz"
 
     pickup_data = generate_public_pickup_slots(orders_sh=orders_sh, tenant_tz=tenant_tz)
