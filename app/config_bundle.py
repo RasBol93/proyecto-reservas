@@ -5,6 +5,7 @@ import importlib
 import json
 import re
 import time
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,7 +17,7 @@ from app.admin_settings import (
     load_admin_settings,
 )
 from app.menu import get_menu_runtime_status, load_menu_index
-from app.pickup import generate_public_pickup_slots
+from app.pickup import _get_today_business_window, get_pickup_config
 from app.promotions import get_promotions_runtime_status, load_promotions
 from app.sheets import get_gspread_client, note_sheets_serving_source, open_spreadsheet_by_key
 from app.tenants import get_tenant_or_404, get_tenants_runtime_status, load_tenants
@@ -312,11 +313,11 @@ def _resolve_bundle_context(
         raise HTTPException(status_code=400, detail="tenant_id is required")
 
     gc = gc or get_gspread_client()
+    resolved_tenant = dict(tenant or {}) if isinstance(tenant, dict) else None
 
-    if force:
+    if force and resolved_tenant is None:
         load_tenants(gc=gc, force=True)
 
-    resolved_tenant = dict(tenant or {}) if isinstance(tenant, dict) else None
     if resolved_tenant is None:
         resolved_tenant = get_tenant_or_404(clean_tenant_id, gc=gc)
 
@@ -606,6 +607,67 @@ def _build_menu_payload(menu_idx: Dict[str, Dict[str, Any]]) -> List[Dict[str, A
     return items
 
 
+def _build_pickup_base_response(ctx: Dict[str, Any], interval: int) -> Dict[str, Any]:
+    return {
+        "open_time": ctx.get("open_time"),
+        "close_time": ctx.get("close_time"),
+        "last_order_time": ctx.get("last_order_time"),
+        "pickup_interval_minutes": interval,
+    }
+
+
+def _build_public_pickup_payload_from_settings(
+    orders_sh,
+    *,
+    tenant_tz: str,
+    settings_map: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    cfg = get_pickup_config(orders_sh, settings_map=settings_map)
+    ctx = _get_today_business_window(orders_sh, tenant_tz, settings_map=settings_map)
+
+    try:
+        interval = max(1, int(cfg.get("pickup_interval_minutes") or 15))
+    except Exception:
+        interval = 15
+
+    base_response = _build_pickup_base_response(ctx, interval)
+    if not ctx.get("accepts_orders_now"):
+        return {
+            "ok": False,
+            "message": _safe_str(ctx.get("public_message")) or "No estamos recibiendo pedidos en este momento.",
+            "slots": [],
+            **base_response,
+        }
+
+    current = ctx["now"] + timedelta(minutes=interval)
+    if ctx.get("last_dt") and current > ctx["last_dt"]:
+        return {
+            "ok": False,
+            "message": "Ya no estamos aceptando pedidos hoy.",
+            "slots": [],
+            **base_response,
+        }
+
+    slots = []
+    while True:
+        if ctx.get("last_dt") and current > ctx["last_dt"]:
+            break
+
+        hhmm = current.strftime("%H:%M")
+        slots.append({
+            "label": hhmm,
+            "hhmm": hhmm,
+        })
+        current += timedelta(minutes=interval)
+
+    return {
+        "ok": bool(slots),
+        "message": "Elige una hora de recojo:" if slots else "No hay horarios disponibles.",
+        "slots": slots,
+        **base_response,
+    }
+
+
 def _normalize_pickup_slot_option(slot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     value = _safe_str(slot.get("value")) or _safe_str(slot.get("hhmm"))
     if not value:
@@ -676,8 +738,9 @@ def build_config_bundle(
     load_promotions(resolved_orders_sh, force=force)
     menu_idx = load_menu_index(resolved_orders_sh, force=force)
     content_map = _safe_load_content_map(resolved_orders_sh, force=force)
-    pickup_payload = generate_public_pickup_slots(
+    pickup_payload = _build_public_pickup_payload_from_settings(
         resolved_orders_sh,
+        settings_map=settings_map,
         tenant_tz=_safe_str(resolved_tenant.get("timezone")) or "America/La_Paz",
     )
 

@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, List, Tuple
 from fastapi import APIRouter, HTTPException, Query
 
 from app.sheets import (
+    enrich_sheets_request_summary_with_logical_counts,
     get_current_sheets_request_summary_preview,
     get_gspread_client,
     open_spreadsheet_by_key,
@@ -370,8 +371,22 @@ def _summarize_recent_sheets(requests: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "requests_count": len(requests),
         "total_sheet_reads_sum": sum(int(req.get("total_sheet_reads") or 0) for req in requests),
+        "logical_sheet_reads_sum": sum(int(req.get("logical_sheet_reads_count") or 0) for req in requests),
         "serving_sources_seen": serving_sources_seen,
         "paths_seen": paths_seen,
+    }
+
+
+def _enrich_recent_sheets_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    enriched_requests = []
+    for req in (result.get("requests") or []):
+        enriched = enrich_sheets_request_summary_with_logical_counts(req)
+        if enriched is not None:
+            enriched_requests.append(enriched)
+
+    return {
+        **result,
+        "requests": enriched_requests,
     }
 
 
@@ -389,6 +404,7 @@ def _summarize_config_bundle_audit(
         return {
             "requests_count": 1,
             "total_sheet_reads_sum": int(current_request_summary.get("total_sheet_reads") or 0),
+            "logical_sheet_reads_sum": int(current_request_summary.get("logical_sheet_reads_count") or 0),
             "serving_sources_seen": serving_sources,
             "paths_seen": [path] if path else [],
         }
@@ -1019,12 +1035,14 @@ def run_config_bundle_audit_diag(
         tenant=tenant,
         orders_sh=sh,
     )
-    current_request_summary = get_current_sheets_request_summary_preview()
-    recent_sheets = get_recent_sheets_request_summaries_since_reset(
+    current_request_summary = enrich_sheets_request_summary_with_logical_counts(
+        get_current_sheets_request_summary_preview()
+    )
+    recent_sheets = _enrich_recent_sheets_payload(get_recent_sheets_request_summaries_since_reset(
         limit=20,
         min_reads=0,
         had_429_only=False,
-    )
+    ))
     requests = recent_sheets.get("requests") or []
 
     return {
@@ -1088,6 +1106,7 @@ def run_webapp_bootstrap_audit_diag(
             seeded_preview,
             final_preview,
         )
+    current_request_summary = enrich_sheets_request_summary_with_logical_counts(current_request_summary)
 
     config_bundle_snapshot = get_config_bundle_runtime_status(
         tenant_id=resolved_tenant_id,
@@ -1095,11 +1114,11 @@ def run_webapp_bootstrap_audit_diag(
         tenant=tenant,
         orders_sh=sh,
     )
-    recent_sheets = get_recent_sheets_request_summaries_since_reset(
+    recent_sheets = _enrich_recent_sheets_payload(get_recent_sheets_request_summaries_since_reset(
         limit=20,
         min_reads=0,
         had_429_only=False,
-    )
+    ))
     requests = recent_sheets.get("requests") or []
 
     return {

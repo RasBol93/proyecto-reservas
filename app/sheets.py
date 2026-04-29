@@ -136,6 +136,85 @@ def get_current_sheets_request_summary_preview() -> Optional[Dict[str, Any]]:
     }
 
 
+def summarize_logical_sheet_reads(summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(summary, dict):
+        return {
+            "logical_sheet_reads_count": 0,
+            "logical_units": [],
+        }
+
+    reads = summary.get("reads") or []
+    if not isinstance(reads, list):
+        reads = []
+
+    sheets_with_full_reads = set()
+    for read in reads:
+        if not isinstance(read, dict):
+            continue
+        operation = _safe_text(read.get("operation"))
+        if operation != "worksheet.get_all_values":
+            continue
+        sheets_with_full_reads.add((
+            _safe_text(read.get("spreadsheet_id")),
+            _safe_text(read.get("worksheet")),
+        ))
+
+    logical_units: List[Dict[str, Any]] = []
+    for read in reads:
+        if not isinstance(read, dict):
+            continue
+
+        operation = _safe_text(read.get("operation"))
+        spreadsheet_id = _safe_text(read.get("spreadsheet_id"))
+        worksheet = _safe_text(read.get("worksheet"))
+        sheet_key = (spreadsheet_id, worksheet)
+
+        if operation in {"client.open_by_key", "spreadsheet.worksheet_lookup", "spreadsheet.worksheets"}:
+            continue
+
+        if not operation.startswith("worksheet."):
+            continue
+
+        logical_operation = ""
+        if operation == "worksheet.get_all_values":
+            logical_operation = "read_all_values"
+        elif operation == "worksheet.get":
+            if sheet_key in sheets_with_full_reads:
+                continue
+            logical_operation = "read_range"
+        elif operation == "worksheet.row_values":
+            logical_operation = "read_row_values"
+        elif operation == "worksheet.col_values":
+            logical_operation = "read_col_values"
+        else:
+            # Conservatively count unknown worksheet-level reads as one logical unit
+            # keyed by sheet + operation, instead of discarding potentially real work.
+            suffix = operation.split(".", 1)[1].strip() if "." in operation else ""
+            logical_operation = f"read_{suffix.replace('.', '_')}" if suffix else "read_worksheet_operation"
+
+        logical_units.append({
+            "spreadsheet_id": spreadsheet_id,
+            "worksheet": worksheet,
+            "logical_operation": logical_operation,
+        })
+
+    return {
+        "logical_sheet_reads_count": len(logical_units),
+        "logical_units": logical_units,
+    }
+
+
+def enrich_sheets_request_summary_with_logical_counts(summary: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(summary, dict):
+        return None
+
+    enriched = dict(summary)
+    logical = summarize_logical_sheet_reads(summary)
+    enriched["logical_sheet_reads_count"] = int(logical.get("logical_sheet_reads_count") or 0)
+    enriched["logical_sheet_read_units"] = list(logical.get("logical_units") or [])
+    return enriched
+
+
 def finish_sheets_request_context(
     *,
     status_code: Optional[int] = None,
