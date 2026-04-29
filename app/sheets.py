@@ -113,6 +113,29 @@ def note_sheets_serving_source(source: str) -> None:
     ctx.setdefault("serving_sources", set()).add(clean_source)
 
 
+def get_current_sheets_request_summary_preview() -> Optional[Dict[str, Any]]:
+    ctx = _SHEETS_REQUEST_CTX.get()
+    if not isinstance(ctx, dict):
+        return None
+
+    duration_ms = max(0, int((time.time() - float(ctx.get("started_at_ts") or time.time())) * 1000))
+    return {
+        "request_id": _safe_text(ctx.get("request_id")),
+        "path": _safe_text(ctx.get("path")),
+        "flow_name": _safe_text(ctx.get("flow_name")),
+        "tenant_id": _safe_text(ctx.get("tenant_id")),
+        "status_code": 0,
+        "total_sheet_reads": int(ctx.get("sheet_reads_count") or 0),
+        "worksheets_touched": sorted([w for w in ctx.get("worksheets_touched", set()) if _safe_text(w)]),
+        "spreadsheets_touched": sorted([s for s in ctx.get("spreadsheets_touched", set()) if _safe_text(s)]),
+        "duration_ms": duration_ms,
+        "had_429": bool(ctx.get("had_429")),
+        "serving_sources": sorted([s for s in ctx.get("serving_sources", set()) if _safe_text(s)]),
+        "reads": list(ctx.get("sheet_reads") or []),
+        "error": "",
+    }
+
+
 def finish_sheets_request_context(
     *,
     status_code: Optional[int] = None,

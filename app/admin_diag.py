@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, List, Tuple
 from fastapi import APIRouter, HTTPException, Query
 
 from app.sheets import (
+    get_current_sheets_request_summary_preview,
     get_gspread_client,
     open_spreadsheet_by_key,
     get_recent_sheets_request_summaries,
@@ -25,6 +26,12 @@ from app.menu import load_menu_admin_index, group_menu_admin_by_category, get_me
 from app.orders import get_order_by_id
 from app.alerts import send_test_alert
 from app.promotions import get_promotions_runtime_status
+from app.config_bundle import (
+    build_config_bundle,
+    get_config_bundle_runtime_status,
+    invalidate_config_bundle,
+    load_config_bundle,
+)
 from app.config_warm import warm_tenant_config
 
 router = APIRouter(prefix="/admin/diag", tags=["admin"])
@@ -324,6 +331,69 @@ def _safe_orders_runtime(orders_sh, order_id: str = "") -> Dict[str, Any]:
             "ok": False,
             "error": str(e),
         }
+
+
+def _resolve_tenant_orders_sheet(tenant_id: str):
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(tenant_id, gc=gc)
+
+    orders_sheet_id = (tenant.get("orders_sheet_id") or "").strip()
+    if not orders_sheet_id:
+        raise HTTPException(status_code=500, detail="orders_sheet_id missing for tenant")
+
+    sh = open_spreadsheet_by_key(gc, orders_sheet_id)
+    return gc, tenant, sh
+
+
+def _build_config_bundle_summary(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "generated_at": str(bundle.get("generated_at") or "").strip(),
+        "serving_source": str(bundle.get("serving_source") or "").strip(),
+        "menu_items_count": len(bundle.get("menu") or []),
+        "content_blocks_count": len(bundle.get("content") or []),
+    }
+
+
+def _summarize_recent_sheets(requests: List[Dict[str, Any]]) -> Dict[str, Any]:
+    serving_sources_seen = sorted({
+        str(source).strip()
+        for req in requests
+        for source in (req.get("serving_sources") or [])
+        if str(source).strip()
+    })
+    paths_seen = sorted({
+        str(req.get("path") or "").strip()
+        for req in requests
+        if str(req.get("path") or "").strip()
+    })
+
+    return {
+        "requests_count": len(requests),
+        "total_sheet_reads_sum": sum(int(req.get("total_sheet_reads") or 0) for req in requests),
+        "serving_sources_seen": serving_sources_seen,
+        "paths_seen": paths_seen,
+    }
+
+
+def _summarize_config_bundle_audit(
+    current_request_summary: Optional[Dict[str, Any]],
+    recent_requests: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if isinstance(current_request_summary, dict):
+        path = str(current_request_summary.get("path") or "").strip()
+        serving_sources = sorted({
+            str(source).strip()
+            for source in (current_request_summary.get("serving_sources") or [])
+            if str(source).strip()
+        })
+        return {
+            "requests_count": 1,
+            "total_sheet_reads_sum": int(current_request_summary.get("total_sheet_reads") or 0),
+            "serving_sources_seen": serving_sources,
+            "paths_seen": [path] if path else [],
+        }
+
+    return _summarize_recent_sheets(recent_requests)
 
 
 @router.get("/tenant")
@@ -749,6 +819,123 @@ def promotions_snapshot_diag(
         "ok": True,
         "tenant_id": tenant.get("tenant_id"),
         "promotions_snapshot": get_promotions_runtime_status(sh),
+    }
+
+
+@router.get("/config_bundle_snapshot")
+def config_bundle_snapshot_diag(
+    tenant_id: str = Query(...),
+    token: str = Query(...),
+) -> Dict[str, Any]:
+    _require_admin_token(token)
+
+    gc, tenant, sh = _resolve_tenant_orders_sheet(tenant_id)
+
+    return {
+        "ok": True,
+        "tenant_id": tenant.get("tenant_id"),
+        "config_bundle_snapshot": get_config_bundle_runtime_status(
+            tenant_id=tenant.get("tenant_id") or tenant_id,
+            gc=gc,
+            tenant=tenant,
+            orders_sh=sh,
+        ),
+    }
+
+
+@router.post("/rebuild_config_bundle")
+def rebuild_config_bundle_diag(
+    tenant_id: str = Query(...),
+    token: str = Query(...),
+) -> Dict[str, Any]:
+    _require_admin_token(token)
+
+    gc, tenant, sh = _resolve_tenant_orders_sheet(tenant_id)
+    resolved_tenant_id = tenant.get("tenant_id") or tenant_id
+    bundle = build_config_bundle(
+        tenant_id=resolved_tenant_id,
+        gc=gc,
+        tenant=tenant,
+        orders_sh=sh,
+        force=True,
+    )
+
+    return {
+        "ok": True,
+        "tenant_id": resolved_tenant_id,
+        "bundle_summary": _build_config_bundle_summary(bundle),
+        "config_bundle_snapshot": get_config_bundle_runtime_status(
+            tenant_id=resolved_tenant_id,
+            gc=gc,
+            tenant=tenant,
+            orders_sh=sh,
+        ),
+    }
+
+
+@router.post("/run_config_bundle_audit")
+def run_config_bundle_audit_diag(
+    tenant_id: str = Query(...),
+    token: str = Query(...),
+    mode: str = Query(default="cold"),
+) -> Dict[str, Any]:
+    _require_admin_token(token)
+
+    clean_mode = str(mode or "cold").strip().lower() or "cold"
+    if clean_mode not in {"cold", "warm"}:
+        raise HTTPException(status_code=400, detail="mode must be one of ['cold', 'warm']")
+
+    reset_recent_sheets_request_summaries()
+    gc, tenant, sh = _resolve_tenant_orders_sheet(tenant_id)
+    resolved_tenant_id = tenant.get("tenant_id") or tenant_id
+
+    if clean_mode == "cold":
+        invalidate_config_bundle(tenant_id=resolved_tenant_id, orders_sh=sh)
+        load_config_bundle(
+            tenant_id=resolved_tenant_id,
+            gc=gc,
+            tenant=tenant,
+            orders_sh=sh,
+            force=False,
+        )
+    else:
+        build_config_bundle(
+            tenant_id=resolved_tenant_id,
+            gc=gc,
+            tenant=tenant,
+            orders_sh=sh,
+            force=True,
+        )
+        load_config_bundle(
+            tenant_id=resolved_tenant_id,
+            gc=gc,
+            tenant=tenant,
+            orders_sh=sh,
+            force=False,
+        )
+
+    config_bundle_snapshot = get_config_bundle_runtime_status(
+        tenant_id=resolved_tenant_id,
+        gc=gc,
+        tenant=tenant,
+        orders_sh=sh,
+    )
+    current_request_summary = get_current_sheets_request_summary_preview()
+    recent_sheets = get_recent_sheets_request_summaries_since_reset(
+        limit=20,
+        min_reads=0,
+        had_429_only=False,
+    )
+    requests = recent_sheets.get("requests") or []
+
+    return {
+        "ok": True,
+        "tenant_id": resolved_tenant_id,
+        "mode": clean_mode,
+        "config_bundle_snapshot": config_bundle_snapshot,
+        "current_request_summary": current_request_summary,
+        "recent_sheets": recent_sheets,
+        "audit_summary": _summarize_config_bundle_audit(current_request_summary, requests),
     }
 
 

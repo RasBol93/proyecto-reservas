@@ -3,6 +3,7 @@ import time
 from typing import Any, Dict, Optional
 
 from app.admin_settings import get_admin_settings_runtime_status, load_admin_settings
+from app.config_bundle import build_config_bundle, get_config_bundle_runtime_status
 from app.menu import (
     MENU_CACHE_STALE_WINDOW_SECONDS,
     MENU_CACHE_TTL_SECONDS,
@@ -31,7 +32,9 @@ def _warm_component_result(*, warmed: bool, runtime_status: Optional[Dict[str, A
     status = dict(runtime_status or {})
     snapshot_valid = bool(status.get("snapshot_valid"))
     cache_present = bool(status.get("cache_present"))
-    ready_for_serving = bool(snapshot_valid or cache_present)
+    ready_for_serving = bool(status.get("ready_for_serving"))
+    if not ready_for_serving:
+        ready_for_serving = bool(snapshot_valid or cache_present)
 
     # Menu expone cache/runtime con shape distinta.
     if "memory_cache_fresh" in status or "memory_cache_age_seconds" in status:
@@ -57,12 +60,27 @@ def _warm_component_result(*, warmed: bool, runtime_status: Optional[Dict[str, A
     }
 
 
-def _build_component_results(orders_sh) -> Dict[str, Dict[str, Any]]:
+def _build_component_results(
+    *,
+    tenant_id: str,
+    gc=None,
+    tenant: Optional[Dict[str, Any]] = None,
+    orders_sh=None,
+) -> Dict[str, Dict[str, Any]]:
     return {
         "tenants": _warm_component_result(warmed=False, runtime_status=get_tenants_runtime_status()),
         "admin_settings": _warm_component_result(warmed=False, runtime_status=get_admin_settings_runtime_status(orders_sh)),
         "promotions": _warm_component_result(warmed=False, runtime_status=get_promotions_runtime_status(orders_sh)),
         "menu": _warm_component_result(warmed=False, runtime_status=get_menu_runtime_status(orders_sh)),
+        "config_bundle": _warm_component_result(
+            warmed=False,
+            runtime_status=get_config_bundle_runtime_status(
+                tenant_id=tenant_id,
+                gc=gc,
+                tenant=tenant,
+                orders_sh=orders_sh,
+            ),
+        ),
     }
 
 
@@ -112,6 +130,7 @@ def warm_tenant_config(
     admin_settings_result: Dict[str, Any]
     promotions_result: Dict[str, Any]
     menu_result: Dict[str, Any]
+    config_bundle_result: Dict[str, Any]
 
     loaded_tenants: Dict[str, Dict[str, Any]] = {}
     try:
@@ -151,6 +170,7 @@ def warm_tenant_config(
         admin_settings_result = _warm_component_result(warmed=False, error=tenant_error)
         promotions_result = _warm_component_result(warmed=False, error=tenant_error)
         menu_result = _warm_component_result(warmed=False, error=tenant_error)
+        config_bundle_result = _warm_component_result(warmed=False, error=tenant_error)
     else:
         try:
             load_admin_settings(orders_sh, force=force)
@@ -191,19 +211,44 @@ def warm_tenant_config(
                 error=str(e),
             )
 
+        try:
+            build_config_bundle(
+                tenant_id=clean_tenant_id,
+                gc=gc,
+                tenant=resolved_tenant,
+                orders_sh=orders_sh,
+                force=force,
+            )
+            config_bundle_result = _warm_component_result(
+                warmed=True,
+                runtime_status=get_config_bundle_runtime_status(
+                    tenant_id=clean_tenant_id,
+                    gc=gc,
+                    tenant=resolved_tenant,
+                    orders_sh=orders_sh,
+                ),
+            )
+        except Exception as e:
+            config_bundle_result = _warm_component_result(
+                warmed=False,
+                runtime_status=get_config_bundle_runtime_status(
+                    tenant_id=clean_tenant_id,
+                    gc=gc,
+                    tenant=resolved_tenant,
+                    orders_sh=orders_sh,
+                ),
+                error=str(e),
+            )
+
     component_results = {
         "tenants": tenants_result,
         "admin_settings": admin_settings_result,
         "promotions": promotions_result,
         "menu": menu_result,
+        "config_bundle": config_bundle_result,
     }
 
-    ok = all([
-        bool(tenants_result.get("warmed")),
-        bool(admin_settings_result.get("warmed")),
-        bool(promotions_result.get("warmed")),
-        bool(menu_result.get("warmed")),
-    ])
+    ok = all(bool(result.get("warmed")) for result in component_results.values())
     ready_components, failed_components = _component_lists(component_results)
     all_components_ready = len(ready_components) == len(component_results)
 
@@ -250,7 +295,12 @@ def maybe_auto_warm_tenant_config(
 
     now_ts = time.time()
     if orders_sh is not None:
-        component_results = _build_component_results(orders_sh)
+        component_results = _build_component_results(
+            tenant_id=clean_tenant_id,
+            gc=gc,
+            tenant=tenant,
+            orders_sh=orders_sh,
+        )
         ready_components, _ = _component_lists(component_results)
         if len(ready_components) == len(component_results):
             _set_auto_warm_state(tenant_key, ready=True)
@@ -353,7 +403,7 @@ def maybe_auto_warm_tenant_config(
                 all_components_warmed=False,
                 all_components_ready=False,
                 ready_components=[],
-                failed_components=["tenants", "admin_settings", "promotions", "menu"],
+                failed_components=["tenants", "admin_settings", "promotions", "menu", "config_bundle"],
                 error=str(e),
             )
         except Exception:
