@@ -396,6 +396,105 @@ def _summarize_config_bundle_audit(
     return _summarize_recent_sheets(recent_requests)
 
 
+def _build_webapp_bootstrap_summary(bundle: Dict[str, Any]) -> Dict[str, Any]:
+    open_status = bundle.get("open_status") or {}
+    pickup_slot_options = open_status.get("pickup_slot_options") or []
+    pickup_slots = open_status.get("pickup_slots") or []
+
+    pickup_slots_count = 0
+    if isinstance(pickup_slot_options, list):
+        pickup_slots_count = len(pickup_slot_options)
+    elif isinstance(pickup_slots, list):
+        pickup_slots_count = len(pickup_slots)
+
+    return {
+        "tenant_id": str(bundle.get("tenant_id") or "").strip(),
+        "generated_at": str(bundle.get("generated_at") or "").strip(),
+        "serving_source": str(bundle.get("serving_source") or "").strip(),
+        "menu_items_count": len(bundle.get("menu") or []),
+        "content_blocks_count": len(bundle.get("content") or []),
+        "pickup_slots_count": pickup_slots_count,
+    }
+
+
+def _compose_warm_bootstrap_request_summary(
+    resolve_preview: Optional[Dict[str, Any]],
+    seeded_preview: Optional[Dict[str, Any]],
+    final_preview: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(final_preview, dict):
+        return None
+    if not isinstance(resolve_preview, dict) or not isinstance(seeded_preview, dict):
+        return final_preview
+
+    resolve_reads = list(resolve_preview.get("reads") or [])
+    seeded_reads = list(seeded_preview.get("reads") or [])
+    final_reads = list(final_preview.get("reads") or [])
+
+    if len(final_reads) >= len(seeded_reads):
+        load_reads = final_reads[len(seeded_reads):]
+    else:
+        load_reads = final_reads
+
+    resolve_serving_sources = {
+        str(source).strip()
+        for source in (resolve_preview.get("serving_sources") or [])
+        if str(source).strip()
+    }
+    seeded_serving_sources = {
+        str(source).strip()
+        for source in (seeded_preview.get("serving_sources") or [])
+        if str(source).strip()
+    }
+    final_serving_sources = {
+        str(source).strip()
+        for source in (final_preview.get("serving_sources") or [])
+        if str(source).strip()
+    }
+    load_serving_sources = final_serving_sources - seeded_serving_sources
+
+    worksheets_touched = set(resolve_preview.get("worksheets_touched") or [])
+    spreadsheets_touched = set(resolve_preview.get("spreadsheets_touched") or [])
+    had_429 = bool(resolve_preview.get("had_429"))
+
+    for read in load_reads:
+        worksheet = str(read.get("worksheet") or "").strip()
+        spreadsheet_id = str(read.get("spreadsheet_id") or "").strip()
+        if worksheet:
+            worksheets_touched.add(worksheet)
+        if spreadsheet_id:
+            spreadsheets_touched.add(spreadsheet_id)
+        if bool(read.get("is_429")):
+            had_429 = True
+
+    load_reads_count = max(
+        0,
+        int(final_preview.get("total_sheet_reads") or 0) - int(seeded_preview.get("total_sheet_reads") or 0),
+    )
+    load_duration_ms = max(
+        0,
+        int(final_preview.get("duration_ms") or 0) - int(seeded_preview.get("duration_ms") or 0),
+    )
+
+    return {
+        "request_id": str(final_preview.get("request_id") or "").strip(),
+        "path": str(final_preview.get("path") or "").strip(),
+        "flow_name": str(final_preview.get("flow_name") or "").strip(),
+        "tenant_id": str(final_preview.get("tenant_id") or "").strip(),
+        "status_code": 0,
+        "total_sheet_reads": int(resolve_preview.get("total_sheet_reads") or 0) + load_reads_count,
+        "worksheets_touched": sorted([w for w in worksheets_touched if str(w).strip()]),
+        "spreadsheets_touched": sorted([s for s in spreadsheets_touched if str(s).strip()]),
+        "duration_ms": int(resolve_preview.get("duration_ms") or 0) + load_duration_ms,
+        "had_429": had_429,
+        "serving_sources": sorted([
+            s for s in (resolve_serving_sources | load_serving_sources) if str(s).strip()
+        ]),
+        "reads": resolve_reads + load_reads,
+        "error": "",
+    }
+
+
 @router.get("/tenant")
 def diag_tenant(tenant_id: str = Query(...), token: str = Query(...)) -> Dict[str, Any]:
     _require_admin_token(token)
@@ -932,6 +1031,82 @@ def run_config_bundle_audit_diag(
         "ok": True,
         "tenant_id": resolved_tenant_id,
         "mode": clean_mode,
+        "config_bundle_snapshot": config_bundle_snapshot,
+        "current_request_summary": current_request_summary,
+        "recent_sheets": recent_sheets,
+        "audit_summary": _summarize_config_bundle_audit(current_request_summary, requests),
+    }
+
+
+@router.post("/run_webapp_bootstrap_audit")
+def run_webapp_bootstrap_audit_diag(
+    tenant_id: str = Query(...),
+    token: str = Query(...),
+    mode: str = Query(default="cold"),
+) -> Dict[str, Any]:
+    _require_admin_token(token)
+
+    clean_mode = str(mode or "cold").strip().lower() or "cold"
+    if clean_mode not in {"cold", "warm"}:
+        raise HTTPException(status_code=400, detail="mode must be one of ['cold', 'warm']")
+
+    reset_recent_sheets_request_summaries()
+    gc, tenant, sh = _resolve_tenant_orders_sheet(tenant_id)
+    resolved_tenant_id = tenant.get("tenant_id") or tenant_id
+
+    resolve_preview = get_current_sheets_request_summary_preview()
+
+    if clean_mode == "cold":
+        invalidate_config_bundle(tenant_id=resolved_tenant_id, orders_sh=sh)
+        bundle = load_config_bundle(
+            tenant_id=resolved_tenant_id,
+            gc=gc,
+            tenant=tenant,
+            orders_sh=sh,
+            force=False,
+        )
+        current_request_summary = get_current_sheets_request_summary_preview()
+    else:
+        build_config_bundle(
+            tenant_id=resolved_tenant_id,
+            gc=gc,
+            tenant=tenant,
+            orders_sh=sh,
+            force=True,
+        )
+        seeded_preview = get_current_sheets_request_summary_preview()
+        bundle = load_config_bundle(
+            tenant_id=resolved_tenant_id,
+            gc=gc,
+            tenant=tenant,
+            orders_sh=sh,
+            force=False,
+        )
+        final_preview = get_current_sheets_request_summary_preview()
+        current_request_summary = _compose_warm_bootstrap_request_summary(
+            resolve_preview,
+            seeded_preview,
+            final_preview,
+        )
+
+    config_bundle_snapshot = get_config_bundle_runtime_status(
+        tenant_id=resolved_tenant_id,
+        gc=gc,
+        tenant=tenant,
+        orders_sh=sh,
+    )
+    recent_sheets = get_recent_sheets_request_summaries_since_reset(
+        limit=20,
+        min_reads=0,
+        had_429_only=False,
+    )
+    requests = recent_sheets.get("requests") or []
+
+    return {
+        "ok": True,
+        "tenant_id": resolved_tenant_id,
+        "mode": clean_mode,
+        "bootstrap_summary": _build_webapp_bootstrap_summary(bundle),
         "config_bundle_snapshot": config_bundle_snapshot,
         "current_request_summary": current_request_summary,
         "recent_sheets": recent_sheets,
