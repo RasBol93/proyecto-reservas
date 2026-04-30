@@ -400,6 +400,21 @@ def invalidate_menu_cache(orders_sh) -> None:
     _MENU_TRANSIENT_ALERT_LAST_AT.pop(ck, None)
     _MENU_LAST_SERVE_SOURCE.pop(ck, None)
 
+    try:
+        from app.config_bundle import invalidate_config_bundle
+
+        invalidate_config_bundle(orders_sh=orders_sh)
+    except Exception as e:
+        try:
+            log_event(
+                "menu_cache_bundle_invalidation_failed",
+                cache_key=ck,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+        except Exception:
+            pass
+
 
 def invalidate_all_menu_caches() -> None:
     _MENU_CACHE.clear()
