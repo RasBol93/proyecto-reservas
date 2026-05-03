@@ -1,6 +1,6 @@
 # app/api_routes.py — optimizado (cache de sheets + menor overhead)
 
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from urllib.parse import unquote, urlparse
 
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
@@ -127,6 +127,47 @@ def _validate_webapp_payment_proof_url(proof_reference: str) -> str:
         raise HTTPException(status_code=400, detail="proof_reference must point to a payment proof object")
 
     return clean_reference
+
+
+def _normalize_payment_proof_filename(filename: str) -> str:
+    clean_filename = str(filename or "").strip()
+    if not clean_filename:
+        raise HTTPException(status_code=400, detail="filename is required")
+    if len(clean_filename) > 180:
+        raise HTTPException(status_code=400, detail="filename is too long")
+    if "/" in clean_filename or "\\" in clean_filename:
+        raise HTTPException(status_code=400, detail="filename must not contain path separators")
+    return clean_filename
+
+
+def _validate_payment_proof_presign_input(filename: str, content_type: str) -> Tuple[str, str]:
+    clean_filename = _normalize_payment_proof_filename(filename)
+    clean_content_type = str(content_type or "").strip().lower()
+
+    if not clean_content_type:
+        raise HTTPException(status_code=400, detail="content_type is required")
+
+    allowed_extensions_by_type = {
+        "image/jpeg": {".jpg", ".jpeg"},
+        "image/png": {".png"},
+        "image/webp": {".webp"},
+        "application/pdf": {".pdf"},
+    }
+
+    allowed_extensions = {ext for exts in allowed_extensions_by_type.values() for ext in exts}
+
+    if clean_content_type not in allowed_extensions_by_type:
+        raise HTTPException(status_code=400, detail="content_type is not allowed")
+
+    dot_idx = clean_filename.rfind(".")
+    ext = clean_filename[dot_idx:].lower() if dot_idx > 0 else ""
+    if ext not in allowed_extensions:
+        raise HTTPException(status_code=400, detail="file extension is not allowed")
+
+    if ext not in allowed_extensions_by_type[clean_content_type]:
+        raise HTTPException(status_code=400, detail="file extension does not match content_type")
+
+    return clean_filename, clean_content_type
 
 
 def _get_order_for_tenant_or_404(orders_sh, tenant_id: str, order_id: str):
@@ -571,14 +612,15 @@ async def upload_payment_proof(file: UploadFile = File(...)):
 
 @router.post("/upload/payment-proof/presign", response_model=PaymentProofPresignOut)
 def presign_payment_proof_upload(payload: PaymentProofPresignIn):
-    filename = str(payload.filename or "").strip()
-    if not filename:
-        raise HTTPException(status_code=400, detail="filename is required")
+    filename, content_type = _validate_payment_proof_presign_input(
+        filename=payload.filename,
+        content_type=payload.content_type,
+    )
 
     try:
         presigned = generate_payment_proof_presigned_upload(
             filename=filename,
-            content_type=str(payload.content_type or "").strip(),
+            content_type=content_type,
         )
         return PaymentProofPresignOut(
             success=True,
