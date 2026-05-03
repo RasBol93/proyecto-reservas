@@ -248,12 +248,18 @@ def _serialize_order_snapshot(order: Dict[str, str]):
         detail_lines, total_amount, total_qty = fmt_snapshot_lines(items_snapshot)
         normalized_items = []
         for item in items_snapshot:
+            qty = _safe_int(item.get("qty") or 1, 1)
+            unit_price = _safe_float(item.get("unit_price") or 0)
+            line_total = _safe_float(item.get("line_total") or 0)
             normalized_items.append({
                 "sku": str(item.get("sku") or "").strip(),
                 "name": str(item.get("name") or item.get("sku") or "").strip(),
-                "qty": _safe_int(item.get("qty") or 1, 1),
-                "unit_price": _safe_float(item.get("unit_price") or 0),
-                "line_total": _safe_float(item.get("line_total") or 0),
+                "qty": qty,
+                "quantity": qty,
+                "unit_price": unit_price,
+                "price": unit_price,
+                "line_total": line_total,
+                "subtotal": line_total,
             })
         return normalized_items, detail_lines, total_amount, total_qty
 
@@ -268,8 +274,11 @@ def _serialize_order_snapshot(order: Dict[str, str]):
             "sku": sku,
             "name": sku,
             "qty": qty,
+            "quantity": qty,
             "unit_price": 0.0,
+            "price": 0.0,
             "line_total": 0.0,
+            "subtotal": 0.0,
         })
 
     detail_lines = "\n".join(
@@ -367,8 +376,11 @@ class OrderStatusItemOut(BaseModel):
     sku: str
     name: str
     qty: int
+    quantity: int
     unit_price: float
+    price: float
     line_total: float
+    subtotal: float
 
 
 class OrderStatusOut(BaseModel):
