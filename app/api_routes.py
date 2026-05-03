@@ -1,16 +1,19 @@
 # app/api_routes.py — optimizado (cache de sheets + menor overhead)
 
 from typing import List, Optional, Dict
+from urllib.parse import unquote, urlparse
 
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
 
 from app.config import (
+    ENV_R2_PUBLIC_BASE_URL,
     MAX_ITEMS_PER_ORDER,
     MAX_NAME_LEN,
     RL_MENU_PER_MIN,
     RL_CREATE_PER_MIN,
     RL_MARKPAID_PER_MIN,
+    env_required,
 )
 from app.rate_limit import rate_limiter
 from app.sheets import get_gspread_client, open_spreadsheet_by_key
@@ -86,6 +89,44 @@ def _serialize_pickup_slots(slots):
         })
 
     return serialized
+
+
+def _validate_webapp_payment_proof_url(proof_reference: str) -> str:
+    clean_reference = str(proof_reference or "").strip()
+    if not clean_reference:
+        raise HTTPException(status_code=400, detail="proof_reference is required")
+
+    base_url = env_required(ENV_R2_PUBLIC_BASE_URL).strip().rstrip("/")
+    parsed_base = urlparse(base_url)
+    parsed_ref = urlparse(clean_reference)
+
+    if not parsed_ref.scheme or not parsed_ref.netloc:
+        raise HTTPException(status_code=400, detail="proof_reference must be an absolute URL")
+
+    base_scheme = str(parsed_base.scheme or "").strip().lower()
+    ref_scheme = str(parsed_ref.scheme or "").strip().lower()
+    if not base_scheme or ref_scheme != base_scheme:
+        raise HTTPException(status_code=400, detail="proof_reference has invalid URL scheme")
+
+    base_netloc = str(parsed_base.netloc or "").strip().lower()
+    ref_netloc = str(parsed_ref.netloc or "").strip().lower()
+    if not base_netloc or ref_netloc != base_netloc:
+        raise HTTPException(status_code=400, detail="proof_reference host is not allowed")
+
+    base_path = unquote(str(parsed_base.path or "").strip()).rstrip("/")
+    ref_path = unquote(str(parsed_ref.path or "").strip())
+
+    if base_path:
+        if ref_path != base_path and not ref_path.startswith(base_path + "/"):
+            raise HTTPException(status_code=400, detail="proof_reference path is outside the allowed storage base path")
+        relative_path = ref_path[len(base_path):] or "/"
+    else:
+        relative_path = ref_path or "/"
+
+    if not relative_path.startswith("/payment_proofs/"):
+        raise HTTPException(status_code=400, detail="proof_reference must point to a payment proof object")
+
+    return clean_reference
 
 
 def _get_order_for_tenant_or_404(orders_sh, tenant_id: str, order_id: str):
@@ -576,6 +617,11 @@ def set_order_payment_proof(payload: OrderPaymentProofIn):
     order_source = str(order.get("source") or "").strip().lower()
     if order_source not in {"webapp", "api"}:
         raise HTTPException(status_code=400, detail="Order source not supported for this endpoint")
+
+    if clean_proof_type != "external_url":
+        raise HTTPException(status_code=400, detail="proof_type must be 'external_url' for webapp/api orders")
+
+    clean_proof_reference = _validate_webapp_payment_proof_url(clean_proof_reference)
 
     if str(order.get("status") or "").strip().upper() == "PAID":
         raise HTTPException(status_code=409, detail="Order is already paid")
