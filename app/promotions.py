@@ -77,6 +77,34 @@ def invalidate_promotions_cache(orders_sh):
         _snapshot_path(ck).unlink(missing_ok=True)
     except Exception:
         pass
+    try:
+        from app.menu import invalidate_menu_cache
+
+        invalidate_menu_cache(orders_sh)
+    except Exception as e:
+        try:
+            log_event(
+                "promotions_cache_menu_invalidation_failed",
+                cache_key=ck,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+        except Exception:
+            pass
+    try:
+        from app.config_bundle import invalidate_config_bundle
+
+        invalidate_config_bundle(orders_sh=orders_sh)
+    except Exception as e:
+        try:
+            log_event(
+                "promotions_cache_bundle_invalidation_failed",
+                cache_key=ck,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+        except Exception:
+            pass
 
 
 def invalidate_all_promotions_cache():
