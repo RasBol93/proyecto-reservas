@@ -90,6 +90,20 @@ def invalidate_admin_settings_cache(orders_sh) -> None:
         _snapshot_path(cache_key).unlink(missing_ok=True)
     except Exception:
         pass
+    try:
+        from app.config_bundle import invalidate_config_bundle
+
+        invalidate_config_bundle(orders_sh=orders_sh)
+    except Exception as e:
+        try:
+            log_event(
+                "admin_settings_cache_bundle_invalidation_failed",
+                cache_key=cache_key,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+        except Exception:
+            pass
 
 
 def _project_root() -> Path:
