@@ -720,6 +720,15 @@ def set_order_payment_proof(payload: OrderPaymentProofIn):
             detail=f"Could not persist payment proof: {str(result.get('error') or 'sheet write failed')}",
         )
 
+    if result.get("already_same"):
+        return OrderPaymentProofOut(
+            ok=True,
+            order_id=payload.order_id,
+            proof_type=clean_proof_type,
+            notified_admin=False,
+            verification_status="pending_verification",
+        )
+
     order_with_proof = dict(order)
     order_with_proof["payment_proof_file_id"] = clean_proof_reference
     order_with_proof["payment_proof_type"] = clean_proof_type
