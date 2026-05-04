@@ -831,6 +831,15 @@ def report_order_paid(payload: OrderReportPaidIn):
             already_paid=True,
         )
 
+    has_payment_proof = bool(str(order.get("payment_proof_file_id") or "").strip())
+    if has_payment_proof:
+        return OrderReportPaidOut(
+            ok=True,
+            order_id=payload.order_id,
+            notified_admin=False,
+            already_paid=False,
+        )
+
     notified_admin = notify_admin_payment_reported(
         tenant=tenant,
         tenant_id=resolved_tenant_id,
