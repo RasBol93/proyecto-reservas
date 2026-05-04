@@ -3,7 +3,7 @@
 from typing import List, Optional, Dict, Tuple
 from urllib.parse import unquote, urlparse
 
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, UploadFile, File, Request
 from pydantic import BaseModel, Field
 
 from app.config import (
@@ -89,6 +89,21 @@ def _serialize_pickup_slots(slots):
         })
 
     return serialized
+
+
+def _client_rate_limit_identity(request: Request) -> str:
+    forwarded_for = str(request.headers.get("x-forwarded-for") or "").strip()
+    if forwarded_for:
+        first_ip = forwarded_for.split(",")[0].strip()
+        if first_ip:
+            return first_ip
+
+    client = getattr(request, "client", None)
+    client_host = str(getattr(client, "host", "") or "").strip()
+    if client_host:
+        return client_host
+
+    return "unknown"
 
 
 def _validate_webapp_payment_proof_url(proof_reference: str) -> str:
@@ -623,7 +638,13 @@ async def upload_payment_proof(file: UploadFile = File(...)):
 
 
 @router.post("/upload/payment-proof/presign", response_model=PaymentProofPresignOut)
-def presign_payment_proof_upload(payload: PaymentProofPresignIn):
+def presign_payment_proof_upload(payload: PaymentProofPresignIn, request: Request):
+    client_key = _client_rate_limit_identity(request)
+    rate_limiter.hit(
+        f"payment_proof_presign:{client_key}",
+        RL_MARKPAID_PER_MIN,
+    )
+
     filename, content_type = _validate_payment_proof_presign_input(
         filename=payload.filename,
         content_type=payload.content_type,
