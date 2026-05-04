@@ -648,6 +648,10 @@ def presign_payment_proof_upload(payload: PaymentProofPresignIn):
 def set_order_payment_proof(payload: OrderPaymentProofIn):
     validate_tenant_id(payload.tenant_id)
     validate_order_id(payload.order_id)
+    rate_limiter.hit(
+        f"payment_proof:{payload.tenant_id}:{payload.order_id}",
+        RL_MARKPAID_PER_MIN,
+    )
 
     clean_proof_type = str(payload.proof_type or "").strip().lower()
     if clean_proof_type not in {"photo", "document", "external_url"}:
