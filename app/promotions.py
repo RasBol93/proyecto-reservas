@@ -36,6 +36,7 @@ _PROMO_CACHE: Dict[str, tuple] = {}
 _PROMO_LAST_SERVE_SOURCE: Dict[str, str] = {}
 _PROMO_LAST_SNAPSHOT_REJECTION_REASON: Dict[str, str] = {}
 PROMO_CACHE_TTL_SECONDS = 180
+PROMO_CACHE_STALE_WINDOW_SECONDS = 900
 PROMO_SNAPSHOT_MAX_AGE_SECONDS = 86400
 PROMO_SNAPSHOT_VERSION = 1
 PROMO_SNAPSHOT_DIRNAME = ".promotions_snapshots"
@@ -60,6 +61,33 @@ def _cache_get(cache_key: str):
     ts, data = v
     if (time.time() - ts) <= PROMO_CACHE_TTL_SECONDS:
         return data
+
+    return None
+
+
+def _cache_get_entry(cache_key: str) -> Optional[Tuple[float, List[Dict[str, Any]]]]:
+    v = _PROMO_CACHE.get(cache_key)
+    if not v:
+        return None
+
+    try:
+        ts, data = v
+        return float(ts), data
+    except Exception:
+        return None
+
+
+def _cache_get_stale(cache_key: str) -> Optional[Tuple[float, List[Dict[str, Any]]]]:
+    entry = _cache_get_entry(cache_key)
+    if entry is None:
+        return None
+
+    ts, data = entry
+    age_seconds = time.time() - ts
+    if age_seconds <= PROMO_CACHE_TTL_SECONDS:
+        return entry
+    if age_seconds <= (PROMO_CACHE_TTL_SECONDS + PROMO_CACHE_STALE_WINDOW_SECONDS):
+        return entry
 
     return None
 
@@ -281,9 +309,12 @@ def get_promotions_runtime_status(orders_sh) -> Dict[str, Any]:
         **snapshot_info,
         "cache_present": cache_present,
         "cache_age_seconds": cache_age_seconds,
+        "cache_fresh": _cache_get(cache_key) is not None,
+        "cache_stale_usable": _cache_get_stale(cache_key) is not None,
         "last_served_from": str(_PROMO_LAST_SERVE_SOURCE.get(cache_key) or "").strip(),
         "last_snapshot_rejection_reason": str(_PROMO_LAST_SNAPSHOT_REJECTION_REASON.get(cache_key) or "").strip(),
         "ttl_seconds": PROMO_CACHE_TTL_SECONDS,
+        "stale_window_seconds": PROMO_CACHE_STALE_WINDOW_SECONDS,
         "snapshot_max_age_seconds": PROMO_SNAPSHOT_MAX_AGE_SECONDS,
     }
 
@@ -295,9 +326,8 @@ def get_promotions_runtime_status(orders_sh) -> Dict[str, Any]:
 def _get_promotions_ws(orders_sh):
     try:
         return get_ws(orders_sh, "Promotions")
-    except Exception:
-        alert_system_error(error="Promotions sheet not found", module="promotions")
-        raise HTTPException(status_code=500, detail="Promotions sheet not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Promotions sheet not found: {e}")
 
 
 def _get_header(ws) -> List[str]:
@@ -578,6 +608,7 @@ def get_promotion_by_id(orders_sh, promo_id: str) -> Optional[Dict[str, Any]]:
 def load_promotions(orders_sh, force: bool = False) -> List[Dict[str, Any]]:
     ck = _cache_key(orders_sh)
     snapshot_cached = None
+    stale_cached = None
     _set_last_promotions_snapshot_rejection_reason(ck, "")
 
     if not force:
@@ -622,6 +653,10 @@ def load_promotions(orders_sh, force: bool = False) -> List[Dict[str, Any]]:
             except Exception:
                 pass
             return snapshot_promos
+    else:
+        snapshot_cached = _load_promotions_snapshot(ck)
+
+    stale_cached = _cache_get_stale(ck)
 
     try:
         ws = _get_promotions_ws(orders_sh)
@@ -684,10 +719,10 @@ def load_promotions(orders_sh, force: bool = False) -> List[Dict[str, Any]]:
         return promos
 
     except Exception as e:
-        if not force and snapshot_cached is not None:
+        if snapshot_cached is not None:
             snapshot_ts, snapshot_promos = snapshot_cached
             _PROMO_CACHE[ck] = (float(snapshot_ts), snapshot_promos)
-            _set_last_promotions_serve_source(ck, "snapshot")
+            _set_last_promotions_serve_source(ck, "snapshot_fallback")
             try:
                 log_event(
                     "promotions_load_failed_serving_snapshot",
@@ -701,6 +736,24 @@ def load_promotions(orders_sh, force: bool = False) -> List[Dict[str, Any]]:
                 pass
             return snapshot_promos
 
+        if stale_cached is not None:
+            stale_ts, stale_promos = stale_cached
+            _PROMO_CACHE[ck] = (float(stale_ts), stale_promos)
+            _set_last_promotions_serve_source(ck, "memory_stale")
+            try:
+                log_event(
+                    "promotions_load_failed_serving_stale_memory",
+                    cache_key=ck,
+                    cache_age_seconds=max(0, int(time.time() - stale_ts)),
+                    stale_window_seconds=PROMO_CACHE_STALE_WINDOW_SECONDS,
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+            except Exception:
+                pass
+            return stale_promos
+
+        _set_last_promotions_serve_source(ck, "empty_on_error")
         alert_system_error(error=str(e), module="promotions.load")
         return []
 
