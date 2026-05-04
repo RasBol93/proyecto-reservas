@@ -840,13 +840,48 @@ def report_order_paid(payload: OrderReportPaidIn):
             already_paid=False,
         )
 
+    freshest_order = order
+    try:
+        fresh_order_ctx = _get_order_context_for_tenant_or_404_strict(
+            orders_sh,
+            resolved_tenant_id,
+            payload.order_id,
+        )
+        fresh_order = dict(fresh_order_ctx.get("order") or {})
+        fresh_order_source = str(fresh_order.get("source") or "").strip().lower()
+        if fresh_order_source not in {"webapp", "api"}:
+            raise HTTPException(status_code=400, detail="Order source not supported for this endpoint")
+
+        fresh_already_paid = str(fresh_order.get("status") or "").strip().upper() == "PAID"
+        if fresh_already_paid:
+            return OrderReportPaidOut(
+                ok=True,
+                order_id=payload.order_id,
+                notified_admin=False,
+                already_paid=True,
+            )
+
+        fresh_has_payment_proof = bool(str(fresh_order.get("payment_proof_file_id") or "").strip())
+        if fresh_has_payment_proof:
+            return OrderReportPaidOut(
+                ok=True,
+                order_id=payload.order_id,
+                notified_admin=False,
+                already_paid=False,
+            )
+
+        freshest_order = fresh_order
+    except HTTPException as e:
+        if int(getattr(e, "status_code", 0) or 0) != 503:
+            raise
+
     notified_admin = notify_admin_payment_reported(
         tenant=tenant,
         tenant_id=resolved_tenant_id,
         orders_sh=orders_sh,
         order_id=payload.order_id,
         is_reminder=False,
-        order=order,
+        order=freshest_order,
     )
 
     if not notified_admin:
