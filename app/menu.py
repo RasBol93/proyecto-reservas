@@ -289,7 +289,12 @@ def _load_menu_snapshot(cache_key: str) -> Optional[Tuple[float, Dict[str, Dict[
     payload = _read_snapshot_payload(path)
     if payload is None:
         try:
-            log_event("menu_snapshot_read_failed", cache_key=cache_key, error_type="snapshot_payload_invalid", error="invalid snapshot payload")
+            log_event(
+                "menu_snapshot_read_failed",
+                cache_key=cache_key,
+                error_type="snapshot_payload_invalid",
+                error="invalid snapshot payload",
+            )
         except Exception:
             pass
         return None
@@ -576,20 +581,15 @@ def _write_full_row(ws, row_index_1based: int, row_values: List[str]) -> None:
     )
 
 
-def _find_next_empty_row(ws, header_row_1based: int, header_len: int) -> int:
+def _find_next_empty_row_from_values(
+    values: List[List[Any]],
+    header_row_1based: int,
+    header_len: int,
+) -> int:
     start_row = max(2, int(header_row_1based or 1) + 1)
 
     if header_len <= 0:
         return start_row
-
-    try:
-        values = _call_with_retry(
-            lambda: ws.get_all_values(),
-            op_name="menu._find_next_empty_row.get_all_values",
-            log_fields={"worksheet_title": getattr(ws, "title", "")},
-        )
-    except Exception:
-        values = []
 
     if not values or len(values) < start_row:
         return start_row
@@ -600,6 +600,23 @@ def _find_next_empty_row(ws, header_row_1based: int, header_len: int) -> int:
             return idx_1based
 
     return len(values) + 1
+
+
+def _find_next_empty_row(ws, header_row_1based: int, header_len: int) -> int:
+    try:
+        values = _call_with_retry(
+            lambda: ws.get_all_values(),
+            op_name="menu._find_next_empty_row.get_all_values",
+            log_fields={"worksheet_title": getattr(ws, "title", "")},
+        )
+    except Exception:
+        values = []
+
+    return _find_next_empty_row_from_values(
+        values=values,
+        header_row_1based=header_row_1based,
+        header_len=header_len,
+    )
 
 
 def _looks_like_headerish_menu_row(sku: str, name: str, price_raw: str, active_raw: str, category: str) -> bool:
@@ -1387,6 +1404,7 @@ def create_menu_product(
 
     ctx = _get_menu_context(orders_sh)
     ws = ctx["ws"]
+    values = ctx["values"]
     headers_raw = ctx["headers_raw"]
     header_row_1based = int(ctx["header_row_1based"])
     idx_map = ctx["idx_map"]
@@ -1411,7 +1429,11 @@ def create_menu_product(
         put("photo_file_id", "")
 
     try:
-        next_row = _find_next_empty_row(ws, header_row_1based, len(headers_raw))
+        next_row = _find_next_empty_row_from_values(
+            values=values,
+            header_row_1based=header_row_1based,
+            header_len=len(headers_raw),
+        )
         _call_with_retry(
             lambda: _write_full_row(ws, next_row, row_values),
             op_name="menu.create_menu_product.write_full_row",
