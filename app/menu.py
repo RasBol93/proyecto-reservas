@@ -547,6 +547,61 @@ def _get_menu_context(orders_sh) -> Dict[str, Any]:
     }
 
 
+def _col_to_a1(col_1based: int) -> str:
+    result = ""
+    n = int(col_1based)
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def _cell_a1(row_1based: int, col_1based: int) -> str:
+    return f"{_col_to_a1(col_1based)}{int(row_1based)}"
+
+
+def _range_a1(row_1based: int, start_col_1based: int, end_col_1based: int) -> str:
+    return f"{_cell_a1(row_1based, start_col_1based)}:{_cell_a1(row_1based, end_col_1based)}"
+
+
+def _write_full_row(ws, row_index_1based: int, row_values: List[str]) -> None:
+    if not row_values:
+        return
+
+    end_col = len(row_values)
+    ws.update(
+        _range_a1(row_index_1based, 1, end_col),
+        [row_values],
+        value_input_option="RAW",
+    )
+
+
+def _find_next_empty_row(ws, header_row_1based: int, header_len: int) -> int:
+    start_row = max(2, int(header_row_1based or 1) + 1)
+
+    if header_len <= 0:
+        return start_row
+
+    try:
+        values = _call_with_retry(
+            lambda: ws.get_all_values(),
+            op_name="menu._find_next_empty_row.get_all_values",
+            log_fields={"worksheet_title": getattr(ws, "title", "")},
+        )
+    except Exception:
+        values = []
+
+    if not values or len(values) < start_row:
+        return start_row
+
+    for idx_1based, row in enumerate(values[start_row - 1:], start=start_row):
+        slice_row = row[:header_len]
+        if not any(str(cell).strip() for cell in slice_row):
+            return idx_1based
+
+    return len(values) + 1
+
+
 def _looks_like_headerish_menu_row(sku: str, name: str, price_raw: str, active_raw: str, category: str) -> bool:
     sku_n = normalize(sku)
     name_n = normalize(name)
@@ -1333,6 +1388,7 @@ def create_menu_product(
     ctx = _get_menu_context(orders_sh)
     ws = ctx["ws"]
     headers_raw = ctx["headers_raw"]
+    header_row_1based = int(ctx["header_row_1based"])
     idx_map = ctx["idx_map"]
 
     row_values = [""] * len(headers_raw)
@@ -1355,10 +1411,11 @@ def create_menu_product(
         put("photo_file_id", "")
 
     try:
+        next_row = _find_next_empty_row(ws, header_row_1based, len(headers_raw))
         _call_with_retry(
-            lambda: ws.append_row(row_values, value_input_option="USER_ENTERED"),
-            op_name="menu.create_menu_product.append_row",
-            log_fields={"sku": sku, "name": clean_name},
+            lambda: _write_full_row(ws, next_row, row_values),
+            op_name="menu.create_menu_product.write_full_row",
+            log_fields={"sku": sku, "name": clean_name, "row_index": next_row},
         )
     except Exception as e:
         alert_system_error(error=str(e), module="menu.create_menu_product")
