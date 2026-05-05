@@ -724,6 +724,9 @@ def _build_virtual_promotions_index(orders_sh, menu_idx: Dict[str, Dict[str, Any
 def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]:
     ck = _cache_key_for_orders_sh(orders_sh)
     max_stale_age = MENU_CACHE_TTL_SECONDS + MENU_CACHE_STALE_WINDOW_SECONDS
+    stale_cached = _cache_get_stale(_MENU_CACHE, ck, max_age_seconds=max_stale_age)
+    stale_cache_age_seconds = _cache_age_seconds(_MENU_CACHE, ck) if stale_cached is not None else None
+    snapshot_cached = _load_menu_snapshot(ck)
 
     if not force:
         cached = _cache_get(_MENU_CACHE, ck)
@@ -732,9 +735,6 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
             return cached
     else:
         _cache_invalidate(_MENU_CACHE, ck)
-
-    stale_cached = _cache_get_stale(_MENU_CACHE, ck, max_age_seconds=max_stale_age)
-    snapshot_cached = None if force else _load_menu_snapshot(ck)
 
     if not force and snapshot_cached is not None:
         snapshot_ts, snapshot_idx = snapshot_cached
@@ -903,7 +903,7 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
                         cache_key=ck,
                         error_type=type(e).__name__,
                         error=str(e),
-                        cache_age_seconds=_cache_age_seconds(_MENU_CACHE, ck),
+                        cache_age_seconds=stale_cache_age_seconds,
                         cooldown_seconds=MENU_READ_FAILURE_COOLDOWN_SECONDS,
                         fresh_ttl_seconds=MENU_CACHE_TTL_SECONDS,
                         stale_window_seconds=MENU_CACHE_STALE_WINDOW_SECONDS,
