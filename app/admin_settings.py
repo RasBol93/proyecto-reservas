@@ -540,6 +540,12 @@ def _get_header(ws) -> List[str]:
     return [str(x or "").strip() for x in values[0]]
 
 
+def _header_from_values(values: List[List[Any]]) -> List[str]:
+    if not values:
+        return []
+    return [str(x or "").strip() for x in values[0]]
+
+
 def _find_col_idx(header: List[str], col_name: str) -> Optional[int]:
     target = normalize(col_name)
     for i, h in enumerate(header):
@@ -548,12 +554,12 @@ def _find_col_idx(header: List[str], col_name: str) -> Optional[int]:
     return None
 
 
-def _find_row_idx_by_key(ws, key: str) -> Optional[int]:
+def _find_row_idx_by_key_with_values(ws, key: str) -> Tuple[Optional[int], List[List[Any]], List[str]]:
     values = ws.get_all_values()
-    if not values or len(values) < 2:
-        return None
+    if not values:
+        return None, [], []
 
-    header = [str(x or "").strip() for x in values[0]]
+    header = _header_from_values(values)
     key_col = _find_col_idx(header, "key")
     if key_col is None:
         raise RuntimeError("Missing 'key' column in AdminSettings header")
@@ -564,9 +570,60 @@ def _find_row_idx_by_key(ws, key: str) -> Optional[int]:
         row = values[i]
         current = row[key_col] if key_col < len(row) else ""
         if normalize(current).replace(" ", "_") == target:
-            return i + 1
+            return i + 1, values, header
 
-    return None
+    return None, values, header
+
+
+def _find_row_idx_by_key(ws, key: str) -> Optional[int]:
+    row_idx, _, _ = _find_row_idx_by_key_with_values(ws, key)
+    return row_idx
+
+
+def _col_to_a1(col_1based: int) -> str:
+    result = ""
+    n = int(col_1based)
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+def _cell_a1(row_1based: int, col_1based: int) -> str:
+    return f"{_col_to_a1(col_1based)}{int(row_1based)}"
+
+
+def _range_a1(row_1based: int, start_col_1based: int, end_col_1based: int) -> str:
+    return f"{_cell_a1(row_1based, start_col_1based)}:{_cell_a1(row_1based, end_col_1based)}"
+
+
+def _write_full_row(ws, row_index_1based: int, row_values: List[str]) -> None:
+    if not row_values:
+        return
+
+    end_col = len(row_values)
+    ws.update(
+        _range_a1(row_index_1based, 1, end_col),
+        [row_values],
+        value_input_option="RAW",
+    )
+
+
+def _find_next_empty_row_from_values(values: List[List[Any]], header_len: int) -> int:
+    start_row = 2
+
+    if header_len <= 0:
+        return start_row
+
+    if not values or len(values) < start_row:
+        return start_row
+
+    for idx_1based, row in enumerate(values[start_row - 1:], start=start_row):
+        slice_row = row[:header_len]
+        if not any(str(cell).strip() for cell in slice_row):
+            return idx_1based
+
+    return len(values) + 1
 
 
 def _update_admin_setting_cells(
@@ -611,19 +668,22 @@ def _append_admin_setting_row(
     active: bool = True,
     scope: str = "global",
     updated_by: str = "admin_bot",
+    header: Optional[List[str]] = None,
+    values: Optional[List[List[Any]]] = None,
 ) -> None:
-    header = _get_header(ws)
-    if not header:
+    resolved_values = values if isinstance(values, list) else ws.get_all_values()
+    resolved_header = header if isinstance(header, list) and header else _header_from_values(resolved_values)
+    if not resolved_header:
         raise RuntimeError("AdminSettings header row missing")
 
-    row = [""] * len(header)
+    row = [""] * len(resolved_header)
 
-    key_col = _find_col_idx(header, "key")
-    value_col = _find_col_idx(header, "value")
-    active_col = _find_col_idx(header, "active")
-    scope_col = _find_col_idx(header, "scope")
-    updated_at_col = _find_col_idx(header, "updated_at")
-    updated_by_col = _find_col_idx(header, "updated_by")
+    key_col = _find_col_idx(resolved_header, "key")
+    value_col = _find_col_idx(resolved_header, "value")
+    active_col = _find_col_idx(resolved_header, "active")
+    scope_col = _find_col_idx(resolved_header, "scope")
+    updated_at_col = _find_col_idx(resolved_header, "updated_at")
+    updated_by_col = _find_col_idx(resolved_header, "updated_by")
 
     if key_col is not None:
         row[key_col] = normalize(key).replace(" ", "_")
@@ -638,7 +698,11 @@ def _append_admin_setting_row(
     if updated_by_col is not None:
         row[updated_by_col] = str(updated_by)
 
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    next_row = _find_next_empty_row_from_values(
+        values=resolved_values,
+        header_len=len(resolved_header),
+    )
+    _write_full_row(ws, next_row, row)
 
 
 def set_admin_setting_value(
@@ -648,7 +712,7 @@ def set_admin_setting_value(
     updated_by: str = "admin_bot",
 ) -> Dict[str, Any]:
     ws = get_admin_settings_ws(orders_sh)
-    row_idx = _find_row_idx_by_key(ws, key)
+    row_idx, values, header = _find_row_idx_by_key_with_values(ws, key)
 
     if row_idx is None:
         _append_admin_setting_row(
@@ -658,6 +722,8 @@ def set_admin_setting_value(
             active=True,
             scope="global",
             updated_by=updated_by,
+            header=header,
+            values=values,
         )
         try:
             log_event("admin_setting_created", key=key, value=value, updated_by=updated_by)
