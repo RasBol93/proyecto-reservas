@@ -21,6 +21,7 @@ from app.tenants import get_tenant_or_404, load_tenants, tenants_cache_info
 from app.menu import load_menu_index, group_menu_by_category, calc_total_amount
 from app.pickup import generate_public_pickup_slots
 from app.config_bundle import load_config_bundle
+from app.content import upsert_content_entries
 
 try:
     from app.orders import append_order_row
@@ -185,6 +186,20 @@ def _validate_payment_proof_presign_input(filename: str, content_type: str) -> T
     return clean_filename, clean_content_type
 
 
+def _validate_optional_public_url(value: str, *, field_name: str) -> str:
+    clean_value = str(value or "").strip()
+    if not clean_value:
+        return ""
+
+    parsed = urlparse(clean_value)
+    scheme = str(parsed.scheme or "").strip().lower()
+    netloc = str(parsed.netloc or "").strip().lower()
+    if scheme not in {"http", "https"} or not netloc:
+        raise HTTPException(status_code=422, detail=f"{field_name} must be an absolute http/https URL")
+
+    return clean_value
+
+
 def _get_order_for_tenant_or_404(orders_sh, tenant_id: str, order_id: str):
     order = get_order_by_id(orders_sh, order_id)
     if not order:
@@ -322,6 +337,23 @@ class AdminTokenIn(BaseModel):
     token: str
 
 
+class AdminBusinessInfoIn(BaseModel):
+    token: str
+    tenant_id: str
+    restaurant_name: Optional[str] = None
+    welcome_text: Optional[str] = None
+    location_text: Optional[str] = None
+    location_link: Optional[str] = None
+    faq_text: Optional[str] = None
+
+
+class AdminBusinessInfoOut(BaseModel):
+    ok: bool
+    tenant_id: str
+    updated_keys: List[str]
+    values: Dict[str, str]
+
+
 class OrderItem(BaseModel):
     sku: str
     qty: int
@@ -443,6 +475,80 @@ def admin_reload_tenants(payload: AdminTokenIn):
     gc = get_gspread_client()
     load_tenants(gc=gc, force=True)
     return {"ok": True, **tenants_cache_info()}
+
+
+@router.post("/admin/content/business_info", response_model=AdminBusinessInfoOut)
+def admin_update_business_info(payload: AdminBusinessInfoIn):
+    require_admin_token(payload.token)
+    validate_tenant_id(payload.tenant_id)
+
+    fields_set = getattr(payload, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(payload, "__fields_set__", set())
+    provided_fields = set(fields_set or set())
+
+    updates = []
+
+    if "restaurant_name" in provided_fields:
+        restaurant_name = str(payload.restaurant_name or "").strip()
+        if not restaurant_name:
+            raise HTTPException(status_code=422, detail="restaurant_name cannot be empty")
+        updates.append({
+            "key": "restaurant_name",
+            "value": restaurant_name,
+            "active": True,
+        })
+
+    if "welcome_text" in provided_fields:
+        welcome_text = str(payload.welcome_text or "").strip()
+        updates.append({
+            "key": "welcome_text",
+            "value": welcome_text,
+            "active": bool(welcome_text),
+        })
+
+    if "location_text" in provided_fields:
+        location_text = str(payload.location_text or "").strip()
+        updates.append({
+            "key": "location_text",
+            "value": location_text,
+            "active": bool(location_text),
+        })
+
+    if "location_link" in provided_fields:
+        location_link = _validate_optional_public_url(
+            payload.location_link or "",
+            field_name="location_link",
+        )
+        updates.append({
+            "key": "location_link",
+            "value": location_link,
+            "active": bool(location_link),
+        })
+
+    if "faq_text" in provided_fields:
+        faq_text = str(payload.faq_text or "").strip()
+        updates.append({
+            "key": "faq_text",
+            "value": faq_text,
+            "active": bool(faq_text),
+        })
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="No business info fields provided")
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(payload.tenant_id, gc=gc)
+    orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
+    resolved_tenant_id = str(tenant.get("tenant_id") or payload.tenant_id).strip()
+
+    applied = upsert_content_entries(orders_sh, updates)
+    return AdminBusinessInfoOut(
+        ok=True,
+        tenant_id=resolved_tenant_id,
+        updated_keys=sorted(list(applied.keys())),
+        values=applied,
+    )
 
 
 @router.get("/menu")
