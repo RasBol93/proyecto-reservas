@@ -42,7 +42,7 @@ from app.orders import (
     OrdersReadTemporarilyUnavailable,
 )
 from app.payment_flow import notify_admin_payment_reported
-from app.r2_storage import generate_payment_proof_presigned_upload, upload_payment_proof_bytes
+from app.r2_storage import generate_payment_proof_presigned_upload
 from app.webhook_helpers import parse_items_field, fmt_snapshot_lines
 
 from app.validators import (
@@ -614,27 +614,14 @@ def mark_paid(payload: MarkPaidIn):
 
 @router.post("/upload/payment-proof", response_model=PaymentProofUploadOut)
 async def upload_payment_proof(file: UploadFile = File(...)):
-    if file is None:
-        raise HTTPException(status_code=400, detail="file is required")
-
     try:
-        file_bytes = await file.read()
-        uploaded = upload_payment_proof_bytes(
-            file_bytes=file_bytes,
-            filename=str(file.filename or "").strip(),
-            content_type=str(file.content_type or "").strip(),
+        raise HTTPException(
+            status_code=410,
+            detail="Legacy payment proof upload is disabled. Use /upload/payment-proof/presign instead.",
         )
-        return PaymentProofUploadOut(
-            success=True,
-            url=uploaded["url"],
-            object_key=uploaded["object_key"],
-        )
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Could not upload payment proof: {e}")
     finally:
-        await file.close()
+        if file is not None:
+            await file.close()
 
 
 @router.post("/upload/payment-proof/presign", response_model=PaymentProofPresignOut)
