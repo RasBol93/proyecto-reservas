@@ -49,6 +49,10 @@ def admin_panel_kb(user_role: str = "admin"):
         ("⏰ Horarios", "admin_hours"),
     ])
 
+    rows.append([
+        ("🏪 Info general", "admin_business"),
+    ])
+
     return kb(rows)
 
 

@@ -7,6 +7,8 @@ from app.admin_messages_menu import handle_admin_menu_message
 from app.admin_messages_surveys import handle_admin_surveys_message
 from app.admin_messages_orders import handle_admin_orders_message
 from app.admin_messages_promotions import handle_admin_promotions_message
+from app.admin_messages_business import handle_admin_business_message
+from app.admin_callbacks_business import clear_admin_business_state
 
 from app.telegram_api import telegram_send_text
 from app.telegram_keyboard import kb
@@ -250,6 +252,19 @@ def handle_admin_message_impl(
         txt_norm = normalize(text)
         sess = get_sess(tenant_id, chat_id)
         tmp = sess.setdefault("tmp", {})
+        admbiz_mode = str(tmp.get("admbiz_mode") or "").strip()
+
+        if admbiz_mode and txt_norm in ("panel", "âš™ï¸panel", "âš™ï¸ panel", "volver", "cancelar"):
+            clear_admin_business_state(tmp)
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                _build_admin_panel_text(is_owner=is_owner),
+                reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
+                parse_mode="Markdown",
+            )
+            return {"ok": True}
 
         if txt_norm in ("panel", "⚙️panel", "⚙️ panel"):
             assert_admin_authorized(tenant, chat_id, tenant_id)
@@ -274,6 +289,18 @@ def handle_admin_message_impl(
                 msg=msg,
                 tmp=tmp,
             )
+
+        business_result = handle_admin_business_message(
+            tenant=tenant,
+            tenant_id=tenant_id,
+            bot_token=bot_token,
+            chat_id=chat_id,
+            msg=msg,
+            orders_sh=orders_sh,
+            tmp=tmp,
+        )
+        if business_result is not None:
+            return business_result
 
         surveys_result = handle_admin_surveys_message(
             tenant=tenant,
@@ -400,6 +427,19 @@ def handle_admin_message_impl(
         ):
             assert_admin_authorized(tenant, chat_id, tenant_id)
             return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if txt_norm in (
+            "info general",
+            "info general del negocio",
+            "informacion general",
+            "informacion general del negocio",
+            "datos del negocio",
+            "logo",
+        ):
+            from app.admin_callbacks_business import send_admin_business_home
+
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            return {"ok": send_admin_business_home(bot_token, chat_id, tenant_id)}
 
         if txt_norm in (
             "encuestas",

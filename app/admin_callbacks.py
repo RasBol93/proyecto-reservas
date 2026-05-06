@@ -7,6 +7,7 @@ from app.admin_callbacks_surveys import handle_admin_surveys_callback
 from app.admin_callbacks_orders import handle_admin_orders_callback
 from app.admin_callbacks_hours import handle_admin_hours_routed_callback
 from app.admin_callbacks_promotions import handle_admin_promotions_callback
+from app.admin_callbacks_business import handle_admin_business_callback
 
 from app.telegram_api import telegram_send_text
 from app.utils import log_event
@@ -86,6 +87,18 @@ def handle_admin_callback_impl(
             assert_admin_authorized(tenant, chat_id, tenant_id)
             sess = get_sess(tenant_id, chat_id)
             return {"ok": send_admin_promotions_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        if data == "admin_business":
+            business_result = handle_admin_business_callback(
+                tenant=tenant,
+                tenant_id=tenant_id,
+                bot_token=bot_token,
+                chat_id=chat_id,
+                data=data,
+                get_effective_admin_role=_effective_admin_role,
+            )
+            if business_result is not None:
+                return business_result
 
         if data == "admin_payments":
             assert_admin_authorized(tenant, chat_id, tenant_id)
@@ -243,6 +256,17 @@ def handle_admin_callback_impl(
         )
         if promotions_result is not None:
             return promotions_result
+
+        business_result = handle_admin_business_callback(
+            tenant=tenant,
+            tenant_id=tenant_id,
+            bot_token=bot_token,
+            chat_id=chat_id,
+            data=data,
+            get_effective_admin_role=_effective_admin_role,
+        )
+        if business_result is not None:
+            return business_result
 
         menu_result = handle_admin_menu_callback(
             tenant=tenant,
