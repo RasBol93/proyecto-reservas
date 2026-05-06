@@ -1116,6 +1116,9 @@ def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str,
     - sí devuelve row_index y active
     """
     ck = _cache_key_for_orders_sh(orders_sh)
+    max_stale_age = MENU_CACHE_TTL_SECONDS + MENU_CACHE_STALE_WINDOW_SECONDS
+    stale_cached = _cache_get_stale(_MENU_ADMIN_CACHE, ck, max_age_seconds=max_stale_age)
+    stale_cache_age_seconds = _cache_age_seconds(_MENU_ADMIN_CACHE, ck) if stale_cached is not None else None
 
     if not force:
         cached = _cache_get(_MENU_ADMIN_CACHE, ck)
@@ -1223,12 +1226,28 @@ def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str,
 
     except Exception as e:
         if _should_retry_exception(e):
+            if stale_cached is not None:
+                try:
+                    log_event(
+                        "menu_admin_load_failed_serving_stale",
+                        cache_key=ck,
+                        error_type=type(e).__name__,
+                        error=str(e),
+                        cache_age_seconds=stale_cache_age_seconds,
+                        fresh_ttl_seconds=MENU_CACHE_TTL_SECONDS,
+                        stale_window_seconds=MENU_CACHE_STALE_WINDOW_SECONDS,
+                        force=bool(force),
+                    )
+                except Exception:
+                    pass
+                return stale_cached
             try:
                 log_event(
                     "menu_admin_load_transient_failure",
                     cache_key=ck,
                     error_type=type(e).__name__,
                     error=str(e),
+                    force=bool(force),
                 )
             except Exception:
                 pass
@@ -1279,9 +1298,61 @@ def get_menu_product_or_404(orders_sh, sku: str) -> Dict[str, Any]:
     return item
 
 
-def set_menu_product_active(orders_sh, sku: str, is_active: bool) -> Dict[str, Any]:
-    item = get_menu_product_or_404(orders_sh, sku)
+def _get_menu_product_context_or_404(orders_sh, sku: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    clean_sku = str(sku or "").strip()
+    if not clean_sku:
+        raise HTTPException(status_code=400, detail="sku is required")
+
     ctx = _get_menu_context(orders_sh)
+    values = ctx["values"]
+    header_row_1based = int(ctx["header_row_1based"])
+    idx_map = ctx["idx_map"]
+
+    for ridx in range(header_row_1based + 1, len(values) + 1):
+        row = values[ridx - 1]
+        if not any(str(x).strip() for x in row):
+            continue
+
+        def g(col_name: str) -> str:
+            i = idx_map.get(normalize(col_name))
+            if i is None:
+                return ""
+            return row[i] if i < len(row) else ""
+
+        row_sku = str(g("sku") or "").strip()
+        name = str(g("name") or "").strip()
+        price_raw = str(g("price") or "").strip()
+        active_raw = str(g("active") or "").strip()
+        category = str(g("category") or "").strip() or "Otros"
+        photo_file_id = str(g("photo_file_id") or "").strip()
+        photo_url = str(g("photo_url") or "").strip()
+
+        if _looks_like_headerish_menu_row(row_sku, name, price_raw, active_raw, category):
+            continue
+
+        if row_sku != clean_sku:
+            continue
+
+        price = _parse_price(price_raw)
+        if price is None:
+            price = 0.0
+
+        return {
+            "sku": row_sku,
+            "name": name,
+            "price": float(price),
+            "category": category,
+            "active": bool(to_bool(active_raw)),
+            "photo_file_id": photo_file_id,
+            "photo_url": photo_url,
+            "row_index": ridx,
+        }, ctx
+
+    raise HTTPException(status_code=404, detail=f"Product not found: {clean_sku}")
+
+
+def set_menu_product_active(orders_sh, sku: str, is_active: bool) -> Dict[str, Any]:
+    item, ctx = _get_menu_product_context_or_404(orders_sh, sku)
     ws = ctx["ws"]
     idx_map = ctx["idx_map"]
 
@@ -1308,8 +1379,7 @@ def set_menu_product_active(orders_sh, sku: str, is_active: bool) -> Dict[str, A
 
 
 def set_menu_product_price(orders_sh, sku: str, new_price: float) -> Dict[str, Any]:
-    item = get_menu_product_or_404(orders_sh, sku)
-    ctx = _get_menu_context(orders_sh)
+    item, ctx = _get_menu_product_context_or_404(orders_sh, sku)
     ws = ctx["ws"]
     idx_map = ctx["idx_map"]
 
@@ -1359,8 +1429,7 @@ def get_menu_categories(orders_sh) -> List[str]:
 
 
 def _set_menu_product_text_field(orders_sh, sku: str, field_name: str, new_value: str) -> Dict[str, Any]:
-    item = get_menu_product_or_404(orders_sh, sku)
-    ctx = _get_menu_context(orders_sh)
+    item, ctx = _get_menu_product_context_or_404(orders_sh, sku)
     ws = ctx["ws"]
     idx_map = ctx["idx_map"]
 
@@ -1412,8 +1481,19 @@ def set_menu_product_category(orders_sh, sku: str, new_category: str) -> Dict[st
 
 
 def _generate_menu_product_sku(orders_sh) -> str:
-    idx = load_menu_admin_index(orders_sh, force=True)
-    existing_skus = set(idx.keys())
+    ctx = _get_menu_context(orders_sh)
+    values = ctx["values"]
+    header_row_1based = int(ctx["header_row_1based"])
+    idx_map = ctx["idx_map"]
+    existing_skus = set()
+
+    sku_idx = idx_map.get(normalize("sku"))
+    if sku_idx is not None:
+        for row in values[header_row_1based:]:
+            sku = row[sku_idx] if sku_idx < len(row) else ""
+            clean_sku = str(sku or "").strip()
+            if clean_sku:
+                existing_skus.add(clean_sku)
 
     base = f"p_{int(time.time())}"
     if base not in existing_skus:
