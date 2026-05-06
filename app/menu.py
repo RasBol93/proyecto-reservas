@@ -119,7 +119,16 @@ def _ws_has_required_headers(ws, required_headers: List[str], max_scan_rows: int
             log_fields={"worksheet_title": getattr(ws, "title", "")},
         )
     except Exception as e:
-        alert_system_error(error=str(e), module="menu._ws_has_required_headers")
+        try:
+            log_event(
+                "menu_ws_headers_probe_failed",
+                worksheet_title=getattr(ws, "title", ""),
+                error_type=type(e).__name__,
+                error=str(e),
+                transient=_should_retry_exception(e),
+            )
+        except Exception:
+            pass
         return False
 
     if not values:
@@ -146,7 +155,15 @@ def _find_menu_ws_by_headers(orders_sh) -> Optional[Any]:
             if _ws_has_required_headers(ws, REQUIRED_MENU_HEADERS):
                 return ws
     except Exception as e:
-        alert_system_error(error=str(e), module="menu._find_menu_ws_by_headers")
+        try:
+            log_event(
+                "menu_ws_autodetect_failed",
+                error_type=type(e).__name__,
+                error=str(e),
+                transient=_should_retry_exception(e),
+            )
+        except Exception:
+            pass
         return None
     return None
 
@@ -381,10 +398,18 @@ def _maybe_alert_transient_menu_failure(cache_key: str, error: Exception, *, ser
     if not _should_emit_transient_menu_alert(cache_key):
         return
 
-    alert_system_error(
-        error=str(error),
-        module="menu.load_menu_index_transient_stale" if served_stale else "menu.load_menu_index_transient",
-    )
+    try:
+        log_event(
+            "menu_transient_failure",
+            cache_key=cache_key,
+            error_type=type(error).__name__,
+            error=str(error),
+            served_fallback=bool(served_stale),
+            cooldown_seconds=MENU_TRANSIENT_ALERT_COOLDOWN_SECONDS,
+            module="menu.load_menu_index_transient_stale" if served_stale else "menu.load_menu_index_transient",
+        )
+    except Exception:
+        pass
 
 
 def _set_last_menu_serve_source(cache_key: str, source: str) -> None:
@@ -520,7 +545,16 @@ def _get_menu_context(orders_sh) -> Dict[str, Any]:
             log_fields={"worksheet_title": getattr(ws, "title", "")},
         )
     except Exception as e:
-        alert_system_error(error=str(e), module="menu._get_menu_context")
+        try:
+            log_event(
+                "menu_context_read_failed",
+                worksheet_title=getattr(ws, "title", ""),
+                error_type=type(e).__name__,
+                error=str(e),
+                transient=_should_retry_exception(e),
+            )
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"Cannot read Menu worksheet: {e}")
 
     if not values:
@@ -1188,7 +1222,18 @@ def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str,
         return idx
 
     except Exception as e:
-        alert_system_error(error=str(e), module="menu.load_menu_admin_index")
+        if _should_retry_exception(e):
+            try:
+                log_event(
+                    "menu_admin_load_transient_failure",
+                    cache_key=ck,
+                    error_type=type(e).__name__,
+                    error=str(e),
+                )
+            except Exception:
+                pass
+        else:
+            alert_system_error(error=str(e), module="menu.load_menu_admin_index")
         raise
 
 
