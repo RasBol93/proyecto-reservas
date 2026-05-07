@@ -49,8 +49,16 @@ def admin_business_home_kb(tenant_id: str):
         [("Dirección", f"admbiz|{tenant_id}|edit|location_text")],
         [("Link ubicación", f"admbiz|{tenant_id}|edit|location_link")],
         [("FAQ", f"admbiz|{tenant_id}|edit|faq_text")],
-        [("Logo", f"admbiz|{tenant_id}|edit|logo_url")],
+        [("Logo", f"admbiz|{tenant_id}|logo")],
         [("⬅️ Volver", f"admbiz|{tenant_id}|panel")],
+    ])
+
+
+def admin_business_logo_kb(tenant_id: str):
+    return kb([
+        [("🔗 Pegar URL", f"admbiz|{tenant_id}|edit|logo_url")],
+        [("📷 Subir foto", f"admbiz|{tenant_id}|logo_upload")],
+        [("⬅️ Volver", f"admbiz|{tenant_id}|home")],
     ])
 
 
@@ -64,6 +72,19 @@ def send_admin_business_home(bot_token: str, chat_id: int, tenant_id: str) -> bo
             "Elige el campo que quieres editar:"
         ),
         reply_markup=admin_business_home_kb(tenant_id),
+        parse_mode="Markdown",
+    )
+
+
+def send_admin_business_logo_menu(bot_token: str, chat_id: int, tenant_id: str) -> bool:
+    return _safe_send_text(
+        bot_token,
+        chat_id,
+        (
+            "🖼 *LOGO DEL NEGOCIO*\n\n"
+            "Puedes pegar una URL pública o subir una foto del logo."
+        ),
+        reply_markup=admin_business_logo_kb(tenant_id),
         parse_mode="Markdown",
     )
 
@@ -132,6 +153,10 @@ def handle_admin_business_callback(
         clear_admin_business_state(tmp)
         return {"ok": send_admin_business_home(bot_token, chat_id, tenant_id)}
 
+    if action == "logo":
+        clear_admin_business_state(tmp)
+        return {"ok": send_admin_business_logo_menu(bot_token, chat_id, tenant_id)}
+
     if action == "panel":
         clear_admin_business_state(tmp)
         user_role = get_effective_admin_role(tenant, chat_id)
@@ -141,6 +166,24 @@ def handle_admin_business_callback(
                 chat_id,
                 "🧭 PANEL ADMIN\n\nElige una opción:",
                 reply_markup=admin_panel_kb(user_role=user_role),
+            )
+        }
+
+    if action == "logo_upload":
+        clear_admin_business_state(tmp)
+        tmp["admbiz_mode"] = "awaiting_logo_photo"
+        return {
+            "ok": _safe_send_text(
+                bot_token,
+                chat_id,
+                (
+                    "📷 *Subir logo del negocio*\n\n"
+                    "Envíame una foto del logo.\n"
+                    "Formatos permitidos: JPG, PNG o WEBP.\n"
+                    "Tamaño máximo: 5 MB."
+                ),
+                reply_markup=admin_business_logo_kb(tenant_id),
+                parse_mode="Markdown",
             )
         }
 

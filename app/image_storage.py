@@ -271,3 +271,18 @@ def upload_product_photo_for_tenant(
             module="image_storage.main",
         )
         raise
+
+
+def upload_business_logo_for_tenant(
+    tenant: Dict[str, Any],
+    tenant_id: str,
+    file_bytes: bytes,
+    mime_type: str = "image/jpeg",
+) -> str:
+    return upload_product_photo_for_tenant(
+        tenant=tenant,
+        tenant_id=tenant_id,
+        sku="business_logo",
+        file_bytes=file_bytes,
+        mime_type=mime_type,
+    )
