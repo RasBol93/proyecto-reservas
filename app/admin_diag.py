@@ -254,7 +254,7 @@ def _safe_count_data_rows(ws) -> int:
 def _safe_menu_runtime(orders_sh) -> Dict[str, Any]:
     try:
         menu_idx = load_menu_admin_index(orders_sh, force=False)
-        cats = group_menu_admin_by_category(menu_idx)
+        cats = group_menu_admin_by_category(menu_idx, orders_sh=orders_sh)
 
         active_products = 0
         inactive_products = 0

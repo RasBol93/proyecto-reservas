@@ -119,8 +119,8 @@ def handle_admin_menu_callback(
 
         _clear_admin_menu_session_cache(tmp)
         menu_idx = load_menu_admin_index(orders_sh, force=True)
-        cats = group_menu_admin_by_category(menu_idx)
-        cat_names = sorted(cats.keys(), key=lambda x: normalize(x))
+        cats = group_menu_admin_by_category(menu_idx, orders_sh=orders_sh)
+        cat_names = list(cats.keys())
 
         if idx < 0 or idx >= len(cat_names):
             return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}

@@ -317,8 +317,8 @@ def handle_admin_promotions_callback(
             # usamos la pantalla para recalcular de forma consistente
             _menu_idx2 = load_menu_admin_index(orders_sh, force=False)
             from app.menu import group_menu_admin_by_category
-            cats = group_menu_admin_by_category(_menu_idx2)
-            cat_names = sorted(cats.keys(), key=lambda x: x.lower())
+            cats = group_menu_admin_by_category(_menu_idx2, orders_sh=orders_sh)
+            cat_names = list(cats.keys())
 
             if idx < 0 or idx >= len(cat_names):
                 return {"ok": send_admin_promotions_discount_categories(
@@ -408,8 +408,8 @@ def handle_admin_promotions_callback(
 
             _menu_idx2 = load_menu_admin_index(orders_sh, force=False)
             from app.menu import group_menu_admin_by_category
-            cats = group_menu_admin_by_category(_menu_idx2)
-            cat_names = sorted(cats.keys(), key=lambda x: x.lower())
+            cats = group_menu_admin_by_category(_menu_idx2, orders_sh=orders_sh)
+            cat_names = list(cats.keys())
 
             if idx < 0 or idx >= len(cat_names):
                 return {"ok": send_admin_promotions_combo_categories(

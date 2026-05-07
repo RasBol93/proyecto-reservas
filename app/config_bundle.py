@@ -16,7 +16,7 @@ from app.admin_settings import (
     get_admin_settings_runtime_status,
     load_admin_settings,
 )
-from app.menu import get_menu_runtime_status, load_menu_index
+from app.menu import get_menu_runtime_status, load_menu_index, resolve_effective_category_order
 from app.pickup import _get_today_business_window, get_pickup_config
 from app.promotions import get_promotions_runtime_status, load_promotions
 from app.sheets import get_gspread_client, note_sheets_serving_source, open_spreadsheet_by_key
@@ -581,16 +581,29 @@ def _build_payment_info_payload(tenant: Dict[str, Any], content_map: Dict[str, s
     return payload
 
 
-def _build_menu_payload(menu_idx: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _build_menu_payload(
+    menu_idx: Dict[str, Dict[str, Any]],
+    orders_sh=None,
+    *,
+    content_map: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
+    category_names_in_order: List[str] = []
+    seen_categories = set()
 
     for item in menu_idx.values():
+        category_name = _safe_str(item.get("category")) or "Otros"
+        category_key = normalize(category_name)
+        if category_key and category_key not in seen_categories:
+            seen_categories.add(category_key)
+            category_names_in_order.append(category_name)
+
         row: Dict[str, Any] = {
             "sku": _safe_str(item.get("sku")),
             "name": _safe_str(item.get("name")),
             "price": _safe_float(item.get("price"), 0.0),
             "active": True,
-            "category": _safe_str(item.get("category")) or "Otros",
+            "category": category_name,
         }
 
         photo_url = _safe_str(item.get("photo_url"))
@@ -603,7 +616,20 @@ def _build_menu_payload(menu_idx: Dict[str, Dict[str, Any]]) -> List[Dict[str, A
 
         items.append(row)
 
-    items.sort(key=lambda x: (normalize(x.get("category", "")), normalize(x.get("name", ""))))
+    ordered_category_names = resolve_effective_category_order(
+        category_names_in_order,
+        orders_sh=orders_sh,
+        content_map=content_map,
+    )
+    order_index = {normalize(cat_name): idx for idx, cat_name in enumerate(ordered_category_names)}
+
+    items.sort(
+        key=lambda x: (
+            order_index.get(normalize(x.get("category", "")), len(order_index)),
+            normalize(x.get("category", "")),
+            normalize(x.get("name", "")),
+        )
+    )
     return items
 
 
@@ -757,7 +783,7 @@ def build_config_bundle(
         "content": _build_content_payload(resolved_tenant, content_map),
         "admin_settings": _build_admin_settings_payload(settings_map),
         "payment_info": _build_payment_info_payload(resolved_tenant, content_map),
-        "menu": _build_menu_payload(menu_idx),
+        "menu": _build_menu_payload(menu_idx, resolved_orders_sh, content_map=content_map),
         "open_status": _build_open_status_payload(pickup_payload),
         "metadata": {
             "tenant_id": resolved_tenant_id,

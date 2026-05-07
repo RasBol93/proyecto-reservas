@@ -114,7 +114,7 @@ def _build_categories_kb(tenant_id: str, cats: Dict[str, List[Dict[str, Any]]], 
     Se conserva por compatibilidad. La UX principal la arma admin_promotions.py,
     pero no eliminamos este helper para no romper futuras referencias.
     """
-    cat_names = sorted(cats.keys(), key=lambda x: normalize(x))
+    cat_names = list(cats.keys())
     rows = []
 
     for idx, cat in enumerate(cat_names[:30]):

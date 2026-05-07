@@ -140,8 +140,8 @@ def _get_menu_cached(sess: Dict[str, Any], orders_sh):
         return cached
 
     menu_idx = load_menu_admin_index(orders_sh, force=False)
-    cats = group_menu_admin_by_category(menu_idx)
-    cat_names = sorted(cats.keys(), key=lambda x: normalize(x))
+    cats = group_menu_admin_by_category(menu_idx, orders_sh=orders_sh)
+    cat_names = list(cats.keys())
 
     tmp["admin_promo_menu_cache"] = (menu_idx, cats, cat_names)
     return tmp["admin_promo_menu_cache"]

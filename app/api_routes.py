@@ -564,7 +564,7 @@ def get_menu(tenant_id: str = Query(...)):
 
     orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
     menu_idx = load_menu_index(orders_sh)
-    categories = group_menu_by_category(menu_idx)
+    categories = group_menu_by_category(menu_idx, orders_sh=orders_sh)
 
     return {"ok": True, "tenant_id": tenant_id, "categories": categories}
 

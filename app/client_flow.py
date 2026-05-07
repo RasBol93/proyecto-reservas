@@ -593,7 +593,7 @@ def handle_client_callback(
 
             try:
                 menu_idx = load_menu_index(orders_sh)
-                cats = group_menu_by_category(menu_idx)
+                cats = group_menu_by_category(menu_idx, orders_sh=orders_sh)
             except Exception as e:
                 log_event(
                     "client_menu_load_error",
@@ -612,7 +612,7 @@ def handle_client_callback(
                 return {"ok": True}
 
             rows = []
-            for c in sorted(cats.keys(), key=lambda x: normalize(x)):
+            for c in cats.keys():
                 rows.append([(c, f"cat|{normalize(c)}")])
             rows.append([("🛒 Carrito", "cart")])
             rows.append([("🏠 Inicio", "home")])
@@ -628,7 +628,7 @@ def handle_client_callback(
 
             try:
                 menu_idx = load_menu_index(orders_sh)
-                cats = group_menu_by_category(menu_idx)
+                cats = group_menu_by_category(menu_idx, orders_sh=orders_sh)
             except Exception as e:
                 log_event(
                     "client_category_load_error",

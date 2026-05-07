@@ -6,6 +6,7 @@ import time
 
 from fastapi import HTTPException
 
+from app.content import load_content_map
 from app.sheets import get_ws, read_records_manual, detect_header_row, note_sheets_serving_source
 from app.utils import to_bool, normalize, log_event
 from app.alerts import alert_system_error, alert_tenant_error
@@ -823,6 +824,98 @@ def _build_virtual_promotions_index(orders_sh, menu_idx: Dict[str, Dict[str, Any
     return result
 
 
+def _load_menu_category_order_config(
+    orders_sh=None,
+    *,
+    content_map: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    resolved_content_map = content_map if isinstance(content_map, dict) else None
+
+    if resolved_content_map is None and orders_sh is not None:
+        try:
+            resolved_content_map = load_content_map(orders_sh, force=False)
+        except Exception:
+            resolved_content_map = {}
+
+    raw_value = str((resolved_content_map or {}).get(normalize("menu_category_order_json")) or "").strip()
+    if not raw_value:
+        return []
+
+    try:
+        parsed = json.loads(raw_value)
+    except Exception:
+        return []
+
+    if not isinstance(parsed, list):
+        return []
+
+    ordered_names: List[str] = []
+    seen = set()
+
+    for item in parsed:
+        clean_name = str(item or "").strip()
+        clean_key = normalize(clean_name)
+        if not clean_key or clean_key in seen:
+            continue
+        seen.add(clean_key)
+        ordered_names.append(clean_name)
+
+    return ordered_names
+
+
+def resolve_effective_category_order(
+    category_names: List[str],
+    orders_sh=None,
+    *,
+    content_map: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    existing_by_key: Dict[str, str] = {}
+    existing_keys_in_order: List[str] = []
+
+    for category_name in category_names or []:
+        clean_name = str(category_name or "").strip()
+        clean_key = normalize(clean_name)
+        if not clean_key or clean_key in existing_by_key:
+            continue
+        existing_by_key[clean_key] = clean_name
+        existing_keys_in_order.append(clean_key)
+
+    if not existing_keys_in_order:
+        return []
+
+    configured_order = _load_menu_category_order_config(orders_sh, content_map=content_map)
+    ordered_keys: List[str] = []
+    seen = set()
+    promotions_key = normalize(PROMOTIONS_CATEGORY_NAME)
+
+    for configured_name in configured_order:
+        configured_key = normalize(configured_name)
+        if configured_key not in existing_by_key or configured_key in seen:
+            continue
+        ordered_keys.append(configured_key)
+        seen.add(configured_key)
+
+    for existing_key in existing_keys_in_order:
+        if existing_key == promotions_key:
+            continue
+        if existing_key in seen:
+            continue
+        ordered_keys.append(existing_key)
+        seen.add(existing_key)
+
+    if promotions_key in existing_by_key and promotions_key not in seen:
+        ordered_keys.append(promotions_key)
+        seen.add(promotions_key)
+
+    for existing_key in existing_keys_in_order:
+        if existing_key in seen:
+            continue
+        ordered_keys.append(existing_key)
+        seen.add(existing_key)
+
+    return [existing_by_key[key] for key in ordered_keys if key in existing_by_key]
+
+
 # -------------------------
 # Public API (cliente)
 # -------------------------
@@ -1045,7 +1138,12 @@ def load_menu_index(orders_sh, force: bool = False) -> Dict[str, Dict[str, Any]]
         raise
 
 
-def group_menu_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+def group_menu_by_category(
+    menu_idx: Dict[str, Dict[str, Any]],
+    orders_sh=None,
+    *,
+    content_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
     cats: Dict[str, List[Dict[str, Any]]] = {}
 
     for item in menu_idx.values():
@@ -1077,7 +1175,22 @@ def group_menu_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, Lis
         else:
             cats[cat] = sorted(cats[cat], key=lambda x: normalize(x.get("name", "")))
 
-    return cats
+    ordered_cat_names = resolve_effective_category_order(
+        list(cats.keys()),
+        orders_sh=orders_sh,
+        content_map=content_map,
+    )
+    ordered_cats: Dict[str, List[Dict[str, Any]]] = {}
+
+    for cat_name in ordered_cat_names:
+        if cat_name in cats:
+            ordered_cats[cat_name] = cats[cat_name]
+
+    for cat_name, items in cats.items():
+        if cat_name not in ordered_cats:
+            ordered_cats[cat_name] = items
+
+    return ordered_cats
 
 
 def calc_total_amount(items: List[Dict[str, Any]], menu_idx: Dict[str, Dict[str, Any]]) -> float:
@@ -1256,7 +1369,12 @@ def load_menu_admin_index(orders_sh, force: bool = False) -> Dict[str, Dict[str,
         raise
 
 
-def group_menu_admin_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+def group_menu_admin_by_category(
+    menu_idx: Dict[str, Dict[str, Any]],
+    orders_sh=None,
+    *,
+    content_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
     cats: Dict[str, List[Dict[str, Any]]] = {}
 
     for item in menu_idx.values():
@@ -1277,7 +1395,22 @@ def group_menu_admin_by_category(menu_idx: Dict[str, Dict[str, Any]]) -> Dict[st
     for cat in cats:
         cats[cat] = sorted(cats[cat], key=lambda x: normalize(x.get("name", "")))
 
-    return cats
+    ordered_cat_names = resolve_effective_category_order(
+        list(cats.keys()),
+        orders_sh=orders_sh,
+        content_map=content_map,
+    )
+    ordered_cats: Dict[str, List[Dict[str, Any]]] = {}
+
+    for cat_name in ordered_cat_names:
+        if cat_name in cats:
+            ordered_cats[cat_name] = cats[cat_name]
+
+    for cat_name, items in cats.items():
+        if cat_name not in ordered_cats:
+            ordered_cats[cat_name] = items
+
+    return ordered_cats
 
 
 def get_menu_product_or_404(orders_sh, sku: str) -> Dict[str, Any]:
@@ -1425,7 +1558,7 @@ def get_menu_categories(orders_sh) -> List[str]:
         seen.add(key)
         categories.append(category)
 
-    return sorted(categories, key=lambda x: normalize(x))
+    return resolve_effective_category_order(categories, orders_sh=orders_sh)
 
 
 def _set_menu_product_text_field(orders_sh, sku: str, field_name: str, new_value: str) -> Dict[str, Any]:

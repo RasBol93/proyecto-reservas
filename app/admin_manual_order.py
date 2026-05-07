@@ -27,7 +27,7 @@ def _get_menu_cached(sess: Dict[str, Any], orders_sh):
         return cached
 
     menu_idx = load_menu_admin_index(orders_sh, force=False)
-    cats_raw = group_menu_admin_by_category(menu_idx)
+    cats_raw = group_menu_admin_by_category(menu_idx, orders_sh=orders_sh)
 
     cats_active: Dict[str, List[Dict[str, Any]]] = {}
     for cat, items in cats_raw.items():
@@ -35,7 +35,7 @@ def _get_menu_cached(sess: Dict[str, Any], orders_sh):
         if only_active:
             cats_active[cat] = only_active
 
-    cat_names = sorted(cats_active.keys(), key=lambda x: normalize(x))
+    cat_names = list(cats_active.keys())
 
     tmp["admin_order_menu_cache"] = (menu_idx, cats_active, cat_names)
     return tmp["admin_order_menu_cache"]
@@ -69,7 +69,7 @@ def _admin_order_get_active_categories(orders_sh) -> Tuple[Dict[str, Any], Dict[
     Se mantiene por compatibilidad con admin_callbacks_orders.py
     """
     menu_idx = load_menu_admin_index(orders_sh, force=False)
-    cats_raw = group_menu_admin_by_category(menu_idx)
+    cats_raw = group_menu_admin_by_category(menu_idx, orders_sh=orders_sh)
 
     cats_active: Dict[str, List[Dict[str, Any]]] = {}
     for cat, items in cats_raw.items():
@@ -77,7 +77,7 @@ def _admin_order_get_active_categories(orders_sh) -> Tuple[Dict[str, Any], Dict[
         if only_active:
             cats_active[cat] = only_active
 
-    cat_names = sorted(cats_active.keys(), key=lambda x: normalize(x))
+    cat_names = list(cats_active.keys())
     return menu_idx, cats_active, cat_names
 
 
