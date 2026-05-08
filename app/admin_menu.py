@@ -1,5 +1,3 @@
-# app/admin_menu.py — versión completa compatible y optimizada
-
 from typing import Any, Dict, List, Tuple
 
 from app.menu import (
@@ -9,7 +7,6 @@ from app.menu import (
 )
 from app.telegram_api import telegram_send_text
 from app.telegram_keyboard import kb
-from app.utils import normalize
 from app.webhook_helpers import fmt_price_short
 
 
@@ -22,10 +19,6 @@ PRICE_STEP_OPTIONS: List[Tuple[str, float]] = [
     ("+10", 10.0),
 ]
 
-
-# -------------------------
-# Cache simple por sesión
-# -------------------------
 
 def _get_menu_cached(sess: Dict[str, Any], orders_sh):
     tmp = sess.setdefault("tmp", {})
@@ -46,9 +39,22 @@ def _clear_menu_cache(sess: Dict[str, Any]) -> None:
     sess.setdefault("tmp", {}).pop("admin_menu_cache", None)
 
 
-# -------------------------
-# Home
-# -------------------------
+def _rebuild_ordered_cats(
+    cats: Dict[str, List[Dict[str, Any]]],
+    ordered_names: List[str],
+) -> Dict[str, List[Dict[str, Any]]]:
+    ordered: Dict[str, List[Dict[str, Any]]] = {}
+
+    for cat_name in ordered_names or []:
+        if cat_name in cats:
+            ordered[cat_name] = cats[cat_name]
+
+    for cat_name, items in cats.items():
+        if cat_name not in ordered:
+            ordered[cat_name] = items
+
+    return ordered
+
 
 def admin_menu_home_kb(tenant_id: str, cats: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
     cat_names = list(cats.keys())
@@ -60,6 +66,7 @@ def admin_menu_home_kb(tenant_id: str, cats: Dict[str, List[Dict[str, Any]]]) ->
         active_n = sum(1 for it in items if bool(it.get("active", False)))
         rows.append([(f"📂 {cat} ({active_n}/{total_n})", f"admmenu|{tenant_id}|cat|{idx}")])
 
+    rows.append([("↕️ Orden de categorías", f"admmenu|{tenant_id}|catorder")])
     rows.append([("➕ Crear producto", f"admmenu|{tenant_id}|create_product")])
     rows.append([("🔄 Refrescar menú", f"admmenu|{tenant_id}|refresh")])
     rows.append([("⬅️ Volver al panel", f"admmenu|{tenant_id}|panel")])
@@ -96,9 +103,83 @@ def send_admin_menu_home(bot_token: str, chat_id: int, tenant_id: str, orders_sh
     )
 
 
-# -------------------------
-# Categoría
-# -------------------------
+def _build_category_order_lines(cat_names: List[str], selected_idx: int = -1) -> List[str]:
+    lines: List[str] = []
+
+    for idx, cat_name in enumerate(cat_names or [], start=1):
+        marker = "➡️ " if (idx - 1) == selected_idx else ""
+        lines.append(f"{idx}. {marker}{cat_name}")
+
+    return lines
+
+
+def admin_menu_category_order_kb(
+    tenant_id: str,
+    cat_names: List[str],
+    *,
+    selected_idx: int = -1,
+) -> Dict[str, Any]:
+    rows: List[List[Tuple[str, str]]] = []
+
+    for idx, cat_name in enumerate(cat_names[:20]):
+        label = f"{idx + 1}. {cat_name}"
+        if idx == selected_idx:
+            label = f"➡️ {label}"
+        rows.append([(label, f"admmenu|{tenant_id}|catorder_pick|{idx}")])
+
+    rows.append([
+        ("⬆️ Subir", f"admmenu|{tenant_id}|catorder_up"),
+        ("⬇️ Bajar", f"admmenu|{tenant_id}|catorder_down"),
+    ])
+    rows.append([("✅ Guardar orden", f"admmenu|{tenant_id}|catorder_save")])
+    rows.append([("🔄 Resetear", f"admmenu|{tenant_id}|catorder_reset")])
+    rows.append([("⬅️ Volver", f"admmenu|{tenant_id}|home")])
+    return kb(rows)
+
+
+def send_admin_menu_category_order(
+    bot_token: str,
+    chat_id: int,
+    tenant_id: str,
+    sess: Dict[str, Any],
+) -> bool:
+    tmp = sess.setdefault("tmp", {})
+    cat_names = list(tmp.get("admin_menu_order_categories") or [])
+    selected_idx = int(tmp.get("admin_menu_order_selected_idx") or -1)
+
+    if not cat_names:
+        return telegram_send_text(
+            bot_token,
+            chat_id,
+            "No hay categorías disponibles para ordenar.",
+            reply_markup=kb([
+                [("⬅️ Volver al menú", f"admmenu|{tenant_id}|home")],
+            ]),
+        )
+
+    selected_line = ""
+    if 0 <= selected_idx < len(cat_names):
+        selected_line = f"\nCategoría seleccionada: {cat_names[selected_idx]}"
+
+    msg = (
+        "↕️ ORDEN DE CATEGORÍAS\n\n"
+        "Orden actual:\n"
+        + "\n".join(_build_category_order_lines(cat_names, selected_idx))
+        + f"{selected_line}\n\n"
+        "Elige una categoría y usa los botones para subirla o bajarla."
+    )
+
+    return telegram_send_text(
+        bot_token,
+        chat_id,
+        msg,
+        reply_markup=admin_menu_category_order_kb(
+            tenant_id,
+            cat_names,
+            selected_idx=selected_idx,
+        ),
+    )
+
 
 def admin_menu_category_kb(tenant_id: str, category: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
     rows: List[List[Tuple[str, str]]] = []
@@ -107,7 +188,7 @@ def admin_menu_category_kb(tenant_id: str, category: str, items: List[Dict[str, 
         emoji = "🟢" if bool(it.get("active", False)) else "🔴"
         price_txt = fmt_price_short(it.get("price", 0))
         sku = str(it.get("sku") or "").strip()
-        rows.append([(f"{emoji} {it.get('name','')} — Bs {price_txt}", f"admmenu|{tenant_id}|prd|{sku}")])
+        rows.append([(f"{emoji} {it.get('name', '')} — Bs {price_txt}", f"admmenu|{tenant_id}|prd|{sku}")])
 
     rows.append([("🔄 Refrescar categoría", f"admmenu|{tenant_id}|catrefresh")])
     rows.append([("⬅️ Categorías", f"admmenu|{tenant_id}|home")])
@@ -151,10 +232,6 @@ def send_admin_menu_category(
     )
 
 
-# -------------------------
-# Producto
-# -------------------------
-
 def admin_menu_product_kb(tenant_id: str, sku: str, active: bool) -> Dict[str, Any]:
     toggle_label = "⛔ Desactivar" if active else "✅ Activar"
 
@@ -193,8 +270,8 @@ def send_admin_menu_product_detail(
 
     msg = (
         "🧾 DETALLE DE PRODUCTO\n\n"
-        f"Nombre: {item.get('name','')}\n"
-        f"Categoría: {item.get('category','')}\n"
+        f"Nombre: {item.get('name', '')}\n"
+        f"Categoría: {item.get('category', '')}\n"
         f"Activo: {active_txt}\n"
         f"Precio actual: Bs {price_txt}\n"
         f"Foto de producto: {'Sí' if has_photo else 'No'}\n"
@@ -207,10 +284,6 @@ def send_admin_menu_product_detail(
         reply_markup=admin_menu_product_kb(tenant_id, sku, bool(item.get("active", False))),
     )
 
-
-# -------------------------
-# Editor de precio
-# -------------------------
 
 def admin_menu_price_kb(tenant_id: str, sku: str) -> Dict[str, Any]:
     row1: List[Tuple[str, str]] = []
@@ -252,11 +325,11 @@ def send_admin_menu_price_editor(
 
     msg = (
         "💲 MODIFICAR PRECIO\n\n"
-        f"Producto: {item.get('name','')}\n"
+        f"Producto: {item.get('name', '')}\n"
         f"Precio guardado: Bs {fmt_price_short(item.get('price', 0))}\n"
         f"Precio en edición: Bs {fmt_price_short(work_price)}\n\n"
         "Usa los botones para subir o bajar el precio.\n"
-        "Luego presiona “Guardar precio”."
+        "Luego presiona 'Guardar precio'."
     )
 
     return telegram_send_text(

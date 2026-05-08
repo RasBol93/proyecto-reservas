@@ -1,3 +1,4 @@
+import json
 from typing import Any, Dict, Optional
 
 from fastapi import HTTPException
@@ -15,13 +16,16 @@ from app.menu import (
 from app.telegram_api import telegram_send_text
 from app.telegram_keyboard import kb
 from app.utils import normalize
+from app.content import upsert_content_entries
 from app.webhook_helpers import (
     get_sess,
     assert_admin_authorized,
     fmt_price_short,
 )
 from app.admin_menu import (
+    _rebuild_ordered_cats,
     send_admin_menu_home,
+    send_admin_menu_category_order,
     send_admin_menu_category,
     send_admin_menu_product_detail,
     send_admin_menu_price_editor,
@@ -32,6 +36,11 @@ from app.admin_nav import admin_panel_kb
 
 def _clear_admin_menu_session_cache(tmp: Dict[str, Any]) -> None:
     tmp.pop("admin_menu_cache", None)
+
+
+def clear_admin_menu_order_state(tmp: Dict[str, Any]) -> None:
+    tmp.pop("admin_menu_order_categories", None)
+    tmp.pop("admin_menu_order_selected_idx", None)
 
 
 def handle_admin_menu_callback(
@@ -61,6 +70,7 @@ def handle_admin_menu_callback(
     tmp = sess.setdefault("tmp", {})
 
     if action == "panel":
+        clear_admin_menu_order_state(tmp)
         tmp.pop("admin_menu_categories", None)
         tmp.pop("admin_menu_current_category", None)
         tmp.pop("admin_menu_last_sku", None)
@@ -84,10 +94,113 @@ def handle_admin_menu_callback(
         return {"ok": True}
 
     if action == "home":
+        clear_admin_menu_order_state(tmp)
         _clear_admin_menu_session_cache(tmp)
         return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
+    if action == "catorder":
+        menu_idx, cats, cat_names = None, None, None
+        cached = tmp.get("admin_menu_cache")
+        if cached is not None:
+            menu_idx, cats, cat_names = cached
+        else:
+            menu_idx = load_menu_admin_index(orders_sh, force=False)
+            cats = group_menu_admin_by_category(menu_idx, orders_sh=orders_sh)
+            cat_names = list(cats.keys())
+            tmp["admin_menu_cache"] = (menu_idx, cats, cat_names)
+
+        tmp["admin_menu_order_categories"] = list(cat_names or [])
+        tmp["admin_menu_order_selected_idx"] = -1
+        return {"ok": send_admin_menu_category_order(bot_token, chat_id, tenant_id, sess)}
+
+    if action == "catorder_pick" and len(parts) == 4:
+        try:
+            idx = int(parts[3].strip())
+        except Exception:
+            idx = -1
+
+        cat_names = list(tmp.get("admin_menu_order_categories") or [])
+        if idx < 0 or idx >= len(cat_names):
+            telegram_send_text(bot_token, chat_id, "No pude identificar esa categoría.")
+            return {"ok": send_admin_menu_category_order(bot_token, chat_id, tenant_id, sess)}
+
+        tmp["admin_menu_order_selected_idx"] = idx
+        return {"ok": send_admin_menu_category_order(bot_token, chat_id, tenant_id, sess)}
+
+    if action == "catorder_up":
+        cat_names = list(tmp.get("admin_menu_order_categories") or [])
+        selected_idx = int(tmp.get("admin_menu_order_selected_idx") or -1)
+
+        if selected_idx <= 0 or selected_idx >= len(cat_names):
+            telegram_send_text(bot_token, chat_id, "Esa categoría ya está al inicio.")
+            return {"ok": send_admin_menu_category_order(bot_token, chat_id, tenant_id, sess)}
+
+        cat_names[selected_idx - 1], cat_names[selected_idx] = cat_names[selected_idx], cat_names[selected_idx - 1]
+        tmp["admin_menu_order_categories"] = cat_names
+        tmp["admin_menu_order_selected_idx"] = selected_idx - 1
+        return {"ok": send_admin_menu_category_order(bot_token, chat_id, tenant_id, sess)}
+
+    if action == "catorder_down":
+        cat_names = list(tmp.get("admin_menu_order_categories") or [])
+        selected_idx = int(tmp.get("admin_menu_order_selected_idx") or -1)
+
+        if selected_idx < 0 or selected_idx >= (len(cat_names) - 1):
+            telegram_send_text(bot_token, chat_id, "Esa categoría ya está al final.")
+            return {"ok": send_admin_menu_category_order(bot_token, chat_id, tenant_id, sess)}
+
+        cat_names[selected_idx + 1], cat_names[selected_idx] = cat_names[selected_idx], cat_names[selected_idx + 1]
+        tmp["admin_menu_order_categories"] = cat_names
+        tmp["admin_menu_order_selected_idx"] = selected_idx + 1
+        return {"ok": send_admin_menu_category_order(bot_token, chat_id, tenant_id, sess)}
+
+    if action == "catorder_save":
+        cat_names = list(tmp.get("admin_menu_order_categories") or [])
+        if not cat_names:
+            clear_admin_menu_order_state(tmp)
+            return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+        payload = json.dumps(cat_names, ensure_ascii=False)
+        upsert_content_entries(
+            orders_sh,
+            [{
+                "key": "menu_category_order_json",
+                "value": payload,
+                "active": True,
+            }],
+        )
+
+        cached = tmp.get("admin_menu_cache")
+        if cached is not None:
+            menu_idx, cats, _ = cached
+            ordered_cats = _rebuild_ordered_cats(cats, cat_names)
+            tmp["admin_menu_cache"] = (menu_idx, ordered_cats, list(ordered_cats.keys()))
+
+        clear_admin_menu_order_state(tmp)
+        telegram_send_text(bot_token, chat_id, "✅ Orden de categorías guardado.")
+        return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+    if action == "catorder_reset":
+        upsert_content_entries(
+            orders_sh,
+            [{
+                "key": "menu_category_order_json",
+                "value": "",
+                "active": False,
+            }],
+        )
+
+        cached = tmp.get("admin_menu_cache")
+        if cached is not None:
+            menu_idx, _, _ = cached
+            default_cats = group_menu_admin_by_category(menu_idx, content_map={})
+            tmp["admin_menu_cache"] = (menu_idx, default_cats, list(default_cats.keys()))
+
+        clear_admin_menu_order_state(tmp)
+        telegram_send_text(bot_token, chat_id, "✅ Orden de categorías reseteado.")
+        return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
     if action == "refresh":
+        clear_admin_menu_order_state(tmp)
         invalidate_menu_cache(orders_sh)
         _clear_admin_menu_session_cache(tmp)
         telegram_send_text(
@@ -98,6 +211,7 @@ def handle_admin_menu_callback(
         return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
 
     if action == "catrefresh":
+        clear_admin_menu_order_state(tmp)
         invalidate_menu_cache(orders_sh)
         _clear_admin_menu_session_cache(tmp)
         current_category = str(tmp.get("admin_menu_current_category") or "").strip()
@@ -117,6 +231,7 @@ def handle_admin_menu_callback(
         except Exception:
             idx = -1
 
+        clear_admin_menu_order_state(tmp)
         _clear_admin_menu_session_cache(tmp)
         menu_idx = load_menu_admin_index(orders_sh, force=True)
         cats = group_menu_admin_by_category(menu_idx, orders_sh=orders_sh)
@@ -129,6 +244,7 @@ def handle_admin_menu_callback(
         return {"ok": send_admin_menu_category(bot_token, chat_id, tenant_id, orders_sh, sess, category)}
 
     if action == "catback":
+        clear_admin_menu_order_state(tmp)
         current_category = str(tmp.get("admin_menu_current_category") or "").strip()
         if not current_category:
             _clear_admin_menu_session_cache(tmp)

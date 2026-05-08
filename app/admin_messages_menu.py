@@ -13,7 +13,7 @@ from app.menu import (
 )
 from app.telegram_api import telegram_send_text, telegram_get_file_path, telegram_download_file_bytes
 from app.telegram_keyboard import kb
-from app.utils import log_event
+from app.utils import log_event, normalize
 from app.image_storage import upload_product_photo_for_tenant
 from app.webhook_helpers import (
     assert_admin_authorized,
@@ -21,7 +21,8 @@ from app.webhook_helpers import (
     fmt_price_short,
     extract_first_number,
 )
-from app.admin_menu import send_admin_menu_product_detail
+from app.admin_menu import send_admin_menu_home, send_admin_menu_product_detail
+from app.admin_callbacks_menu import clear_admin_menu_order_state
 from app.alerts import (
     alert_menu_error,
     alert_photo_upload_failed,
@@ -39,6 +40,15 @@ def handle_admin_menu_message(
 ) -> Optional[Dict[str, Any]]:
     tmp = sess.setdefault("tmp", {})
     text = (msg.get("text") or "").strip()
+    txt_norm = normalize(text)
+
+    if tmp.get("admin_menu_order_categories"):
+        if txt_norm in ("volver", "cancelar"):
+            clear_admin_menu_order_state(tmp)
+            return {"ok": send_admin_menu_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+        if txt_norm in ("panel", "âš™ï¸panel", "âš™ï¸ panel"):
+            clear_admin_menu_order_state(tmp)
+            return None
 
     input_mode = str(tmp.get("admin_menu_input_mode") or "").strip()
     input_sku = str(tmp.get("admin_menu_price_sku") or "").strip()
