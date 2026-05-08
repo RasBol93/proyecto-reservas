@@ -1,17 +1,20 @@
 import json
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import HTTPException
 
 from app.menu import (
     load_menu_admin_index,
+    load_menu_index,
     group_menu_admin_by_category,
+    group_menu_by_category,
     get_menu_product_or_404,
     set_menu_product_active,
     set_menu_product_price,
     set_menu_product_category,
     get_menu_categories,
     invalidate_menu_cache,
+    resolve_effective_category_order,
 )
 from app.telegram_api import telegram_send_text
 from app.telegram_keyboard import kb
@@ -41,6 +44,22 @@ def _clear_admin_menu_session_cache(tmp: Dict[str, Any]) -> None:
 def clear_admin_menu_order_state(tmp: Dict[str, Any]) -> None:
     tmp.pop("admin_menu_order_categories", None)
     tmp.pop("admin_menu_order_selected_idx", None)
+
+
+def _build_admin_menu_order_categories(orders_sh, cats: Dict[str, Any]) -> List[str]:
+    combined_names = list(cats.keys())
+
+    try:
+        public_menu_idx = load_menu_index(orders_sh, force=False)
+        public_cats = group_menu_by_category(public_menu_idx, orders_sh=orders_sh)
+    except Exception:
+        public_cats = {}
+
+    for cat_name in public_cats.keys():
+        if cat_name not in combined_names:
+            combined_names.append(cat_name)
+
+    return resolve_effective_category_order(combined_names, orders_sh=orders_sh)
 
 
 def handle_admin_menu_callback(
@@ -109,7 +128,7 @@ def handle_admin_menu_callback(
             cat_names = list(cats.keys())
             tmp["admin_menu_cache"] = (menu_idx, cats, cat_names)
 
-        tmp["admin_menu_order_categories"] = list(cat_names or [])
+        tmp["admin_menu_order_categories"] = _build_admin_menu_order_categories(orders_sh, cats or {})
         tmp["admin_menu_order_selected_idx"] = -1
         return {"ok": send_admin_menu_category_order(bot_token, chat_id, tenant_id, sess)}
 
@@ -129,7 +148,11 @@ def handle_admin_menu_callback(
 
     if action == "catorder_up":
         cat_names = list(tmp.get("admin_menu_order_categories") or [])
-        selected_idx = int(tmp.get("admin_menu_order_selected_idx") or -1)
+        selected_idx_raw = tmp.get("admin_menu_order_selected_idx")
+        try:
+            selected_idx = int(selected_idx_raw)
+        except Exception:
+            selected_idx = -1
 
         if selected_idx <= 0 or selected_idx >= len(cat_names):
             telegram_send_text(bot_token, chat_id, "Esa categoría ya está al inicio.")
@@ -142,7 +165,11 @@ def handle_admin_menu_callback(
 
     if action == "catorder_down":
         cat_names = list(tmp.get("admin_menu_order_categories") or [])
-        selected_idx = int(tmp.get("admin_menu_order_selected_idx") or -1)
+        selected_idx_raw = tmp.get("admin_menu_order_selected_idx")
+        try:
+            selected_idx = int(selected_idx_raw)
+        except Exception:
+            selected_idx = -1
 
         if selected_idx < 0 or selected_idx >= (len(cat_names) - 1):
             telegram_send_text(bot_token, chat_id, "Esa categoría ya está al final.")

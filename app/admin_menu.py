@@ -66,9 +66,8 @@ def admin_menu_home_kb(tenant_id: str, cats: Dict[str, List[Dict[str, Any]]]) ->
         active_n = sum(1 for it in items if bool(it.get("active", False)))
         rows.append([(f"📂 {cat} ({active_n}/{total_n})", f"admmenu|{tenant_id}|cat|{idx}")])
 
-    rows.append([("↕️ Orden de categorías", f"admmenu|{tenant_id}|catorder")])
+    rows.append([("↕️ Orden de categorías en app de pedidos", f"admmenu|{tenant_id}|catorder")])
     rows.append([("➕ Crear producto", f"admmenu|{tenant_id}|create_product")])
-    rows.append([("🔄 Refrescar menú", f"admmenu|{tenant_id}|refresh")])
     rows.append([("⬅️ Volver al panel", f"admmenu|{tenant_id}|panel")])
     return kb(rows)
 
@@ -145,7 +144,11 @@ def send_admin_menu_category_order(
 ) -> bool:
     tmp = sess.setdefault("tmp", {})
     cat_names = list(tmp.get("admin_menu_order_categories") or [])
-    selected_idx = int(tmp.get("admin_menu_order_selected_idx") or -1)
+    selected_idx_raw = tmp.get("admin_menu_order_selected_idx")
+    try:
+        selected_idx = int(selected_idx_raw)
+    except Exception:
+        selected_idx = -1
 
     if not cat_names:
         return telegram_send_text(
