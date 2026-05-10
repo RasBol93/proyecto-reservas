@@ -20,7 +20,7 @@ from app.sheets import get_gspread_client, open_spreadsheet_by_key
 from app.tenants import get_tenant_or_404, load_tenants, tenants_cache_info
 from app.menu import load_menu_index, group_menu_by_category, calc_total_amount
 from app.pickup import generate_public_pickup_slots
-from app.config_bundle import load_config_bundle
+from app.config_bundle import load_config_bundle, build_fresh_open_status
 from app.content import upsert_content_entries
 
 try:
@@ -616,6 +616,11 @@ def get_webapp_bootstrap(tenant_id: str = Query(...)):
         tenant=tenant,
         orders_sh=orders_sh,
         force=False,
+    )
+    tenant_tz = str(tenant.get("timezone") or "America/La_Paz").strip() or "America/La_Paz"
+    bundle["open_status"] = build_fresh_open_status(
+        orders_sh,
+        tenant_tz=tenant_tz,
     )
 
     return {

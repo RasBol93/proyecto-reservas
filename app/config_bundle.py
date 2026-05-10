@@ -742,6 +742,16 @@ def _build_open_status_payload(pickup_payload: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
+def build_fresh_open_status(orders_sh, *, tenant_tz: str) -> Dict[str, Any]:
+    settings_map = load_admin_settings(orders_sh, force=False)
+    pickup_payload = _build_public_pickup_payload_from_settings(
+        orders_sh,
+        settings_map=settings_map,
+        tenant_tz=_safe_str(tenant_tz) or "America/La_Paz",
+    )
+    return _build_open_status_payload(pickup_payload)
+
+
 def build_config_bundle(
     tenant_id: str,
     gc=None,
