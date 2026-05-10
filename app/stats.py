@@ -487,6 +487,298 @@ def _bar(value: float, max_value: float, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+def build_stats_summary_data(orders_sh, tenant_id: str, tenant_tz: str, period: Period) -> Dict[str, Any]:
+    try:
+        ws = orders_sh.worksheet("Orders")
+        values = ws.get_all_values()
+    except Exception:
+        try:
+            for w in orders_sh.worksheets():
+                vals = w.get_all_values()
+                if not vals:
+                    continue
+                hdr_idx = _detect_header_row(vals, required_headers=["order_id", "created_at", "status"], max_scan=30)
+                hdr_norm = [normalize(x) for x in (vals[hdr_idx] or [])]
+                if "order_id" in hdr_norm and "status" in hdr_norm:
+                    ws = w
+                    values = vals
+                    break
+            else:
+                raise Exception("Orders not found")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Cannot read Orders: {e}")
+
+    def _empty_summary(insights: List[str]) -> Dict[str, Any]:
+        return {
+            "period": {
+                "label": period.label,
+                "range_text": _period_range_text_local(period, tenant_tz),
+            },
+            "kpis": {
+                "sales_total": 0.0,
+                "orders_created": 0,
+                "orders_paid": 0,
+                "orders_unpaid": 0,
+                "avg_ticket": 0.0,
+                "avg_units_per_order": 0.0,
+                "conversations_started": 0,
+                "conv_conversation_to_order": 0.0,
+                "conv_order_to_paid": 0.0,
+                "unique_customers": 0,
+            },
+            "sales_by_day": [],
+            "sales_by_hour": [],
+            "top_products": [],
+            "categories": [],
+            "insights": insights,
+        }
+
+    if not values:
+        return _empty_summary(["Aún no hay datos disponibles para este período."])
+
+    hdr_idx = _detect_header_row(values, required_headers=["order_id", "created_at", "status"], max_scan=30)
+    headers_raw = values[hdr_idx]
+    headers_norm = [normalize(h) for h in headers_raw]
+
+    def cidx(name: str) -> Optional[int]:
+        k = normalize(name)
+        return headers_norm.index(k) if k in headers_norm else None
+
+    i_created = cidx("created_at")
+    i_status = cidx("status")
+    i_total = cidx("total_amount")
+    i_items = cidx("items")
+    i_contact = cidx("customer_contact")
+
+    if i_created is None or i_status is None:
+        return _empty_summary(["La hoja Orders no tiene las columnas requeridas."])
+
+    try:
+        menu_idx = load_menu_index(orders_sh)
+    except Exception:
+        menu_idx = {}
+
+    conversations = count_conversations_started(orders_sh, tenant_id, period.start_utc, period.end_utc)
+
+    orders_created = 0
+    orders_paid = 0
+    paid_total_sales = 0.0
+    paid_units_total = 0
+    paid_customers: set = set()
+
+    sku_units: Dict[str, int] = {}
+    sku_sales: Dict[str, float] = {}
+    cat_sales: Dict[str, float] = {}
+    cat_orders: Dict[str, int] = {}
+    weekday_stats: Dict[str, Dict[str, float]] = {}
+    hour_stats_sales: Dict[str, float] = {}
+    hour_stats_orders: Dict[str, int] = {}
+    weekday_order = ["Lun", "Mar", "MiÃ©", "Jue", "Vie", "SÃ¡b", "Dom"]
+
+    for row in values[hdr_idx + 1:]:
+        created_s = row[i_created] if i_created < len(row) else ""
+        dt = _parse_iso_dt(created_s)
+        if not dt:
+            continue
+
+        dt_utc = dt.replace(tzinfo=None)
+        if not (period.start_utc <= dt_utc < period.end_utc):
+            continue
+
+        dt_local = _to_local(dt, tenant_tz)
+        orders_created += 1
+
+        status = row[i_status] if i_status < len(row) else ""
+        is_paid = normalize(status) == normalize("PAID")
+        if not is_paid:
+            continue
+
+        orders_paid += 1
+
+        total_s = row[i_total] if (i_total is not None and i_total < len(row)) else "0"
+        order_sales = _safe_float(total_s)
+        paid_total_sales += order_sales
+
+        if i_contact is not None:
+            c = row[i_contact] if i_contact < len(row) else ""
+            c_norm = _normalize_contact(c)
+            if c_norm:
+                paid_customers.add(c_norm)
+
+        items_field = row[i_items] if (i_items is not None and i_items < len(row)) else ""
+        items = _parse_items(items_field)
+
+        cats_in_order: set = set()
+        order_units = 0
+
+        for it in items:
+            sku = str(it.get("sku", "") or "").strip()
+            try:
+                qty = int(it.get("qty", 1) or 1)
+            except Exception:
+                qty = 1
+            qty = max(1, qty)
+
+            if not sku:
+                continue
+
+            order_units += qty
+            paid_units_total += qty
+            sku_units[sku] = sku_units.get(sku, 0) + qty
+
+            price = 0.0
+            cat = "Otros"
+            if sku in menu_idx:
+                try:
+                    price = float(menu_idx[sku].get("price") or 0)
+                except Exception:
+                    price = 0.0
+                cat = str(menu_idx[sku].get("category") or "Otros")
+
+            sku_sales[sku] = sku_sales.get(sku, 0.0) + (price * qty)
+            cats_in_order.add(cat)
+
+        weekday = _weekday_es(dt_local)
+        if weekday not in weekday_stats:
+            weekday_stats[weekday] = {"orders": 0, "units": 0, "sales": 0.0}
+        weekday_stats[weekday]["orders"] += 1
+        weekday_stats[weekday]["units"] += order_units
+        weekday_stats[weekday]["sales"] += order_sales
+
+        hour_key = _hour_bucket(dt_local)
+        hour_stats_sales[hour_key] = hour_stats_sales.get(hour_key, 0.0) + order_sales
+        hour_stats_orders[hour_key] = hour_stats_orders.get(hour_key, 0) + 1
+
+        for cat in cats_in_order:
+            cat_orders[cat] = cat_orders.get(cat, 0) + 1
+
+    unpaid = max(0, orders_created - orders_paid)
+    conv_to_order = (orders_created / conversations * 100.0) if conversations > 0 else 0.0
+    order_to_paid = (orders_paid / orders_created * 100.0) if orders_created > 0 else 0.0
+    ticket_avg = (paid_total_sales / orders_paid) if orders_paid > 0 else 0.0
+    units_avg = (paid_units_total / orders_paid) if orders_paid > 0 else 0.0
+
+    def sku_name(sku: str) -> str:
+        if sku in menu_idx:
+            return str(menu_idx[sku].get("name") or sku)
+        return sku
+
+    def sku_cat(sku: str) -> str:
+        if sku in menu_idx:
+            return str(menu_idx[sku].get("category") or "Otros")
+        return "Otros"
+
+    for sku, sales in sku_sales.items():
+        cat = sku_cat(sku)
+        cat_sales[cat] = cat_sales.get(cat, 0.0) + float(sales)
+
+    top_units = sorted(sku_units.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_sales = sorted(sku_sales.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_cat = sorted(cat_sales.items(), key=lambda x: x[1], reverse=True)
+    top_hours = sorted(hour_stats_sales.items(), key=lambda x: x[1], reverse=True)
+
+    star_product = top_sales[0][0] if top_sales else ""
+    star_product_name = sku_name(star_product) if star_product else ""
+
+    best_day_sales = None
+    best_day_value = -1.0
+    for d in weekday_order:
+        v = weekday_stats.get(d, {}).get("sales", 0.0)
+        if v > best_day_value:
+            best_day_value = v
+            best_day_sales = d
+
+    best_hour = top_hours[0][0] if top_hours else ""
+
+    insights: List[str] = []
+    if orders_paid == 0:
+        insights.append("Aún no hay suficiente información en este período.")
+    else:
+        if star_product_name:
+            insights.append(f"Producto estrella por ventas: {star_product_name}.")
+        if unpaid > 0:
+            insights.append(f"Hay {unpaid} pedidos no pagados: conviene revisar fricción de pago y recordatorios.")
+        if best_day_sales:
+            insights.append(f"El día con mayor venta fue {best_day_sales}.")
+        if best_hour:
+            insights.append(f"La hora más fuerte fue {best_hour}.")
+        if units_avg < 2:
+            insights.append("Hay espacio para crecer en unidades por pedido con combos y adicionales.")
+        else:
+            insights.append("El promedio de unidades por pedido ya muestra una compra relativamente completa.")
+
+    sales_by_day = []
+    for d in weekday_order:
+        if d not in weekday_stats:
+            continue
+        v = weekday_stats[d]
+        sales_by_day.append({
+            "label": d,
+            "orders": int(v["orders"]),
+            "units": int(v["units"]),
+            "sales": round(float(v["sales"]), 2),
+        })
+
+    sales_by_hour = []
+    for hour_key, sales in top_hours:
+        sales_by_hour.append({
+            "label": hour_key,
+            "orders": int(hour_stats_orders.get(hour_key, 0)),
+            "sales": round(float(sales), 2),
+        })
+
+    top_products = []
+    top_sales_map = {sku: float(sales) for sku, sales in top_sales}
+    top_units_map = {sku: int(units) for sku, units in top_units}
+    top_skus: List[str] = []
+    for sku, _ in top_sales:
+        if sku not in top_skus:
+            top_skus.append(sku)
+    for sku, _ in top_units:
+        if sku not in top_skus:
+            top_skus.append(sku)
+    for sku in top_skus[:5]:
+        top_products.append({
+            "sku": sku,
+            "name": sku_name(sku),
+            "sales": round(float(top_sales_map.get(sku, 0.0)), 2),
+            "units": int(top_units_map.get(sku, 0)),
+            "category": sku_cat(sku),
+        })
+
+    categories = []
+    for cat, sales in top_cat:
+        categories.append({
+            "name": cat,
+            "sales": round(float(sales), 2),
+            "orders": int(cat_orders.get(cat, 0)),
+        })
+
+    return {
+        "period": {
+            "label": period.label,
+            "range_text": _period_range_text_local(period, tenant_tz),
+        },
+        "kpis": {
+            "sales_total": round(float(paid_total_sales), 2),
+            "orders_created": int(orders_created),
+            "orders_paid": int(orders_paid),
+            "orders_unpaid": int(unpaid),
+            "avg_ticket": round(float(ticket_avg), 2),
+            "avg_units_per_order": round(float(units_avg), 2),
+            "conversations_started": int(conversations),
+            "conv_conversation_to_order": round(float(conv_to_order), 2),
+            "conv_order_to_paid": round(float(order_to_paid), 2),
+            "unique_customers": len(paid_customers),
+        },
+        "sales_by_day": sales_by_day,
+        "sales_by_hour": sales_by_hour,
+        "top_products": top_products,
+        "categories": categories,
+        "insights": insights,
+    }
+
+
 def build_stats_report_text(orders_sh, tenant_id: str, tenant_tz: str, period: Period) -> str:
     try:
         ws = orders_sh.worksheet("Orders")

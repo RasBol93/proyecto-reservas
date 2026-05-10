@@ -22,6 +22,7 @@ from app.menu import load_menu_index, group_menu_by_category, calc_total_amount
 from app.pickup import generate_public_pickup_slots
 from app.config_bundle import load_config_bundle, build_fresh_open_status
 from app.content import upsert_content_entries
+from app.dashboard_summary import build_dashboard_summary_data
 
 try:
     from app.orders import append_order_row
@@ -548,6 +549,34 @@ def admin_update_business_info(payload: AdminBusinessInfoIn):
         tenant_id=resolved_tenant_id,
         updated_keys=sorted(list(applied.keys())),
         values=applied,
+    )
+
+
+@router.get("/admin/dashboard/summary")
+def admin_dashboard_summary(
+    tenant_id: str = Query(...),
+    token: str = Query(...),
+    period: str = Query("today"),
+):
+    require_admin_token(token)
+    validate_tenant_id(tenant_id)
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(tenant_id, gc=gc)
+
+    if not tenant.get("orders_enabled", False):
+        raise HTTPException(status_code=400, detail="Orders not enabled")
+
+    orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
+    tenant_tz = str(tenant.get("timezone") or "America/La_Paz").strip() or "America/La_Paz"
+    resolved_tenant_id = str(tenant.get("tenant_id") or tenant_id).strip()
+
+    return build_dashboard_summary_data(
+        orders_sh=orders_sh,
+        tenant=tenant,
+        tenant_id=resolved_tenant_id,
+        tenant_tz=tenant_tz,
+        period_key=str(period or "today").strip() or "today",
     )
 
 
