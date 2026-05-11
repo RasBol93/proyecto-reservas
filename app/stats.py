@@ -1479,14 +1479,23 @@ def _direction_and_sentiment(current_value: float, reference_value: float) -> Tu
 def _normalize_metric_value(metric_key: str, value: float) -> Any:
     if metric_key in {"sales_total", "avg_ticket"}:
         return round(float(value), 2)
-    return int(round(float(value)))
+    raw = float(value)
+    rounded_2 = round(raw, 2)
+    if abs(rounded_2 - round(rounded_2)) < 1e-9:
+        return int(round(rounded_2))
+    return rounded_2
 
 
 def _build_comparison(metric_key: str, key: str, label: str, current_value: float, reference_value: float) -> Dict[str, Any]:
-    delta_absolute = current_value - reference_value
-    if reference_value > 0:
-        delta_percent = round((delta_absolute / reference_value) * 100.0, 2)
-        direction, sentiment = _direction_and_sentiment(current_value, reference_value)
+    current_norm = _normalize_metric_value(metric_key, current_value)
+    reference_norm = _normalize_metric_value(metric_key, reference_value)
+    current_num = float(current_norm)
+    reference_num = float(reference_norm)
+    delta_absolute = current_num - reference_num
+
+    if reference_num > 0:
+        delta_percent = round((delta_absolute / reference_num) * 100.0, 2)
+        direction, sentiment = _direction_and_sentiment(current_num, reference_num)
     else:
         delta_percent = None
         direction = "flat"
@@ -1495,8 +1504,8 @@ def _build_comparison(metric_key: str, key: str, label: str, current_value: floa
     return {
         "key": key,
         "label": label,
-        "current_value": _normalize_metric_value(metric_key, current_value),
-        "reference_value": _normalize_metric_value(metric_key, reference_value),
+        "current_value": current_norm,
+        "reference_value": reference_norm,
         "delta_absolute": _normalize_metric_value(metric_key, delta_absolute),
         "delta_percent": delta_percent,
         "direction": direction,
