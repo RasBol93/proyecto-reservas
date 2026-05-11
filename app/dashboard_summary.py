@@ -2,7 +2,12 @@ from datetime import datetime
 from typing import Any, Dict, List
 
 from app.consumer_db import aggregate_consumers
-from app.stats import resolve_period, build_stats_summary_data
+from app.stats import (
+    resolve_period,
+    load_stats_source_data,
+    build_stats_summary_data,
+    build_kpi_comparisons,
+)
 from app.survey_analytics import build_survey_analytics
 
 
@@ -40,11 +45,22 @@ def build_dashboard_summary_data(
     period_key: str = "today",
 ) -> Dict[str, Any]:
     period = resolve_period(tenant_tz, period_key)
+    stats_source = load_stats_source_data(orders_sh)
     stats_data = build_stats_summary_data(
         orders_sh=orders_sh,
         tenant_id=tenant_id,
         tenant_tz=tenant_tz,
         period=period,
+        source_data=stats_source,
+    )
+    kpi_comparisons = build_kpi_comparisons(
+        orders_sh=orders_sh,
+        tenant_id=tenant_id,
+        tenant_tz=tenant_tz,
+        period_key=period_key,
+        period=period,
+        current_summary=stats_data,
+        source_data=stats_source,
     )
 
     try:
@@ -98,6 +114,7 @@ def build_dashboard_summary_data(
             "range_text": str((stats_data.get("period") or {}).get("range_text") or "").strip(),
         },
         "kpis": dict(stats_data.get("kpis") or {}),
+        "kpi_comparisons": dict(kpi_comparisons or {}),
         "sales_by_day": list(stats_data.get("sales_by_day") or []),
         "sales_by_hour": list(stats_data.get("sales_by_hour") or []),
         "top_products": list(stats_data.get("top_products") or []),
