@@ -9,6 +9,8 @@ from app.admin_messages_orders import handle_admin_orders_message
 from app.admin_messages_promotions import handle_admin_promotions_message
 from app.admin_messages_business import handle_admin_business_message
 from app.admin_callbacks_business import clear_admin_business_state
+from app.admin_messages_sales_goals import handle_admin_sales_goals_message
+from app.admin_callbacks_sales_goals import clear_admin_sales_goals_state, send_admin_sales_goals_home
 
 from app.telegram_api import telegram_send_text
 from app.telegram_keyboard import kb
@@ -77,7 +79,8 @@ def _build_admin_panel_text(is_owner: bool) -> str:
             "📝 Encuestas\n"
             "🎁 Promociones\n"
             "🍔 Menú\n"
-            "⏰ Horarios\n\n"
+            "⏰ Horarios\n"
+            "🎯 Objetivos de ventas\n\n"
             "_Selecciona una opción del panel inferior._"
         )
 
@@ -89,7 +92,7 @@ def _build_admin_panel_text(is_owner: bool) -> str:
         "*Análisis*\n"
         "📊 Estadísticas · 👥 Clientes · 📝 Encuestas\n\n"
         "*Configuración*\n"
-        "🎁 Promociones · 🍔 Menú · ⏰ Horarios\n\n"
+        "🎁 Promociones · 🍔 Menú · ⏰ Horarios · 🎯 Objetivos\n\n"
         "_Selecciona una opción del panel inferior._"
     )
 
@@ -253,6 +256,7 @@ def handle_admin_message_impl(
         sess = get_sess(tenant_id, chat_id)
         tmp = sess.setdefault("tmp", {})
         admbiz_mode = str(tmp.get("admbiz_mode") or "").strip()
+        admin_sales_goals_mode = str(tmp.get("admin_sales_goals_mode") or "").strip()
 
         if admbiz_mode and txt_norm in ("panel", "âš™ï¸panel", "âš™ï¸ panel", "volver", "cancelar"):
             clear_admin_business_state(tmp)
@@ -265,6 +269,24 @@ def handle_admin_message_impl(
                 parse_mode="Markdown",
             )
             return {"ok": True}
+
+        if admin_sales_goals_mode:
+            if txt_norm in ("volver", "cancelar"):
+                clear_admin_sales_goals_state(tmp)
+                assert_admin_authorized(tenant, chat_id, tenant_id)
+                return {"ok": send_admin_sales_goals_home(bot_token, chat_id, tenant_id, orders_sh)}
+
+            if txt_norm in ("panel", "⚙️panel", "⚙️ panel"):
+                clear_admin_sales_goals_state(tmp)
+                assert_admin_authorized(tenant, chat_id, tenant_id)
+                _safe_send_text(
+                    bot_token,
+                    chat_id,
+                    _build_admin_panel_text(is_owner=is_owner),
+                    reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
+                    parse_mode="Markdown",
+                )
+                return {"ok": True}
 
         if txt_norm in ("panel", "⚙️panel", "⚙️ panel"):
             assert_admin_authorized(tenant, chat_id, tenant_id)
@@ -301,6 +323,18 @@ def handle_admin_message_impl(
         )
         if business_result is not None:
             return business_result
+
+        sales_goals_result = handle_admin_sales_goals_message(
+            tenant=tenant,
+            tenant_id=tenant_id,
+            bot_token=bot_token,
+            chat_id=chat_id,
+            msg=msg,
+            orders_sh=orders_sh,
+            tmp=tmp,
+        )
+        if sales_goals_result is not None:
+            return sales_goals_result
 
         surveys_result = handle_admin_surveys_message(
             tenant=tenant,
@@ -440,6 +474,16 @@ def handle_admin_message_impl(
 
             assert_admin_authorized(tenant, chat_id, tenant_id)
             return {"ok": send_admin_business_home(bot_token, chat_id, tenant_id)}
+
+        if txt_norm in (
+            "objetivos de ventas",
+            "objetivos ventas",
+            "objetivos",
+            "meta de ventas",
+            "metas de ventas",
+        ):
+            assert_admin_authorized(tenant, chat_id, tenant_id)
+            return {"ok": send_admin_sales_goals_home(bot_token, chat_id, tenant_id, orders_sh)}
 
         if txt_norm in (
             "encuestas",

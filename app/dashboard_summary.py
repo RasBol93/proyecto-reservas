@@ -1,6 +1,7 @@
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
+from app.admin_settings import get_admin_setting_value, load_admin_settings
 from app.consumer_db import aggregate_consumers
 from app.stats import (
     resolve_period,
@@ -13,6 +14,71 @@ from app.survey_analytics import build_survey_analytics
 
 def _utc_iso() -> str:
     return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _money_value(value: Any) -> Any:
+    try:
+        amount = round(float(value or 0.0), 2)
+    except Exception:
+        amount = 0.0
+
+    if abs(amount - round(amount)) < 0.000001:
+        return int(round(amount))
+    return amount
+
+
+def _parse_sales_goal_amount(settings_map: Dict[str, Dict[str, Any]], key: str) -> Optional[float]:
+    raw_value = str(get_admin_setting_value(settings_map, key, "") or "").strip()
+    if not raw_value:
+        return None
+
+    try:
+        amount = float(raw_value.replace(",", "."))
+    except Exception:
+        return None
+
+    if amount <= 0:
+        return None
+
+    return amount
+
+
+def _build_sales_goal_payload(
+    settings_map: Dict[str, Dict[str, Any]],
+    period_key: str,
+    current_amount: Any,
+) -> Dict[str, Any]:
+    goal_key_by_period = {
+        "today": "daily_sales_goal_amount",
+        "this_week": "weekly_sales_goal_amount",
+        "month_to_date": "monthly_sales_goal_amount",
+    }
+
+    current_amount_num = round(float(current_amount or 0.0), 2)
+    target_key = goal_key_by_period.get(str(period_key or "").strip(), "")
+    target_amount = _parse_sales_goal_amount(settings_map, target_key) if target_key else None
+
+    if target_amount is None:
+        return {
+            "period": period_key,
+            "target_amount": None,
+            "current_amount": _money_value(current_amount_num),
+            "remaining_amount": None,
+            "achievement_percent": None,
+            "status": "not_configured",
+        }
+
+    remaining_amount = round(max(target_amount - current_amount_num, 0.0), 2)
+    achievement_percent = round((current_amount_num / target_amount) * 100, 2)
+
+    return {
+        "period": period_key,
+        "target_amount": _money_value(target_amount),
+        "current_amount": _money_value(current_amount_num),
+        "remaining_amount": _money_value(remaining_amount),
+        "achievement_percent": achievement_percent,
+        "status": "achieved" if current_amount_num >= target_amount else "behind",
+    }
 
 
 def _serialize_top_customers(consumers: List[Dict[str, Any]], limit: int = 5) -> List[Dict[str, Any]]:
@@ -62,6 +128,10 @@ def build_dashboard_summary_data(
         current_summary=stats_data,
         source_data=stats_source,
     )
+    try:
+        settings_map = load_admin_settings(orders_sh, force=False)
+    except Exception:
+        settings_map = {}
 
     try:
         _, consumers, _ = aggregate_consumers(
@@ -119,6 +189,11 @@ def build_dashboard_summary_data(
         "sales_by_hour": list(stats_data.get("sales_by_hour") or []),
         "top_products": list(stats_data.get("top_products") or []),
         "categories": list(stats_data.get("categories") or []),
+        "sales_goal": _build_sales_goal_payload(
+            settings_map=settings_map,
+            period_key=period_key,
+            current_amount=(stats_data.get("kpis") or {}).get("sales_total", 0),
+        ),
         "customers_summary": {
             "total_customers": len(consumers),
             "repeat_customers": repeat_customers,

@@ -50,6 +50,7 @@ def admin_panel_kb(user_role: str = "admin"):
     ])
 
     rows.append([
+        ("🎯 Objetivos de ventas", "admin_sales_goals"),
         ("🏪 Info general", "admin_business"),
     ])
 
