@@ -729,7 +729,6 @@ def _legacy_build_stats_summary_data(orders_sh, tenant_id: str, tenant_tz: str, 
 
     top_products = []
     top_sales_map = {sku: float(sales) for sku, sales in top_sales}
-    top_units_map = {sku: int(units) for sku, units in top_units}
     top_skus: List[str] = []
     for sku, _ in top_sales:
         if sku not in top_skus:
@@ -738,11 +737,14 @@ def _legacy_build_stats_summary_data(orders_sh, tenant_id: str, tenant_tz: str, 
         if sku not in top_skus:
             top_skus.append(sku)
     for sku in top_skus[:5]:
+        units_value = int(sku_units.get(sku, 0) or 0)
+        if float(top_sales_map.get(sku, 0.0)) > 0 and units_value <= 0:
+            units_value = 1
         top_products.append({
             "sku": sku,
             "name": sku_name(sku),
             "sales": round(float(top_sales_map.get(sku, 0.0)), 2),
-            "units": int(top_units_map.get(sku, 0)),
+            "units": units_value,
             "category": sku_cat(sku),
         })
 
@@ -1398,7 +1400,6 @@ def _compute_stats_summary_from_source(source_data: Dict[str, Any], tenant_id: s
 
     top_products = []
     top_sales_map = {sku: float(sales) for sku, sales in top_sales}
-    top_units_map = {sku: int(units) for sku, units in top_units}
     top_skus: List[str] = []
     for sku, _ in top_sales:
         if sku not in top_skus:
@@ -1407,11 +1408,14 @@ def _compute_stats_summary_from_source(source_data: Dict[str, Any], tenant_id: s
         if sku not in top_skus:
             top_skus.append(sku)
     for sku in top_skus[:5]:
+        units_value = int(sku_units.get(sku, 0) or 0)
+        if float(top_sales_map.get(sku, 0.0)) > 0 and units_value <= 0:
+            units_value = 1
         top_products.append({
             "sku": sku,
             "name": sku_name(sku),
             "sales": round(float(top_sales_map.get(sku, 0.0)), 2),
-            "units": int(top_units_map.get(sku, 0)),
+            "units": units_value,
             "category": sku_cat(sku),
         })
 
