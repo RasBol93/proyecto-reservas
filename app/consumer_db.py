@@ -490,24 +490,44 @@ def _is_paid_order(order: Dict[str, Any]) -> bool:
     return status == "PAID"
 
 
-def aggregate_consumers(
-    orders_sh,
+def _serialize_customer_order_type_distribution(
+    new_orders_count: int,
+    returning_orders_count: int,
+) -> List[Dict[str, Any]]:
+    total_classified = int(new_orders_count) + int(returning_orders_count)
+    if total_classified <= 0:
+        return []
+
+    return [
+        {
+            "type": "new",
+            "label": "Clientes nuevos",
+            "orders_count": int(new_orders_count),
+            "percent": round((float(new_orders_count) / float(total_classified)) * 100.0, 2),
+        },
+        {
+            "type": "returning",
+            "label": "Clientes recurrentes",
+            "orders_count": int(returning_orders_count),
+            "percent": round((float(returning_orders_count) / float(total_classified)) * 100.0, 2),
+        },
+    ]
+
+
+def _build_consumers_dashboard_metrics_from_rows(
+    rows: List[Dict[str, Any]],
+    menu_idx: Dict[str, Any],
     tenant_tz: str,
-    period_key: str,
+    period: ConsumerPeriod,
     min_orders: int,
-) -> Tuple[ConsumerPeriod, List[Dict[str, Any]], int]:
-    period = resolve_consumer_period(period_key, tenant_tz)
-    rows = _load_orders_records(orders_sh)
-
-    try:
-        menu_idx = load_menu_index(orders_sh, force=False)
-    except Exception as e:
-        log_event("consumer_db_menu_load_failed", error=str(e))
-        menu_idx = {}
-
+) -> Dict[str, Any]:
     consumers: Dict[str, Dict[str, Any]] = {}
     paid_orders_in_period = 0
+    new_orders_count = 0
+    returning_orders_count = 0
+    paid_orders_seen_by_contact: Counter = Counter()
 
+    ordered_rows: List[Tuple[datetime, int, Dict[str, Any]]] = []
     for row_idx, row in enumerate(rows, start=1):
         if not _is_paid_order(row):
             continue
@@ -516,14 +536,32 @@ def aggregate_consumers(
         if not created_dt:
             continue
 
-        created_local = _to_local(created_dt, tenant_tz)
-        if not _match_period(created_local, period):
-            continue
+        ordered_rows.append((created_dt, row_idx, row))
 
-        paid_orders_in_period += 1
+    ordered_rows.sort(key=lambda x: (x[0], x[1]))
+
+    for created_dt, row_idx, row in ordered_rows:
+        created_local = _to_local(created_dt, tenant_tz)
+        in_period = _match_period(created_local, period)
 
         contact_raw = str(row.get("customer_contact") or "").strip()
         contact_norm = _normalize_contact(contact_raw)
+
+        if in_period:
+            paid_orders_in_period += 1
+
+            if contact_norm:
+                if int(paid_orders_seen_by_contact.get(contact_norm) or 0) > 0:
+                    returning_orders_count += 1
+                else:
+                    new_orders_count += 1
+
+        if contact_norm:
+            paid_orders_seen_by_contact[contact_norm] += 1
+
+        if not in_period:
+            continue
+
         display_contact = contact_norm if contact_norm else "Sin contacto"
 
         raw_name = str(row.get("customer_name") or "").strip()
@@ -573,7 +611,7 @@ def aggregate_consumers(
             c["latest_name"] = display_name
             c["latest_name_norm"] = name_norm
 
-    output: List[Dict[str, Any]] = []
+    consumers_output: List[Dict[str, Any]] = []
     for _, c in consumers.items():
         if c["orders_count"] < min_orders:
             continue
@@ -585,7 +623,7 @@ def aggregate_consumers(
             c["latest_display_by_norm"],
         )
 
-        output.append({
+        consumers_output.append({
             "name": resolved_name,
             "contact": c["contact"],
             "orders_count": int(c["orders_count"]),
@@ -595,13 +633,61 @@ def aggregate_consumers(
             "products_text": _top_products_text(c["product_counter"]),
         })
 
-    output.sort(
+    consumers_output.sort(
         key=lambda x: (
             -int(x["orders_count"]),
             -float(x["total_spent"]),
             str(x["name"]).lower(),
         )
     )
+
+    recurrent_customers = [
+        dict(c)
+        for c in consumers_output
+        if int(c.get("orders_count") or 0) > 1
+    ]
+    recurrent_customers.sort(
+        key=lambda x: (
+            -int(x.get("orders_count") or 0),
+            -float(x.get("total_spent") or 0.0),
+            -(x.get("last_purchase_dt").timestamp() if isinstance(x.get("last_purchase_dt"), datetime) else 0.0),
+        )
+    )
+
+    return {
+        "consumers": consumers_output,
+        "paid_orders_in_period": paid_orders_in_period,
+        "customer_order_type_distribution": _serialize_customer_order_type_distribution(
+            new_orders_count=new_orders_count,
+            returning_orders_count=returning_orders_count,
+        ),
+        "top_recurrent_customers": recurrent_customers[:3],
+    }
+
+
+def aggregate_consumers(
+    orders_sh,
+    tenant_tz: str,
+    period_key: str,
+    min_orders: int,
+) -> Tuple[ConsumerPeriod, List[Dict[str, Any]], int]:
+    period = resolve_consumer_period(period_key, tenant_tz)
+    rows = _load_orders_records(orders_sh)
+
+    try:
+        menu_idx = load_menu_index(orders_sh, force=False)
+    except Exception as e:
+        log_event("consumer_db_menu_load_failed", error=str(e))
+        menu_idx = {}
+    metrics = _build_consumers_dashboard_metrics_from_rows(
+        rows=rows,
+        menu_idx=menu_idx,
+        tenant_tz=tenant_tz,
+        period=period,
+        min_orders=min_orders,
+    )
+    output = list(metrics.get("consumers") or [])
+    paid_orders_in_period = int(metrics.get("paid_orders_in_period") or 0)
 
     log_event(
         "consumer_db_aggregate_done",
@@ -612,6 +698,49 @@ def aggregate_consumers(
     )
 
     return period, output, paid_orders_in_period
+
+
+def build_dashboard_customer_metrics(
+    orders_sh,
+    tenant_tz: str,
+    period_key: str,
+) -> Tuple[ConsumerPeriod, List[Dict[str, Any]], int, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    period = resolve_consumer_period(period_key, tenant_tz)
+    rows = _load_orders_records(orders_sh)
+
+    try:
+        menu_idx = load_menu_index(orders_sh, force=False)
+    except Exception as e:
+        log_event("consumer_db_menu_load_failed", error=str(e))
+        menu_idx = {}
+
+    metrics = _build_consumers_dashboard_metrics_from_rows(
+        rows=rows,
+        menu_idx=menu_idx,
+        tenant_tz=tenant_tz,
+        period=period,
+        min_orders=1,
+    )
+
+    log_event(
+        "consumer_db_dashboard_metrics_done",
+        period_key=period_key,
+        paid_orders_in_period=int(metrics.get("paid_orders_in_period") or 0),
+        consumers_found=len(list(metrics.get("consumers") or [])),
+        classified_orders=sum(
+            int(item.get("orders_count") or 0)
+            for item in list(metrics.get("customer_order_type_distribution") or [])
+        ),
+        top_recurrent_found=len(list(metrics.get("top_recurrent_customers") or [])),
+    )
+
+    return (
+        period,
+        list(metrics.get("consumers") or []),
+        int(metrics.get("paid_orders_in_period") or 0),
+        list(metrics.get("customer_order_type_distribution") or []),
+        list(metrics.get("top_recurrent_customers") or []),
+    )
 
 
 def build_consumers_report_pages(

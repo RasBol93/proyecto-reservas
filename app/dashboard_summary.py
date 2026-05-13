@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from app.admin_settings import get_admin_setting_value, load_admin_settings
-from app.consumer_db import aggregate_consumers
+from app.consumer_db import build_dashboard_customer_metrics
 from app.stats import (
     resolve_period,
     load_stats_source_data,
@@ -134,14 +134,15 @@ def build_dashboard_summary_data(
         settings_map = {}
 
     try:
-        _, consumers, _ = aggregate_consumers(
+        _, consumers, _, customer_order_type_distribution, top_recurrent_consumers = build_dashboard_customer_metrics(
             orders_sh=orders_sh,
             tenant_tz=tenant_tz,
             period_key=period_key,
-            min_orders=1,
         )
     except Exception:
         consumers = []
+        customer_order_type_distribution = []
+        top_recurrent_consumers = []
 
     repeat_customers = 0
     for c in consumers:
@@ -201,6 +202,8 @@ def build_dashboard_summary_data(
             "repeat_customers": repeat_customers,
             "top_customers": _serialize_top_customers(consumers),
         },
+        "customer_order_type_distribution": list(customer_order_type_distribution or []),
+        "top_recurrent_customers": _serialize_top_customers(top_recurrent_consumers, limit=3),
         "survey_summary": {
             "total_answers": int(survey_summary.get("total_answers") or 0),
             "total_unique_responses": int(survey_summary.get("total_unique_responses") or 0),
