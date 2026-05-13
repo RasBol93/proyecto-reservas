@@ -559,16 +559,29 @@ def _build_consumers_dashboard_metrics_from_rows(
         contact_raw = str(row.get("customer_contact") or "").strip()
         contact_norm = _normalize_contact(contact_raw)
         has_reliable_contact = _is_reliable_contact_norm(contact_norm)
+        seen_before = contact_norm in seen_paid_contacts if has_reliable_contact else False
 
         if in_period:
             paid_orders_in_period += 1
 
         if not has_reliable_contact:
             bucket = "unidentified"
-        elif contact_norm in seen_paid_contacts:
+        elif seen_before:
             bucket = "returning"
         else:
             bucket = "new"
+
+        if contact_norm == "66666666":
+            log_event(
+                "consumer_db_debug_contact_66666666",
+                row_idx=row_idx,
+                created_at_utc=created_dt.isoformat(),
+                created_at_local=created_local.isoformat(),
+                in_period=in_period,
+                has_reliable_contact=has_reliable_contact,
+                seen_before=seen_before,
+                bucket=bucket,
+            )
 
         if in_period:
             if bucket == "new":
