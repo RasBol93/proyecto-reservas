@@ -29,6 +29,13 @@ class SurveyPeriod:
     end_local: datetime
 
 
+@dataclass
+class SurveyTrendWindow:
+    label: str
+    start_local: datetime
+    end_local: datetime
+
+
 def _month_name_es(month: int) -> str:
     names = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
     try:
@@ -233,6 +240,98 @@ def _survey_period_range_text(period: SurveyPeriod) -> str:
 # Analítica
 # ---------------------------------------------------------
 
+def _month_label_es(year: int, month: int) -> str:
+    return f"{_month_name_es(month)} {year}"
+
+
+def _window_iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def _build_day_windows(now_local: datetime, count: int = 7) -> List[SurveyTrendWindow]:
+    current_day_start = _start_of_day(now_local)
+    windows: List[SurveyTrendWindow] = []
+    for idx in range(count - 1, -1, -1):
+        start_local = current_day_start - timedelta(days=idx)
+        end_local = now_local if idx == 0 else start_local + timedelta(days=1)
+        windows.append(
+            SurveyTrendWindow(
+                label=start_local.strftime("%d/%m"),
+                start_local=start_local,
+                end_local=end_local,
+            )
+        )
+    return windows
+
+
+def _build_week_windows(now_local: datetime, count: int = 7) -> List[SurveyTrendWindow]:
+    current_week_start = _start_of_week(now_local)
+    windows: List[SurveyTrendWindow] = []
+    for idx in range(count - 1, -1, -1):
+        start_local = current_week_start - timedelta(days=7 * idx)
+        end_local = now_local if idx == 0 else start_local + timedelta(days=7)
+        windows.append(
+            SurveyTrendWindow(
+                label=f"Sem {start_local.strftime('%d/%m')}",
+                start_local=start_local,
+                end_local=end_local,
+            )
+        )
+    return windows
+
+
+def _build_month_same_progress_windows(now_local: datetime, count: int = 7) -> List[SurveyTrendWindow]:
+    current_month_start = _start_of_month(now_local)
+    progress_delta = now_local - current_month_start
+    windows: List[SurveyTrendWindow] = []
+
+    for idx in range(count - 1, -1, -1):
+        year, month = _shift_year_month(now_local.year, now_local.month, -idx)
+        start_local = datetime(year, month, 1, 0, 0, 0, tzinfo=now_local.tzinfo)
+        next_year, next_month = _shift_year_month(year, month, 1)
+        next_month_start = datetime(next_year, next_month, 1, 0, 0, 0, tzinfo=now_local.tzinfo)
+        end_local = start_local + progress_delta
+        if end_local > next_month_start:
+            end_local = next_month_start
+
+        windows.append(
+            SurveyTrendWindow(
+                label=_month_label_es(year, month),
+                start_local=start_local,
+                end_local=end_local,
+            )
+        )
+    return windows
+
+
+def _resolve_survey_trend_windows(period_key: Optional[str], tenant_tz: str) -> Tuple[str, List[SurveyTrendWindow]]:
+    now_local = datetime.now(ZoneInfo(tenant_tz))
+    clean_period_key = str(period_key or "").strip()
+
+    if clean_period_key == "this_week":
+        return "week", _build_week_windows(now_local)
+    if clean_period_key == "month_to_date":
+        return "month", _build_month_same_progress_windows(now_local)
+    return "day", _build_day_windows(now_local)
+
+
+def _build_empty_survey_trends(period_grain: str, windows: List[SurveyTrendWindow]) -> Dict[str, Any]:
+    return {
+        "period_grain": period_grain,
+        "overall": [
+            {
+                "label": w.label,
+                "start": _window_iso(w.start_local),
+                "end": _window_iso(w.end_local),
+                "avg": None,
+                "count": 0,
+            }
+            for w in windows
+        ],
+        "by_question": [],
+    }
+
+
 def load_survey_response_rows(orders_sh) -> List[Dict[str, Any]]:
     try:
         ws = _ensure_ws(orders_sh, SURVEY_RESPONSES_WS, SURVEY_RESPONSES_HEADERS)
@@ -246,30 +345,33 @@ def load_survey_response_rows(orders_sh) -> List[Dict[str, Any]]:
         return []
 
 
-def build_survey_analytics(
-    orders_sh,
-    tenant_tz: str = "America/La_Paz",
-    period_key: Optional[str] = None,
-) -> Dict[str, Any]:
-    rows = load_survey_response_rows(orders_sh)
+def _resolve_selected_survey_period(period_key: Optional[str], tenant_tz: str) -> Optional[SurveyPeriod]:
+    if not period_key:
+        return None
 
-    selected_period: Optional[SurveyPeriod] = None
-    if period_key:
-        try:
-            selected_period = resolve_survey_period(period_key, tenant_tz)
-        except Exception as e:
-            log_event(
-                "survey_resolve_period_error",
-                period_key=str(period_key),
-                tenant_tz=str(tenant_tz),
-                error_type=type(e).__name__,
-                error=str(e),
-            )
-            selected_period = None
+    try:
+        return resolve_survey_period(period_key, tenant_tz)
+    except Exception as e:
+        log_event(
+            "survey_resolve_period_error",
+            period_key=str(period_key),
+            tenant_tz=str(tenant_tz),
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        return None
+
+
+def _build_survey_summary_from_rows(
+    rows: List[Dict[str, Any]],
+    tenant_tz: str,
+    selected_period: Optional[SurveyPeriod],
+) -> Dict[str, Any]:
+    filtered_rows = list(rows or [])
 
     if selected_period is not None:
-        filtered_rows: List[Dict[str, Any]] = []
-        for r in rows:
+        filtered_rows = []
+        for r in rows or []:
             created_dt = _parse_iso_dt_any(r.get("created_at"))
             if not created_dt:
                 continue
@@ -278,9 +380,7 @@ def build_survey_analytics(
             if _match_period(created_local, selected_period):
                 filtered_rows.append(r)
 
-        rows = filtered_rows
-
-    if not rows:
+    if not filtered_rows:
         return {
             "period_label": selected_period.label if selected_period else "",
             "period_range_text": _survey_period_range_text(selected_period) if selected_period else "",
@@ -296,7 +396,7 @@ def build_survey_analytics(
     general_hist = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
     by_question_map: Dict[str, Dict[str, Any]] = {}
 
-    for r in rows:
+    for r in filtered_rows:
         response_id = _safe_str(r.get("response_id"))
         if response_id:
             response_ids.add(response_id)
@@ -370,12 +470,192 @@ def build_survey_analytics(
     return {
         "period_label": selected_period.label if selected_period else "",
         "period_range_text": _survey_period_range_text(selected_period) if selected_period else "",
-        "total_answers": len(rows),
+        "total_answers": len(filtered_rows),
         "total_unique_responses": len(response_ids),
         "general_stars_avg": general_avg,
         "general_stars_hist": general_hist,
         "by_question": by_question,
     }
+
+
+def _window_contains(dt: datetime, window: SurveyTrendWindow) -> bool:
+    return window.start_local <= dt < window.end_local
+
+
+def _build_survey_trends_from_rows(
+    rows: List[Dict[str, Any]],
+    tenant_tz: str,
+    period_key: Optional[str],
+    current_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    period_grain, windows = _resolve_survey_trend_windows(period_key, tenant_tz)
+    if not windows:
+        return {"period_grain": period_grain, "overall": [], "by_question": []}
+
+    overall_values: List[List[int]] = [[] for _ in windows]
+    question_meta: Dict[str, Dict[str, Any]] = {}
+    question_values_by_window: Dict[str, List[List[int]]] = {}
+    current_question_summary: Dict[str, Dict[str, Any]] = {}
+
+    for q in list(current_summary.get("by_question") or []):
+        if normalize(q.get("answer_type", "")) != "stars":
+            continue
+        qid = _safe_str(q.get("question_id"))
+        current_question_summary[qid] = {
+            "current_avg": float(q.get("stars_avg") or 0.0),
+            "current_count": int(q.get("count") or 0),
+        }
+
+    for r in rows or []:
+        if normalize(r.get("answer_type", "")) != "stars":
+            continue
+
+        created_dt = _parse_iso_dt_any(r.get("created_at"))
+        if not created_dt:
+            continue
+
+        created_local = _to_local(created_dt, tenant_tz)
+
+        try:
+            stars_value = int(_safe_str(r.get("answer_value")))
+        except Exception:
+            continue
+
+        if stars_value < 1 or stars_value > 5:
+            continue
+
+        window_idx = -1
+        for idx, window in enumerate(windows):
+            if _window_contains(created_local, window):
+                window_idx = idx
+                break
+
+        if window_idx < 0:
+            continue
+
+        overall_values[window_idx].append(stars_value)
+
+        qid = _safe_str(r.get("question_id"))
+        if not qid:
+            continue
+
+        qtext = _safe_str(r.get("question_text"))
+        try:
+            q_order = int(_safe_str(r.get("question_order")) or "999999")
+        except Exception:
+            q_order = 999999
+
+        meta = question_meta.get(qid)
+        if meta is None:
+            question_meta[qid] = {
+                "question_text": qtext,
+                "order_hint": q_order,
+            }
+        else:
+            if qtext and not meta.get("question_text"):
+                meta["question_text"] = qtext
+            if q_order < int(meta.get("order_hint", 999999) or 999999):
+                meta["order_hint"] = q_order
+
+        if qid not in question_values_by_window:
+            question_values_by_window[qid] = [[] for _ in windows]
+        question_values_by_window[qid][window_idx].append(stars_value)
+
+    overall = []
+    for idx, window in enumerate(windows):
+        vals = overall_values[idx]
+        overall.append({
+            "label": window.label,
+            "start": _window_iso(window.start_local),
+            "end": _window_iso(window.end_local),
+            "avg": round(sum(vals) / len(vals), 2) if vals else None,
+            "count": len(vals),
+        })
+
+    question_ids = set(question_values_by_window.keys()) | set(current_question_summary.keys())
+    if not question_ids:
+        return {
+            "period_grain": period_grain,
+            "overall": overall,
+            "by_question": [],
+        }
+
+    by_question = []
+    for qid in question_ids:
+        meta = question_meta.get(qid) or {}
+        trend_values = question_values_by_window.get(qid) or [[] for _ in windows]
+        current_meta = current_question_summary.get(qid) or {}
+
+        if qid not in question_values_by_window and qid not in current_question_summary:
+            continue
+
+        by_question.append({
+            "question_id": qid,
+            "question_text": _safe_str(meta.get("question_text")),
+            "order_hint": int(meta.get("order_hint", 999999) or 999999),
+            "current_avg": current_meta.get("current_avg") if qid in current_question_summary else None,
+            "current_count": int(current_meta.get("current_count") or 0),
+            "trend": [
+                {
+                    "label": window.label,
+                    "start": _window_iso(window.start_local),
+                    "end": _window_iso(window.end_local),
+                    "avg": round(sum(vals) / len(vals), 2) if vals else None,
+                    "count": len(vals),
+                }
+                for window, vals in zip(windows, trend_values)
+            ],
+        })
+
+    by_question.sort(key=lambda x: (int(x.get("order_hint", 999999)), _safe_str(x.get("question_id"))))
+    for item in by_question:
+        item.pop("order_hint", None)
+
+    return {
+        "period_grain": period_grain,
+        "overall": overall,
+        "by_question": by_question,
+    }
+
+
+def build_survey_dashboard_data(
+    orders_sh,
+    tenant_tz: str = "America/La_Paz",
+    period_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    rows = load_survey_response_rows(orders_sh)
+    selected_period = _resolve_selected_survey_period(period_key, tenant_tz)
+    summary = _build_survey_summary_from_rows(rows, tenant_tz=tenant_tz, selected_period=selected_period)
+    period_grain, windows = _resolve_survey_trend_windows(period_key, tenant_tz)
+    trends = _build_empty_survey_trends(period_grain, windows)
+
+    if rows:
+        trends = _build_survey_trends_from_rows(
+            rows=rows,
+            tenant_tz=tenant_tz,
+            period_key=period_key,
+            current_summary=summary,
+        )
+
+    return {
+        "summary": summary,
+        "trends": trends,
+    }
+
+
+def build_survey_analytics(
+    orders_sh,
+    tenant_tz: str = "America/La_Paz",
+    period_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    return dict(
+        build_survey_dashboard_data(
+            orders_sh=orders_sh,
+            tenant_tz=tenant_tz,
+            period_key=period_key,
+        ).get("summary")
+        or {}
+    )
 
 
 # ---------------------------------------------------------

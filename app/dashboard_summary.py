@@ -9,7 +9,7 @@ from app.stats import (
     build_stats_summary_data,
     build_kpi_comparisons,
 )
-from app.survey_analytics import build_survey_analytics
+from app.survey_analytics import build_survey_dashboard_data
 
 
 def _utc_iso() -> str:
@@ -153,11 +153,13 @@ def build_dashboard_summary_data(
             continue
 
     try:
-        survey_summary = build_survey_analytics(
+        survey_dashboard = build_survey_dashboard_data(
             orders_sh=orders_sh,
             tenant_tz=tenant_tz,
             period_key=period_key,
         )
+        survey_summary = dict(survey_dashboard.get("summary") or {})
+        survey_trends = dict(survey_dashboard.get("trends") or {})
     except Exception:
         survey_summary = {
             "period_label": "",
@@ -166,6 +168,11 @@ def build_dashboard_summary_data(
             "total_unique_responses": 0,
             "general_stars_avg": 0.0,
             "general_stars_hist": {1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+            "by_question": [],
+        }
+        survey_trends = {
+            "period_grain": "day",
+            "overall": [],
             "by_question": [],
         }
 
@@ -210,6 +217,11 @@ def build_dashboard_summary_data(
             "general_stars_avg": float(survey_summary.get("general_stars_avg") or 0.0),
             "general_stars_hist": dict(survey_summary.get("general_stars_hist") or {}),
             "by_question": list(survey_summary.get("by_question") or []),
+        },
+        "survey_trends": {
+            "period_grain": str(survey_trends.get("period_grain") or "").strip(),
+            "overall": list(survey_trends.get("overall") or []),
+            "by_question": list(survey_trends.get("by_question") or []),
         },
         "insights": list(stats_data.get("insights") or []),
         "metadata": {
