@@ -571,18 +571,6 @@ def _build_consumers_dashboard_metrics_from_rows(
         else:
             bucket = "new"
 
-        if contact_norm == "66666666":
-            log_event(
-                "consumer_db_debug_contact_66666666",
-                row_idx=row_idx,
-                created_at_utc=created_dt.isoformat(),
-                created_at_local=created_local.isoformat(),
-                in_period=in_period,
-                has_reliable_contact=has_reliable_contact,
-                seen_before=seen_before,
-                bucket=bucket,
-            )
-
         if in_period:
             if bucket == "new":
                 new_orders_count += 1
