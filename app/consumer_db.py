@@ -537,7 +537,7 @@ def _build_consumers_dashboard_metrics_from_rows(
     new_orders_count = 0
     returning_orders_count = 0
     unidentified_orders_count = 0
-    paid_orders_seen_by_contact: Counter = Counter()
+    seen_paid_contacts = set()
 
     ordered_rows: List[Tuple[datetime, int, Dict[str, Any]]] = []
     for row_idx, row in enumerate(rows, start=1):
@@ -563,15 +563,23 @@ def _build_consumers_dashboard_metrics_from_rows(
         if in_period:
             paid_orders_in_period += 1
 
-            if not has_reliable_contact:
-                unidentified_orders_count += 1
-            elif int(paid_orders_seen_by_contact.get(contact_norm) or 0) > 0:
+        if not has_reliable_contact:
+            bucket = "unidentified"
+        elif contact_norm in seen_paid_contacts:
+            bucket = "returning"
+        else:
+            bucket = "new"
+
+        if in_period:
+            if bucket == "new":
+                new_orders_count += 1
+            elif bucket == "returning":
                 returning_orders_count += 1
             else:
-                new_orders_count += 1
+                unidentified_orders_count += 1
 
         if has_reliable_contact:
-            paid_orders_seen_by_contact[contact_norm] += 1
+            seen_paid_contacts.add(contact_norm)
 
         if not in_period:
             continue
