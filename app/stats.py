@@ -520,6 +520,8 @@ def _build_order_combination(items: List[Dict[str, Any]], menu_idx: Dict[str, An
 
     if not aggregated:
         return None
+    if len(aggregated) <= 1:
+        return None
 
     parts: List[str] = []
     for item_key in sorted(aggregated.keys()):
@@ -711,9 +713,11 @@ def _legacy_build_stats_summary_data(orders_sh, tenant_id: str, tenant_tz: str, 
                         "products": list(combination.get("products") or []),
                         "label": str(combination.get("label") or "").strip(),
                         "orders_count": 1,
+                        "sales": float(order_sales),
                     }
                 else:
                     current_combo["orders_count"] = int(current_combo.get("orders_count") or 0) + 1
+                    current_combo["sales"] = float(current_combo.get("sales") or 0.0) + float(order_sales)
 
         weekday = _weekday_es(dt_local)
         if weekday not in weekday_stats:
@@ -847,7 +851,11 @@ def _legacy_build_stats_summary_data(orders_sh, tenant_id: str, tenant_tz: str, 
     top_order_combinations = []
     sorted_combinations = sorted(
         combination_counts.values(),
-        key=lambda x: (-int(x.get("orders_count") or 0), str(x.get("label") or "")),
+        key=lambda x: (
+            -int(x.get("orders_count") or 0),
+            -float(x.get("sales") or 0.0),
+            str(x.get("label") or ""),
+        ),
     )[:5]
     for combo in sorted_combinations:
         orders_count = int(combo.get("orders_count") or 0)
@@ -855,6 +863,7 @@ def _legacy_build_stats_summary_data(orders_sh, tenant_id: str, tenant_tz: str, 
             "products": list(combo.get("products") or []),
             "label": str(combo.get("label") or "").strip(),
             "orders_count": orders_count,
+            "sales": round(float(combo.get("sales") or 0.0), 2),
             "percent": round((orders_count / orders_paid) * 100.0, 2) if orders_paid > 0 else 0.0,
         })
 
@@ -1425,9 +1434,11 @@ def _compute_stats_summary_from_source(source_data: Dict[str, Any], tenant_id: s
                         "products": list(combination.get("products") or []),
                         "label": str(combination.get("label") or "").strip(),
                         "orders_count": 1,
+                        "sales": float(order_sales),
                     }
                 else:
                     current_combo["orders_count"] = int(current_combo.get("orders_count") or 0) + 1
+                    current_combo["sales"] = float(current_combo.get("sales") or 0.0) + float(order_sales)
 
         weekday = _weekday_es(dt_local)
         if weekday not in weekday_stats:
@@ -1561,7 +1572,11 @@ def _compute_stats_summary_from_source(source_data: Dict[str, Any], tenant_id: s
     top_order_combinations = []
     sorted_combinations = sorted(
         combination_counts.values(),
-        key=lambda x: (-int(x.get("orders_count") or 0), str(x.get("label") or "")),
+        key=lambda x: (
+            -int(x.get("orders_count") or 0),
+            -float(x.get("sales") or 0.0),
+            str(x.get("label") or ""),
+        ),
     )[:5]
     for combo in sorted_combinations:
         orders_count = int(combo.get("orders_count") or 0)
@@ -1569,6 +1584,7 @@ def _compute_stats_summary_from_source(source_data: Dict[str, Any], tenant_id: s
             "products": list(combo.get("products") or []),
             "label": str(combo.get("label") or "").strip(),
             "orders_count": orders_count,
+            "sales": round(float(combo.get("sales") or 0.0), 2),
             "percent": round((orders_count / orders_paid) * 100.0, 2) if orders_paid > 0 else 0.0,
         })
 
