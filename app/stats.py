@@ -479,6 +479,68 @@ def _parse_items(items_field: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _item_qty(it: Dict[str, Any]) -> int:
+    try:
+        qty = int(it.get("qty", 1) or 1)
+    except Exception:
+        qty = 1
+    return max(1, qty)
+
+
+def _item_display_name(it: Dict[str, Any], menu_idx: Dict[str, Any]) -> str:
+    sku = str(it.get("sku", "") or "").strip()
+    if sku and sku in menu_idx:
+        return str(menu_idx[sku].get("name") or sku).strip() or sku
+
+    item_name = str(it.get("name", "") or "").strip()
+    if item_name:
+        return item_name
+
+    return sku
+
+
+def _build_order_combination(items: List[Dict[str, Any]], menu_idx: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    aggregated: Dict[str, Dict[str, Any]] = {}
+
+    for it in items or []:
+        item_name = _item_display_name(it, menu_idx)
+        if not item_name:
+            continue
+
+        qty = _item_qty(it)
+        item_key = normalize(item_name)
+        current = aggregated.get(item_key)
+        if current is None:
+            aggregated[item_key] = {
+                "name": item_name,
+                "qty": qty,
+            }
+        else:
+            current["qty"] = int(current.get("qty") or 0) + qty
+
+    if not aggregated:
+        return None
+
+    parts: List[str] = []
+    for item_key in sorted(aggregated.keys()):
+        row = aggregated[item_key]
+        item_name = str(row.get("name") or "").strip()
+        qty = int(row.get("qty") or 0)
+        if qty > 1:
+            parts.append(f"{item_name} x{qty}")
+        else:
+            parts.append(item_name)
+
+    if not parts:
+        return None
+
+    return {
+        "key": "||".join(parts),
+        "products": list(parts),
+        "label": " + ".join(parts),
+    }
+
+
 def _bar(value: float, max_value: float, width: int = 10) -> str:
     if max_value <= 0:
         return ""
@@ -570,6 +632,8 @@ def _legacy_build_stats_summary_data(orders_sh, tenant_id: str, tenant_tz: str, 
     sku_sales: Dict[str, float] = {}
     cat_sales: Dict[str, float] = {}
     cat_orders: Dict[str, int] = {}
+    item_count_distribution: Dict[int, int] = {}
+    combination_counts: Dict[str, Dict[str, Any]] = {}
     weekday_stats: Dict[str, Dict[str, float]] = {}
     hour_stats_sales: Dict[str, float] = {}
     hour_stats_orders: Dict[str, int] = {}
@@ -610,14 +674,9 @@ def _legacy_build_stats_summary_data(orders_sh, tenant_id: str, tenant_tz: str, 
 
         cats_in_order: set = set()
         order_units = 0
-
         for it in items:
             sku = str(it.get("sku", "") or "").strip()
-            try:
-                qty = int(it.get("qty", 1) or 1)
-            except Exception:
-                qty = 1
-            qty = max(1, qty)
+            qty = _item_qty(it)
 
             if not sku:
                 continue
@@ -637,6 +696,24 @@ def _legacy_build_stats_summary_data(orders_sh, tenant_id: str, tenant_tz: str, 
 
             sku_sales[sku] = sku_sales.get(sku, 0.0) + (price * qty)
             cats_in_order.add(cat)
+
+        if order_units <= 0 and order_sales > 0:
+            order_units = 1
+
+        item_count_distribution[order_units] = item_count_distribution.get(order_units, 0) + 1
+        combination = _build_order_combination(items, menu_idx)
+        if combination is not None:
+            combo_key = str(combination.get("key") or "").strip()
+            if combo_key:
+                current_combo = combination_counts.get(combo_key)
+                if current_combo is None:
+                    combination_counts[combo_key] = {
+                        "products": list(combination.get("products") or []),
+                        "label": str(combination.get("label") or "").strip(),
+                        "orders_count": 1,
+                    }
+                else:
+                    current_combo["orders_count"] = int(current_combo.get("orders_count") or 0) + 1
 
         weekday = _weekday_es(dt_local)
         if weekday not in weekday_stats:
@@ -749,11 +826,36 @@ def _legacy_build_stats_summary_data(orders_sh, tenant_id: str, tenant_tz: str, 
         })
 
     categories = []
+    total_category_sales = sum(float(sales) for _, sales in top_cat)
     for cat, sales in top_cat:
         categories.append({
             "name": cat,
             "sales": round(float(sales), 2),
             "orders": int(cat_orders.get(cat, 0)),
+            "percent": round((float(sales) / total_category_sales) * 100.0, 2) if total_category_sales > 0 else 0.0,
+        })
+
+    order_item_count_distribution_out = []
+    for item_count in sorted(item_count_distribution.keys()):
+        orders_count = int(item_count_distribution[item_count] or 0)
+        order_item_count_distribution_out.append({
+            "item_count": int(item_count),
+            "orders_count": orders_count,
+            "percent": round((orders_count / orders_paid) * 100.0, 2) if orders_paid > 0 else 0.0,
+        })
+
+    top_order_combinations = []
+    sorted_combinations = sorted(
+        combination_counts.values(),
+        key=lambda x: (-int(x.get("orders_count") or 0), str(x.get("label") or "")),
+    )[:5]
+    for combo in sorted_combinations:
+        orders_count = int(combo.get("orders_count") or 0)
+        top_order_combinations.append({
+            "products": list(combo.get("products") or []),
+            "label": str(combo.get("label") or "").strip(),
+            "orders_count": orders_count,
+            "percent": round((orders_count / orders_paid) * 100.0, 2) if orders_paid > 0 else 0.0,
         })
 
     return {
@@ -777,6 +879,8 @@ def _legacy_build_stats_summary_data(orders_sh, tenant_id: str, tenant_tz: str, 
         "sales_by_hour": sales_by_hour,
         "top_products": top_products,
         "categories": categories,
+        "order_item_count_distribution": order_item_count_distribution_out,
+        "top_order_combinations": top_order_combinations,
         "insights": insights,
     }
 
@@ -1244,6 +1348,8 @@ def _compute_stats_summary_from_source(source_data: Dict[str, Any], tenant_id: s
     sku_sales: Dict[str, float] = {}
     cat_sales: Dict[str, float] = {}
     cat_orders: Dict[str, int] = {}
+    item_count_distribution: Dict[int, int] = {}
+    combination_counts: Dict[str, Dict[str, Any]] = {}
     weekday_stats: Dict[str, Dict[str, float]] = {}
     hour_stats_sales: Dict[str, float] = {}
     hour_stats_orders: Dict[str, int] = {}
@@ -1285,11 +1391,7 @@ def _compute_stats_summary_from_source(source_data: Dict[str, Any], tenant_id: s
         order_units = 0
         for it in items:
             sku = str(it.get("sku", "") or "").strip()
-            try:
-                qty = int(it.get("qty", 1) or 1)
-            except Exception:
-                qty = 1
-            qty = max(1, qty)
+            qty = _item_qty(it)
             if not sku:
                 continue
 
@@ -1308,6 +1410,24 @@ def _compute_stats_summary_from_source(source_data: Dict[str, Any], tenant_id: s
 
             sku_sales[sku] = sku_sales.get(sku, 0.0) + (price * qty)
             cats_in_order.add(cat)
+
+        if order_units <= 0 and order_sales > 0:
+            order_units = 1
+
+        item_count_distribution[order_units] = item_count_distribution.get(order_units, 0) + 1
+        combination = _build_order_combination(items, menu_idx)
+        if combination is not None:
+            combo_key = str(combination.get("key") or "").strip()
+            if combo_key:
+                current_combo = combination_counts.get(combo_key)
+                if current_combo is None:
+                    combination_counts[combo_key] = {
+                        "products": list(combination.get("products") or []),
+                        "label": str(combination.get("label") or "").strip(),
+                        "orders_count": 1,
+                    }
+                else:
+                    current_combo["orders_count"] = int(current_combo.get("orders_count") or 0) + 1
 
         weekday = _weekday_es(dt_local)
         if weekday not in weekday_stats:
@@ -1420,11 +1540,36 @@ def _compute_stats_summary_from_source(source_data: Dict[str, Any], tenant_id: s
         })
 
     categories = []
+    total_category_sales = sum(float(sales) for _, sales in top_cat)
     for cat, sales in top_cat:
         categories.append({
             "name": cat,
             "sales": round(float(sales), 2),
             "orders": int(cat_orders.get(cat, 0)),
+            "percent": round((float(sales) / total_category_sales) * 100.0, 2) if total_category_sales > 0 else 0.0,
+        })
+
+    order_item_count_distribution_out = []
+    for item_count in sorted(item_count_distribution.keys()):
+        orders_count = int(item_count_distribution[item_count] or 0)
+        order_item_count_distribution_out.append({
+            "item_count": int(item_count),
+            "orders_count": orders_count,
+            "percent": round((orders_count / orders_paid) * 100.0, 2) if orders_paid > 0 else 0.0,
+        })
+
+    top_order_combinations = []
+    sorted_combinations = sorted(
+        combination_counts.values(),
+        key=lambda x: (-int(x.get("orders_count") or 0), str(x.get("label") or "")),
+    )[:5]
+    for combo in sorted_combinations:
+        orders_count = int(combo.get("orders_count") or 0)
+        top_order_combinations.append({
+            "products": list(combo.get("products") or []),
+            "label": str(combo.get("label") or "").strip(),
+            "orders_count": orders_count,
+            "percent": round((orders_count / orders_paid) * 100.0, 2) if orders_paid > 0 else 0.0,
         })
 
     return {
@@ -1448,6 +1593,8 @@ def _compute_stats_summary_from_source(source_data: Dict[str, Any], tenant_id: s
         "sales_by_hour": sales_by_hour,
         "top_products": top_products,
         "categories": categories,
+        "order_item_count_distribution": order_item_count_distribution_out,
+        "top_order_combinations": top_order_combinations,
         "insights": insights,
     }
 

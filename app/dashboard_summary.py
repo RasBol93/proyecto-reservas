@@ -189,6 +189,8 @@ def build_dashboard_summary_data(
         "sales_by_hour": list(stats_data.get("sales_by_hour") or []),
         "top_products": list(stats_data.get("top_products") or []),
         "categories": list(stats_data.get("categories") or []),
+        "order_item_count_distribution": list(stats_data.get("order_item_count_distribution") or []),
+        "top_order_combinations": list(stats_data.get("top_order_combinations") or []),
         "sales_goal": _build_sales_goal_payload(
             settings_map=settings_map,
             period_key=period_key,
