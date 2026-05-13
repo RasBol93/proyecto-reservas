@@ -493,8 +493,9 @@ def _is_paid_order(order: Dict[str, Any]) -> bool:
 def _serialize_customer_order_type_distribution(
     new_orders_count: int,
     returning_orders_count: int,
+    unidentified_orders_count: int,
 ) -> List[Dict[str, Any]]:
-    total_classified = int(new_orders_count) + int(returning_orders_count)
+    total_classified = int(new_orders_count) + int(returning_orders_count) + int(unidentified_orders_count)
     if total_classified <= 0:
         return []
 
@@ -511,7 +512,17 @@ def _serialize_customer_order_type_distribution(
             "orders_count": int(returning_orders_count),
             "percent": round((float(returning_orders_count) / float(total_classified)) * 100.0, 2),
         },
+        {
+            "type": "unidentified",
+            "label": "Sin identificar",
+            "orders_count": int(unidentified_orders_count),
+            "percent": round((float(unidentified_orders_count) / float(total_classified)) * 100.0, 2),
+        },
     ]
+
+
+def _is_reliable_contact_norm(contact_norm: str) -> bool:
+    return len(str(contact_norm or "").strip()) >= 3
 
 
 def _build_consumers_dashboard_metrics_from_rows(
@@ -525,6 +536,7 @@ def _build_consumers_dashboard_metrics_from_rows(
     paid_orders_in_period = 0
     new_orders_count = 0
     returning_orders_count = 0
+    unidentified_orders_count = 0
     paid_orders_seen_by_contact: Counter = Counter()
 
     ordered_rows: List[Tuple[datetime, int, Dict[str, Any]]] = []
@@ -546,29 +558,31 @@ def _build_consumers_dashboard_metrics_from_rows(
 
         contact_raw = str(row.get("customer_contact") or "").strip()
         contact_norm = _normalize_contact(contact_raw)
+        has_reliable_contact = _is_reliable_contact_norm(contact_norm)
 
         if in_period:
             paid_orders_in_period += 1
 
-            if contact_norm:
-                if int(paid_orders_seen_by_contact.get(contact_norm) or 0) > 0:
-                    returning_orders_count += 1
-                else:
-                    new_orders_count += 1
+            if not has_reliable_contact:
+                unidentified_orders_count += 1
+            elif int(paid_orders_seen_by_contact.get(contact_norm) or 0) > 0:
+                returning_orders_count += 1
+            else:
+                new_orders_count += 1
 
-        if contact_norm:
+        if has_reliable_contact:
             paid_orders_seen_by_contact[contact_norm] += 1
 
         if not in_period:
             continue
 
-        display_contact = contact_norm if contact_norm else "Sin contacto"
+        display_contact = contact_norm if has_reliable_contact else "Sin contacto"
 
         raw_name = str(row.get("customer_name") or "").strip()
         display_name = _clean_display_name(raw_name)
         name_norm = _normalized_name_key(display_name)
 
-        consumer_key = _build_consumer_key(contact_norm, name_norm, row_idx)
+        consumer_key = _build_consumer_key(contact_norm if has_reliable_contact else "", name_norm, row_idx)
 
         try:
             total_amount = float(row.get("total_amount") or 0)
@@ -580,7 +594,7 @@ def _build_consumers_dashboard_metrics_from_rows(
         if consumer_key not in consumers:
             consumers[consumer_key] = {
                 "contact": display_contact,
-                "contact_norm": contact_norm,
+                "contact_norm": contact_norm if has_reliable_contact else "",
                 "name_counter": Counter(),
                 "latest_name": display_name,
                 "latest_name_norm": name_norm,
@@ -626,6 +640,7 @@ def _build_consumers_dashboard_metrics_from_rows(
         consumers_output.append({
             "name": resolved_name,
             "contact": c["contact"],
+            "contact_norm": c["contact_norm"],
             "orders_count": int(c["orders_count"]),
             "total_spent": round(float(c["total_spent"]), 2),
             "last_purchase_dt": c["last_purchase_dt"],
@@ -645,6 +660,7 @@ def _build_consumers_dashboard_metrics_from_rows(
         dict(c)
         for c in consumers_output
         if int(c.get("orders_count") or 0) > 1
+        and _is_reliable_contact_norm(str(c.get("contact_norm") or ""))
     ]
     recurrent_customers.sort(
         key=lambda x: (
@@ -660,6 +676,7 @@ def _build_consumers_dashboard_metrics_from_rows(
         "customer_order_type_distribution": _serialize_customer_order_type_distribution(
             new_orders_count=new_orders_count,
             returning_orders_count=returning_orders_count,
+            unidentified_orders_count=unidentified_orders_count,
         ),
         "top_recurrent_customers": recurrent_customers[:3],
     }
