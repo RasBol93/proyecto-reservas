@@ -23,6 +23,7 @@ from app.pickup import generate_public_pickup_slots
 from app.config_bundle import load_config_bundle, build_fresh_open_status
 from app.content import upsert_content_entries
 from app.dashboard_summary import build_dashboard_summary_data
+from app.dashboard_orders_detail import build_dashboard_orders_detail
 
 try:
     from app.orders import append_order_row
@@ -577,6 +578,37 @@ def admin_dashboard_summary(
         tenant_id=resolved_tenant_id,
         tenant_tz=tenant_tz,
         period_key=str(period or "today").strip() or "today",
+    )
+
+
+@router.get("/admin/dashboard/orders-detail")
+def admin_dashboard_orders_detail(
+    tenant_id: str = Query(...),
+    token: str = Query(...),
+    period: str = Query("today"),
+):
+    require_admin_token(token)
+    validate_tenant_id(tenant_id)
+
+    gc = get_gspread_client()
+    tenant = get_tenant_or_404(tenant_id, gc=gc)
+
+    if not tenant.get("orders_enabled", False):
+        raise HTTPException(status_code=400, detail="Orders not enabled")
+
+    clean_period = str(period or "today").strip() or "today"
+    if clean_period not in {"today", "this_week", "month_to_date"}:
+        raise HTTPException(status_code=400, detail="Unsupported period")
+
+    orders_sh = _get_orders_sheet(gc, tenant["orders_sheet_id"])
+    tenant_tz = str(tenant.get("timezone") or "America/La_Paz").strip() or "America/La_Paz"
+    resolved_tenant_id = str(tenant.get("tenant_id") or tenant_id).strip()
+
+    return build_dashboard_orders_detail(
+        orders_sh=orders_sh,
+        tenant_id=resolved_tenant_id,
+        tenant_tz=tenant_tz,
+        period_key=clean_period,
     )
 
 
