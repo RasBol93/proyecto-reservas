@@ -138,6 +138,8 @@ def build_dashboard_summary_data(
             orders_sh=orders_sh,
             tenant_tz=tenant_tz,
             period_key=period_key,
+            orders_records=stats_source.get("orders_records"),
+            menu_idx=stats_source.get("menu_idx"),
         )
     except Exception:
         consumers = []

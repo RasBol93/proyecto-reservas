@@ -696,15 +696,18 @@ def aggregate_consumers(
     tenant_tz: str,
     period_key: str,
     min_orders: int,
+    orders_records: Optional[List[Dict[str, Any]]] = None,
+    menu_idx: Optional[Dict[str, Any]] = None,
 ) -> Tuple[ConsumerPeriod, List[Dict[str, Any]], int]:
     period = resolve_consumer_period(period_key, tenant_tz)
-    rows = _load_orders_records(orders_sh)
+    rows = list(orders_records or []) if orders_records is not None else _load_orders_records(orders_sh)
 
-    try:
-        menu_idx = load_menu_index(orders_sh, force=False)
-    except Exception as e:
-        log_event("consumer_db_menu_load_failed", error=str(e))
-        menu_idx = {}
+    if menu_idx is None:
+        try:
+            menu_idx = load_menu_index(orders_sh, force=False)
+        except Exception as e:
+            log_event("consumer_db_menu_load_failed", error=str(e))
+            menu_idx = {}
     metrics = _build_consumers_dashboard_metrics_from_rows(
         rows=rows,
         menu_idx=menu_idx,
@@ -730,15 +733,18 @@ def build_dashboard_customer_metrics(
     orders_sh,
     tenant_tz: str,
     period_key: str,
+    orders_records: Optional[List[Dict[str, Any]]] = None,
+    menu_idx: Optional[Dict[str, Any]] = None,
 ) -> Tuple[ConsumerPeriod, List[Dict[str, Any]], int, List[Dict[str, Any]], List[Dict[str, Any]]]:
     period = resolve_consumer_period(period_key, tenant_tz)
-    rows = _load_orders_records(orders_sh)
+    rows = list(orders_records or []) if orders_records is not None else _load_orders_records(orders_sh)
 
-    try:
-        menu_idx = load_menu_index(orders_sh, force=False)
-    except Exception as e:
-        log_event("consumer_db_menu_load_failed", error=str(e))
-        menu_idx = {}
+    if menu_idx is None:
+        try:
+            menu_idx = load_menu_index(orders_sh, force=False)
+        except Exception as e:
+            log_event("consumer_db_menu_load_failed", error=str(e))
+            menu_idx = {}
 
     metrics = _build_consumers_dashboard_metrics_from_rows(
         rows=rows,

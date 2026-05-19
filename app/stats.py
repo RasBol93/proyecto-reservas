@@ -1261,6 +1261,20 @@ def load_stats_source_data(orders_sh) -> Dict[str, Any]:
         hdr_idx = _detect_header_row(values, required_headers=["order_id", "created_at", "status"], max_scan=30)
         headers_norm = [normalize(h) for h in values[hdr_idx]]
 
+    orders_records: List[Dict[str, Any]] = []
+    if values and headers_norm:
+        record_keys = [str(h or "").strip().replace(" ", "_") for h in headers_norm]
+        for row in values[hdr_idx + 1:]:
+            if not any(str(cell or "").strip() for cell in row):
+                continue
+
+            rec: Dict[str, Any] = {}
+            for col_idx, key in enumerate(record_keys):
+                if not key:
+                    continue
+                rec[key] = row[col_idx] if col_idx < len(row) else ""
+            orders_records.append(rec)
+
     try:
         menu_idx = load_menu_index(orders_sh)
     except Exception:
@@ -1282,6 +1296,7 @@ def load_stats_source_data(orders_sh) -> Dict[str, Any]:
         "orders_values": values,
         "orders_hdr_idx": hdr_idx,
         "orders_headers_norm": headers_norm,
+        "orders_records": orders_records,
         "menu_idx": menu_idx,
         "events_values": events_values,
         "events_hdr_idx": events_hdr_idx,
