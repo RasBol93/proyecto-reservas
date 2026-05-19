@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from app.sheets import read_records_manual
+from app.stats import resolve_selected_period_context
 from app.utils import normalize, log_event
 
 from app.survey_core import (
@@ -118,7 +119,24 @@ def survey_period_options(tenant_tz: str) -> List[Tuple[str, str]]:
     ]
 
 
-def resolve_survey_period(period_key: str, tenant_tz: str) -> SurveyPeriod:
+def resolve_survey_period(
+    period_key: str,
+    tenant_tz: str,
+    *,
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
+) -> SurveyPeriod:
+    context = resolve_selected_period_context(
+        tenant_tz=tenant_tz,
+        period_key=period_key,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
+    if context.label:
+        return SurveyPeriod(context.key, context.label, context.start_local, context.end_local)
+
     tz = ZoneInfo(tenant_tz)
     now_local = datetime.now(tz)
 
@@ -248,12 +266,13 @@ def _window_iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
-def _build_day_windows(now_local: datetime, count: int = 7) -> List[SurveyTrendWindow]:
-    current_day_start = _start_of_day(now_local)
+def _build_day_windows(period_end_local: datetime, count: int = 7, *, is_partial: bool) -> List[SurveyTrendWindow]:
+    anchor_local = period_end_local if is_partial else (period_end_local - timedelta(seconds=1))
+    current_day_start = _start_of_day(anchor_local)
     windows: List[SurveyTrendWindow] = []
     for idx in range(count - 1, -1, -1):
         start_local = current_day_start - timedelta(days=idx)
-        end_local = now_local if idx == 0 else start_local + timedelta(days=1)
+        end_local = period_end_local if idx == 0 else start_local + timedelta(days=1)
         windows.append(
             SurveyTrendWindow(
                 label=start_local.strftime("%d/%m"),
@@ -264,12 +283,12 @@ def _build_day_windows(now_local: datetime, count: int = 7) -> List[SurveyTrendW
     return windows
 
 
-def _build_week_windows(now_local: datetime, count: int = 7) -> List[SurveyTrendWindow]:
-    current_week_start = _start_of_week(now_local)
+def _build_week_windows(period_start_local: datetime, period_end_local: datetime, count: int = 7) -> List[SurveyTrendWindow]:
+    current_week_start = period_start_local
     windows: List[SurveyTrendWindow] = []
     for idx in range(count - 1, -1, -1):
         start_local = current_week_start - timedelta(days=7 * idx)
-        end_local = now_local if idx == 0 else start_local + timedelta(days=7)
+        end_local = period_end_local if idx == 0 else start_local + timedelta(days=7)
         windows.append(
             SurveyTrendWindow(
                 label=f"Sem {start_local.strftime('%d/%m')}",
@@ -280,18 +299,21 @@ def _build_week_windows(now_local: datetime, count: int = 7) -> List[SurveyTrend
     return windows
 
 
-def _build_month_same_progress_windows(now_local: datetime, count: int = 7) -> List[SurveyTrendWindow]:
-    current_month_start = _start_of_month(now_local)
-    progress_delta = now_local - current_month_start
+def _build_month_windows(period_start_local: datetime, period_end_local: datetime, count: int = 7, *, is_partial: bool) -> List[SurveyTrendWindow]:
+    current_month_start = period_start_local
+    progress_delta = period_end_local - current_month_start
     windows: List[SurveyTrendWindow] = []
 
     for idx in range(count - 1, -1, -1):
-        year, month = _shift_year_month(now_local.year, now_local.month, -idx)
-        start_local = datetime(year, month, 1, 0, 0, 0, tzinfo=now_local.tzinfo)
+        year, month = _shift_year_month(current_month_start.year, current_month_start.month, -idx)
+        start_local = datetime(year, month, 1, 0, 0, 0, tzinfo=current_month_start.tzinfo)
         next_year, next_month = _shift_year_month(year, month, 1)
-        next_month_start = datetime(next_year, next_month, 1, 0, 0, 0, tzinfo=now_local.tzinfo)
-        end_local = start_local + progress_delta
-        if end_local > next_month_start:
+        next_month_start = datetime(next_year, next_month, 1, 0, 0, 0, tzinfo=current_month_start.tzinfo)
+        if is_partial:
+            end_local = start_local + progress_delta
+            if end_local > next_month_start:
+                end_local = next_month_start
+        else:
             end_local = next_month_start
 
         windows.append(
@@ -304,15 +326,28 @@ def _build_month_same_progress_windows(now_local: datetime, count: int = 7) -> L
     return windows
 
 
-def _resolve_survey_trend_windows(period_key: Optional[str], tenant_tz: str) -> Tuple[str, List[SurveyTrendWindow]]:
-    now_local = datetime.now(ZoneInfo(tenant_tz))
-    clean_period_key = str(period_key or "").strip()
+def _resolve_survey_trend_windows(
+    period_key: Optional[str],
+    tenant_tz: str,
+    *,
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
+) -> Tuple[str, List[SurveyTrendWindow]]:
+    clean_period_key = str(period_key or "").strip() or "today"
+    context = resolve_selected_period_context(
+        tenant_tz=tenant_tz,
+        period_key=clean_period_key,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
 
     if clean_period_key == "this_week":
-        return "week", _build_week_windows(now_local)
+        return "week", _build_week_windows(context.start_local, context.end_local)
     if clean_period_key == "month_to_date":
-        return "month", _build_month_same_progress_windows(now_local)
-    return "day", _build_day_windows(now_local)
+        return "month", _build_month_windows(context.start_local, context.end_local, is_partial=context.is_partial)
+    return "day", _build_day_windows(context.end_local, is_partial=context.is_partial)
 
 
 def _build_empty_survey_trends(period_grain: str, windows: List[SurveyTrendWindow]) -> Dict[str, Any]:
@@ -345,12 +380,25 @@ def load_survey_response_rows(orders_sh) -> List[Dict[str, Any]]:
         return []
 
 
-def _resolve_selected_survey_period(period_key: Optional[str], tenant_tz: str) -> Optional[SurveyPeriod]:
+def _resolve_selected_survey_period(
+    period_key: Optional[str],
+    tenant_tz: str,
+    *,
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
+) -> Optional[SurveyPeriod]:
     if not period_key:
         return None
 
     try:
-        return resolve_survey_period(period_key, tenant_tz)
+        return resolve_survey_period(
+            period_key,
+            tenant_tz,
+            selected_date=selected_date,
+            selected_week_start=selected_week_start,
+            selected_month=selected_month,
+        )
     except Exception as e:
         log_event(
             "survey_resolve_period_error",
@@ -487,8 +535,18 @@ def _build_survey_trends_from_rows(
     tenant_tz: str,
     period_key: Optional[str],
     current_summary: Dict[str, Any],
+    *,
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
 ) -> Dict[str, Any]:
-    period_grain, windows = _resolve_survey_trend_windows(period_key, tenant_tz)
+    period_grain, windows = _resolve_survey_trend_windows(
+        period_key,
+        tenant_tz,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
     if not windows:
         return {"period_grain": period_grain, "overall": [], "by_question": []}
 
@@ -622,11 +680,26 @@ def build_survey_dashboard_data(
     orders_sh,
     tenant_tz: str = "America/La_Paz",
     period_key: Optional[str] = None,
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
 ) -> Dict[str, Any]:
     rows = load_survey_response_rows(orders_sh)
-    selected_period = _resolve_selected_survey_period(period_key, tenant_tz)
+    selected_period = _resolve_selected_survey_period(
+        period_key,
+        tenant_tz,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
     summary = _build_survey_summary_from_rows(rows, tenant_tz=tenant_tz, selected_period=selected_period)
-    period_grain, windows = _resolve_survey_trend_windows(period_key, tenant_tz)
+    period_grain, windows = _resolve_survey_trend_windows(
+        period_key,
+        tenant_tz,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
     trends = _build_empty_survey_trends(period_grain, windows)
 
     if rows:
@@ -635,6 +708,9 @@ def build_survey_dashboard_data(
             tenant_tz=tenant_tz,
             period_key=period_key,
             current_summary=summary,
+            selected_date=selected_date,
+            selected_week_start=selected_week_start,
+            selected_month=selected_month,
         )
 
     return {

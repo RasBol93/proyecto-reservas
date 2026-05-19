@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from app.menu import load_menu_index
 from app.sheets import detect_header_row
+from app.stats import resolve_selected_period_context
 from app.telegram_keyboard import kb
 from app.utils import log_event, normalize
 
@@ -124,7 +125,24 @@ def consumer_filters_inline_kb(tenant_id: str, period_key: str) -> Dict[str, Any
     ])
 
 
-def resolve_consumer_period(period_key: str, tenant_tz: str) -> ConsumerPeriod:
+def resolve_consumer_period(
+    period_key: str,
+    tenant_tz: str,
+    *,
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
+) -> ConsumerPeriod:
+    context = resolve_selected_period_context(
+        tenant_tz=tenant_tz,
+        period_key=period_key,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
+    if context.label:
+        return ConsumerPeriod(context.key, context.label, context.start_local, context.end_local)
+
     tz = ZoneInfo(tenant_tz)
     now_local = datetime.now(tz)
 
@@ -698,8 +716,17 @@ def aggregate_consumers(
     min_orders: int,
     orders_records: Optional[List[Dict[str, Any]]] = None,
     menu_idx: Optional[Dict[str, Any]] = None,
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
 ) -> Tuple[ConsumerPeriod, List[Dict[str, Any]], int]:
-    period = resolve_consumer_period(period_key, tenant_tz)
+    period = resolve_consumer_period(
+        period_key,
+        tenant_tz,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
     rows = list(orders_records or []) if orders_records is not None else _load_orders_records(orders_sh)
 
     if menu_idx is None:
@@ -735,8 +762,17 @@ def build_dashboard_customer_metrics(
     period_key: str,
     orders_records: Optional[List[Dict[str, Any]]] = None,
     menu_idx: Optional[Dict[str, Any]] = None,
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
 ) -> Tuple[ConsumerPeriod, List[Dict[str, Any]], int, List[Dict[str, Any]], List[Dict[str, Any]]]:
-    period = resolve_consumer_period(period_key, tenant_tz)
+    period = resolve_consumer_period(
+        period_key,
+        tenant_tz,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
     rows = list(orders_records or []) if orders_records is not None else _load_orders_records(orders_sh)
 
     if menu_idx is None:

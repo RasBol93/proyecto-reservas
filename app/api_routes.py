@@ -558,6 +558,9 @@ def admin_dashboard_summary(
     tenant_id: str = Query(...),
     token: str = Query(...),
     period: str = Query("today"),
+    date: str | None = Query(None),
+    week_start: str | None = Query(None),
+    month: str | None = Query(None),
 ):
     require_admin_token(token)
     validate_tenant_id(tenant_id)
@@ -578,6 +581,9 @@ def admin_dashboard_summary(
         tenant_id=resolved_tenant_id,
         tenant_tz=tenant_tz,
         period_key=str(period or "today").strip() or "today",
+        selected_date=date,
+        selected_week_start=week_start,
+        selected_month=month,
     )
 
 
@@ -586,6 +592,9 @@ def admin_dashboard_orders_detail(
     tenant_id: str = Query(...),
     token: str = Query(...),
     period: str = Query("today"),
+    date: str | None = Query(None),
+    week_start: str | None = Query(None),
+    month: str | None = Query(None),
 ):
     require_admin_token(token)
     validate_tenant_id(tenant_id)
@@ -609,6 +618,9 @@ def admin_dashboard_orders_detail(
         tenant_id=resolved_tenant_id,
         tenant_tz=tenant_tz,
         period_key=clean_period,
+        selected_date=date,
+        selected_week_start=week_start,
+        selected_month=month,
     )
 
 

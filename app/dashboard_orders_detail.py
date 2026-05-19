@@ -182,12 +182,21 @@ def build_dashboard_orders_detail(
     tenant_id: str,
     tenant_tz: str,
     period_key: str = "today",
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
 ) -> Dict[str, Any]:
     clean_period_key = str(period_key or "today").strip() or "today"
     if clean_period_key not in ALLOWED_PERIOD_KEYS:
         raise ValueError("Unsupported period")
 
-    period = resolve_period(tenant_tz, clean_period_key)
+    period = resolve_period(
+        tenant_tz,
+        clean_period_key,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
     rows = _load_orders_records(orders_sh)
 
     try:

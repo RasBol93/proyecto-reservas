@@ -303,6 +303,16 @@ class Period:
     end_utc: datetime
 
 
+@dataclass
+class SelectedPeriodContext:
+    key: str
+    label: str
+    start_local: datetime
+    end_local: datetime
+    is_partial: bool
+    is_current: bool
+
+
 def build_periods(tenant_tz: str, now_utc: Optional[datetime] = None) -> List[Tuple[str, str]]:
     if now_utc is None:
         now_utc = _now_utc()
@@ -336,7 +346,132 @@ def build_periods(tenant_tz: str, now_utc: Optional[datetime] = None) -> List[Tu
     ]
 
 
-def resolve_period(tenant_tz: str, period_key: str, now_utc: Optional[datetime] = None) -> Period:
+def _parse_selected_local_date(value: str) -> date:
+    raw = str(value or "").strip()
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+
+def _parse_selected_year_month(value: str) -> Tuple[int, int]:
+    raw = str(value or "").strip()
+    try:
+        parsed = datetime.strptime(raw, "%Y-%m")
+        return parsed.year, parsed.month
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid month format. Use YYYY-MM.")
+
+
+def resolve_selected_period_context(
+    tenant_tz: str,
+    period_key: str,
+    now_utc: Optional[datetime] = None,
+    *,
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
+) -> SelectedPeriodContext:
+    if now_utc is None:
+        now_utc = _now_utc()
+
+    tz = _tz(tenant_tz)
+    if tz is None:
+        now_local = now_utc
+    else:
+        now_local = now_utc.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+
+    has_date = bool(str(selected_date or "").strip())
+    has_week_start = bool(str(selected_week_start or "").strip())
+    has_month = bool(str(selected_month or "").strip())
+
+    if period_key == "today":
+        if has_week_start or has_month:
+            raise HTTPException(status_code=400, detail="period=today only supports the date parameter.")
+        if has_date:
+            day_local = _parse_selected_local_date(selected_date or "")
+            today_local = now_local.date()
+            earliest_local = today_local - timedelta(days=29)
+            if day_local > today_local:
+                raise HTTPException(status_code=400, detail="date cannot be in the future.")
+            if day_local < earliest_local:
+                raise HTTPException(status_code=400, detail="date must be within the last 30 days.")
+            start_local = datetime(day_local.year, day_local.month, day_local.day, 0, 0, 0, tzinfo=now_local.tzinfo)
+            if day_local == today_local:
+                return SelectedPeriodContext("today", "Hoy", start_local, now_local, True, True)
+            return SelectedPeriodContext("today", start_local.strftime("%d/%m/%Y"), start_local, start_local + timedelta(days=1), False, False)
+        start_local = _local_day_start(now_local)
+        return SelectedPeriodContext("today", "Hoy", start_local, now_local, True, True)
+
+    if period_key == "this_week":
+        if has_date or has_month:
+            raise HTTPException(status_code=400, detail="period=this_week only supports the week_start parameter.")
+        current_week_start = _local_week_start(now_local)
+        if has_week_start:
+            week_start_date = _parse_selected_local_date(selected_week_start or "")
+            if week_start_date.weekday() != 0:
+                raise HTTPException(status_code=400, detail="week_start must be a Monday.")
+            selected_start_local = datetime(week_start_date.year, week_start_date.month, week_start_date.day, 0, 0, 0, tzinfo=now_local.tzinfo)
+            earliest_week_start = current_week_start - timedelta(weeks=11)
+            if selected_start_local > current_week_start:
+                raise HTTPException(status_code=400, detail="week_start cannot be in the future.")
+            if selected_start_local < earliest_week_start:
+                raise HTTPException(status_code=400, detail="week_start must be within the last 12 weeks.")
+            if selected_start_local == current_week_start:
+                return SelectedPeriodContext("this_week", "Esta semana", selected_start_local, now_local, True, True)
+            return SelectedPeriodContext("this_week", f"Semana del {selected_start_local.strftime('%d/%m/%Y')}", selected_start_local, selected_start_local + timedelta(days=7), False, False)
+        return SelectedPeriodContext("this_week", "Esta semana", current_week_start, now_local, True, True)
+
+    if period_key == "month_to_date":
+        if has_date or has_week_start:
+            raise HTTPException(status_code=400, detail="period=month_to_date only supports the month parameter.")
+        current_month_start = _start_of_month_local(now_local)
+        if has_month:
+            year, month = _parse_selected_year_month(selected_month or "")
+            selected_month_start = datetime(year, month, 1, 0, 0, 0, tzinfo=now_local.tzinfo)
+            earliest_year, earliest_month = _shift_year_month(now_local.year, now_local.month, -5)
+            earliest_month_start = datetime(earliest_year, earliest_month, 1, 0, 0, 0, tzinfo=now_local.tzinfo)
+            if selected_month_start > current_month_start:
+                raise HTTPException(status_code=400, detail="month cannot be in the future.")
+            if selected_month_start < earliest_month_start:
+                raise HTTPException(status_code=400, detail="month must be within the last 6 months.")
+            if selected_month_start == current_month_start:
+                return SelectedPeriodContext("month_to_date", "Mes en curso", selected_month_start, now_local, True, True)
+            next_year, next_month = _shift_year_month(year, month, 1)
+            end_local = datetime(next_year, next_month, 1, 0, 0, 0, tzinfo=now_local.tzinfo)
+            return SelectedPeriodContext("month_to_date", f"{_month_name_es(month)} {year}", selected_month_start, end_local, False, False)
+        return SelectedPeriodContext("month_to_date", "Mes en curso", current_month_start, now_local, True, True)
+
+    if has_date or has_week_start or has_month:
+        raise HTTPException(status_code=400, detail="Selected period parameters are not supported for this period.")
+
+    return SelectedPeriodContext(period_key, "", now_local, now_local, True, True)
+
+
+def resolve_period(
+    tenant_tz: str,
+    period_key: str,
+    now_utc: Optional[datetime] = None,
+    *,
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
+) -> Period:
+    context = resolve_selected_period_context(
+        tenant_tz=tenant_tz,
+        period_key=period_key,
+        now_utc=now_utc,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
+    if context.label:
+        return Period(
+            label=context.label,
+            start_utc=_local_datetime_to_utc_naive(context.start_local),
+            end_utc=_local_datetime_to_utc_naive(context.end_local),
+        )
+
     if now_utc is None:
         now_utc = _now_utc()
 

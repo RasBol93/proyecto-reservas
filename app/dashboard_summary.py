@@ -109,8 +109,17 @@ def build_dashboard_summary_data(
     tenant_id: str,
     tenant_tz: str,
     period_key: str = "today",
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
 ) -> Dict[str, Any]:
-    period = resolve_period(tenant_tz, period_key)
+    period = resolve_period(
+        tenant_tz,
+        period_key,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
     stats_source = load_stats_source_data(orders_sh)
     stats_data = build_stats_summary_data(
         orders_sh=orders_sh,
@@ -140,6 +149,9 @@ def build_dashboard_summary_data(
             period_key=period_key,
             orders_records=stats_source.get("orders_records"),
             menu_idx=stats_source.get("menu_idx"),
+            selected_date=selected_date,
+            selected_week_start=selected_week_start,
+            selected_month=selected_month,
         )
     except Exception:
         consumers = []
@@ -159,6 +171,9 @@ def build_dashboard_summary_data(
             orders_sh=orders_sh,
             tenant_tz=tenant_tz,
             period_key=period_key,
+            selected_date=selected_date,
+            selected_week_start=selected_week_start,
+            selected_month=selected_month,
         )
         survey_summary = dict(survey_dashboard.get("summary") or {})
         survey_trends = dict(survey_dashboard.get("trends") or {})
