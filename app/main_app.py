@@ -31,6 +31,13 @@ def _setup_logging():
 _setup_logging()
 logger = logging.getLogger(__name__)
 
+ALLOWED_CORS_ORIGINS = [
+    "https://app-pedidos-rho-eight.vercel.app",
+    "https://app-pedidos-git-main-rasbol93s-projects.vercel.app",
+    "http://localhost:3000",
+    "http://localhost:3001",
+]
+
 
 # -------------------------
 # App factory
@@ -47,7 +54,7 @@ def create_app() -> FastAPI:
     # -------------------------
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # luego se puede restringir
+        allow_origins=ALLOWED_CORS_ORIGINS,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
