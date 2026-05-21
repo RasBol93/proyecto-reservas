@@ -1891,6 +1891,15 @@ def _build_previous_year_month_same_progress_periods(start_local: datetime, end_
     return periods
 
 
+def _build_previous_year_full_month_periods(start_local: datetime) -> List[Period]:
+    periods: List[Period] = []
+    for month in range(1, start_local.month):
+        month_start = datetime(start_local.year, month, 1, 0, 0, 0, tzinfo=start_local.tzinfo)
+        month_end = _next_month_start_local(month_start)
+        periods.append(_build_period_from_local(f"{month_start.year}-{month_start.month:02d}", month_start, month_end))
+    return periods
+
+
 def _average_reference_from_summaries(metric_key: str, summaries: List[Dict[str, Any]]) -> float:
     if not summaries:
         return 0.0
@@ -1924,11 +1933,22 @@ def build_kpi_comparisons(
     current_summary: Dict[str, Any],
     *,
     source_data: Optional[Dict[str, Any]] = None,
+    selected_date: Optional[str] = None,
+    selected_week_start: Optional[str] = None,
+    selected_month: Optional[str] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     source = source_data or load_stats_source_data(orders_sh)
     start_local, end_local = _period_to_local_bounds(period, tenant_tz)
     elapsed = end_local - start_local
     elapsed_days = _days_in_range(start_local, end_local)
+    selected_context = resolve_selected_period_context(
+        tenant_tz=tenant_tz,
+        period_key=period_key,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
+    is_closed = not bool(selected_context.is_current)
 
     metric_keys = ["sales_total", "orders_paid", "avg_ticket", "unique_customers"]
     out: Dict[str, List[Dict[str, Any]]] = {k: [] for k in metric_keys}
@@ -1938,13 +1958,13 @@ def build_kpi_comparisons(
     if period_key == "today":
         comparison_specs.append((
             "previous_day_same_time",
-            "vs ayer, misma hora",
+            "vs día anterior" if is_closed else "vs ayer, misma hora",
             _build_period_from_local("Ayer", start_local - timedelta(days=1), end_local - timedelta(days=1)),
             False,
         ))
         comparison_specs.append((
             "same_weekday_last_week_same_time",
-            "vs mismo día semana pasada, misma hora",
+            "vs mismo día de la semana anterior" if is_closed else "vs mismo día semana pasada, misma hora",
             _build_period_from_local("Mismo día semana pasada", start_local - timedelta(days=7), end_local - timedelta(days=7)),
             False,
         ))
@@ -1952,7 +1972,7 @@ def build_kpi_comparisons(
         prev_month_end = _start_of_month_local(end_local)
         comparison_specs.append((
             "previous_month_daily_average_scaled",
-            "vs promedio diario mes anterior, hasta esta misma hora",
+            "vs promedio diario del mes anterior" if is_closed else "vs promedio diario mes anterior, hasta esta misma hora",
             _build_period_from_local("Mes anterior", prev_month_start, prev_month_end),
             True,
         ))
@@ -1960,7 +1980,7 @@ def build_kpi_comparisons(
     elif period_key == "this_week":
         comparison_specs.append((
             "previous_week_same_progress",
-            "vs semana anterior, hasta este mismo día",
+            "vs semana anterior" if is_closed else "vs semana anterior, hasta este mismo día",
             _build_period_from_local("Semana pasada", start_local - timedelta(days=7), end_local - timedelta(days=7)),
             False,
         ))
@@ -1968,7 +1988,7 @@ def build_kpi_comparisons(
         prev_month_end = _start_of_month_local(end_local)
         comparison_specs.append((
             "previous_month_weekly_average_scaled",
-            "vs promedio semanal mes anterior, hasta este mismo día",
+            "vs promedio semanal del mes anterior" if is_closed else "vs promedio semanal mes anterior, hasta este mismo día",
             _build_period_from_local("Mes anterior", prev_month_start, prev_month_end),
             True,
         ))
@@ -1983,8 +2003,12 @@ def build_kpi_comparisons(
 
         comparison_specs.append((
             "previous_month_same_progress",
-            "vs mismo avance mes anterior",
-            _build_period_from_local("Mismo avance mes anterior", prev_month_start_local, prev_month_same_progress_end_local),
+            "vs mes anterior" if is_closed else "vs mismo avance mes anterior",
+            _build_period_from_local(
+                "Mes anterior" if is_closed else "Mismo avance mes anterior",
+                prev_month_start_local,
+                prev_month_full_end_local if is_closed else prev_month_same_progress_end_local,
+            ),
             False,
         ))
 
@@ -2008,7 +2032,7 @@ def build_kpi_comparisons(
             )
 
     if period_key == "month_to_date":
-        previous_month_periods = _build_previous_year_month_same_progress_periods(start_local, end_local)
+        previous_month_periods = _build_previous_year_full_month_periods(start_local) if is_closed else _build_previous_year_month_same_progress_periods(start_local, end_local)
         previous_month_summaries = [
             _compute_stats_summary_from_source(source, tenant_id, tenant_tz, ref_period)
             for ref_period in previous_month_periods
@@ -2020,7 +2044,7 @@ def build_kpi_comparisons(
                 _build_comparison(
                     metric_key,
                     "year_to_date_monthly_average_same_progress",
-                    "vs promedio mensual del año hasta esta fecha",
+                    "vs promedio mensual del año" if is_closed else "vs promedio mensual del año hasta esta fecha",
                     current_value,
                     reference_value,
                 )

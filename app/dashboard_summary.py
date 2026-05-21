@@ -5,6 +5,7 @@ from app.admin_settings import get_admin_setting_value, load_admin_settings
 from app.consumer_db import build_dashboard_customer_metrics
 from app.stats import (
     resolve_period,
+    resolve_selected_period_context,
     load_stats_source_data,
     build_stats_summary_data,
     build_kpi_comparisons,
@@ -43,20 +44,49 @@ def _parse_sales_goal_amount(settings_map: Dict[str, Dict[str, Any]], key: str) 
     return amount
 
 
+def _build_period_context_payload(selected_period_context) -> Dict[str, Any]:
+    granularity_by_key = {
+        "today": "day",
+        "this_week": "week",
+        "month_to_date": "month",
+    }
+    completion_label_by_key = {
+        "today": "Datos hasta ahora" if selected_period_context.is_current else "Día completo",
+        "this_week": "Semana en curso" if selected_period_context.is_current else "Semana completa",
+        "month_to_date": "Mes en curso" if selected_period_context.is_current else "Mes completo",
+    }
+    return {
+        "granularity": granularity_by_key.get(str(selected_period_context.key or "").strip(), "day"),
+        "is_current": bool(selected_period_context.is_current),
+        "is_closed": not bool(selected_period_context.is_current),
+        "tense": "present" if selected_period_context.is_current else "past",
+        "completion_label": completion_label_by_key.get(str(selected_period_context.key or "").strip(), "Datos hasta ahora"),
+    }
+
+
 def _build_sales_goal_payload(
     settings_map: Dict[str, Dict[str, Any]],
     period_key: str,
     current_amount: Any,
+    *,
+    period_context: Dict[str, Any],
 ) -> Dict[str, Any]:
     goal_key_by_period = {
         "today": "daily_sales_goal_amount",
         "this_week": "weekly_sales_goal_amount",
         "month_to_date": "monthly_sales_goal_amount",
     }
+    goal_period_label_by_period = {
+        "today": "día",
+        "this_week": "semana",
+        "month_to_date": "mes",
+    }
 
     current_amount_num = round(float(current_amount or 0.0), 2)
     target_key = goal_key_by_period.get(str(period_key or "").strip(), "")
     target_amount = _parse_sales_goal_amount(settings_map, target_key) if target_key else None
+    goal_period_label = goal_period_label_by_period.get(str(period_key or "").strip(), "período")
+    is_period_closed = bool(period_context.get("is_closed"))
 
     if target_amount is None:
         return {
@@ -66,10 +96,20 @@ def _build_sales_goal_payload(
             "remaining_amount": None,
             "achievement_percent": None,
             "status": "not_configured",
+            "goal_period_label": goal_period_label,
+            "goal_label": f"Objetivo de ventas del {goal_period_label}",
+            "is_goal_period_closed": is_period_closed,
+            "remaining_label": None,
         }
 
     remaining_amount = round(max(target_amount - current_amount_num, 0.0), 2)
     achievement_percent = round((current_amount_num / target_amount) * 100, 2)
+    remaining_label = None
+    if current_amount_num >= target_amount:
+        remaining_label = "Meta alcanzada"
+    else:
+        verb = "Faltaron" if is_period_closed else "Faltan"
+        remaining_label = f"{verb} Bs {_money_value(remaining_amount)} para llegar a la meta"
 
     return {
         "period": period_key,
@@ -78,6 +118,10 @@ def _build_sales_goal_payload(
         "remaining_amount": _money_value(remaining_amount),
         "achievement_percent": achievement_percent,
         "status": "achieved" if current_amount_num >= target_amount else "behind",
+        "goal_period_label": goal_period_label,
+        "goal_label": f"Objetivo de ventas del {goal_period_label}",
+        "is_goal_period_closed": is_period_closed,
+        "remaining_label": remaining_label,
     }
 
 
@@ -113,6 +157,13 @@ def build_dashboard_summary_data(
     selected_week_start: Optional[str] = None,
     selected_month: Optional[str] = None,
 ) -> Dict[str, Any]:
+    selected_period_context = resolve_selected_period_context(
+        tenant_tz=tenant_tz,
+        period_key=period_key,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
     period = resolve_period(
         tenant_tz,
         period_key,
@@ -136,6 +187,9 @@ def build_dashboard_summary_data(
         period=period,
         current_summary=stats_data,
         source_data=stats_source,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
     )
     try:
         settings_map = load_admin_settings(orders_sh, force=False)
@@ -208,6 +262,7 @@ def build_dashboard_summary_data(
             "label": str((stats_data.get("period") or {}).get("label") or period.label).strip(),
             "range_text": str((stats_data.get("period") or {}).get("range_text") or "").strip(),
         },
+        "period_context": _build_period_context_payload(selected_period_context),
         "kpis": dict(stats_data.get("kpis") or {}),
         "kpi_comparisons": dict(kpi_comparisons or {}),
         "sales_by_day": list(stats_data.get("sales_by_day") or []),
@@ -220,6 +275,7 @@ def build_dashboard_summary_data(
             settings_map=settings_map,
             period_key=period_key,
             current_amount=(stats_data.get("kpis") or {}).get("sales_total", 0),
+            period_context=_build_period_context_payload(selected_period_context),
         ),
         "customers_summary": {
             "total_customers": len(consumers),
