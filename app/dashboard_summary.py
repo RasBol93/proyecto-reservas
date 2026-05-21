@@ -81,11 +81,17 @@ def _build_sales_goal_payload(
         "this_week": "semana",
         "month_to_date": "mes",
     }
+    goal_label_by_period = {
+        "today": "Objetivo de ventas del día",
+        "this_week": "Objetivo de ventas de la semana",
+        "month_to_date": "Objetivo de ventas del mes",
+    }
 
     current_amount_num = round(float(current_amount or 0.0), 2)
     target_key = goal_key_by_period.get(str(period_key or "").strip(), "")
     target_amount = _parse_sales_goal_amount(settings_map, target_key) if target_key else None
     goal_period_label = goal_period_label_by_period.get(str(period_key or "").strip(), "período")
+    goal_label = goal_label_by_period.get(str(period_key or "").strip(), f"Objetivo de ventas del {goal_period_label}")
     is_period_closed = bool(period_context.get("is_closed"))
 
     if target_amount is None:
@@ -97,7 +103,7 @@ def _build_sales_goal_payload(
             "achievement_percent": None,
             "status": "not_configured",
             "goal_period_label": goal_period_label,
-            "goal_label": f"Objetivo de ventas del {goal_period_label}",
+            "goal_label": goal_label,
             "is_goal_period_closed": is_period_closed,
             "remaining_label": None,
         }
@@ -119,7 +125,7 @@ def _build_sales_goal_payload(
         "achievement_percent": achievement_percent,
         "status": "achieved" if current_amount_num >= target_amount else "behind",
         "goal_period_label": goal_period_label,
-        "goal_label": f"Objetivo de ventas del {goal_period_label}",
+        "goal_label": goal_label,
         "is_goal_period_closed": is_period_closed,
         "remaining_label": remaining_label,
     }
