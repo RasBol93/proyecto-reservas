@@ -213,8 +213,8 @@ def build_dashboard_orders_detail(
         if not created_dt:
             continue
 
-        dt_utc = created_dt.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
-        if not (period.start_utc <= dt_utc < period.end_utc):
+        created_filter_dt = created_dt.replace(tzinfo=None)
+        if not (period.start_utc <= created_filter_dt < period.end_utc):
             continue
 
         status = str(row.get("status") or "").strip()
