@@ -11,7 +11,7 @@ from app.stats import resolve_period, resolve_selected_period_context
 from app.utils import normalize, log_event
 
 
-ORDERS_WORKSHEET_CANDIDATES = ["ORDERS", "Orders", "orders"]
+ORDERS_WORKSHEET_CANDIDATES = ["Orders", "ORDERS", "orders"]
 ALLOWED_PERIOD_KEYS = {"today", "this_week", "month_to_date"}
 
 
@@ -91,25 +91,34 @@ def _money_value(value: Any) -> Any:
 
 
 def _load_orders_records(orders_sh) -> List[Dict[str, Any]]:
-    ws = None
+    values: List[List[str]] = []
     for name in ORDERS_WORKSHEET_CANDIDATES:
         try:
             ws = orders_sh.worksheet(name)
+            values = ws.get_all_values()
             break
         except Exception:
             continue
 
-    if ws is None:
+    if not values:
         try:
-            ws = orders_sh.get_worksheet(0)
-        except Exception:
+            for ws in orders_sh.worksheets():
+                candidate_values = ws.get_all_values()
+                if not candidate_values:
+                    continue
+                header_row_1based = detect_header_row(
+                    candidate_values,
+                    required_headers=["order_id", "created_at", "status", "total_amount"],
+                    max_scan=min(10, len(candidate_values)),
+                )
+                header = candidate_values[header_row_1based - 1]
+                header_norm = [_normalize_header_name(h) for h in header]
+                if "order_id" in header_norm and "created_at" in header_norm and "status" in header_norm:
+                    values = candidate_values
+                    break
+        except Exception as e:
+            log_event("dashboard_orders_detail_scan_worksheets_failed", error=str(e))
             return []
-
-    try:
-        values = ws.get_all_values()
-    except Exception as e:
-        log_event("dashboard_orders_detail_get_all_values_failed", error=str(e))
-        return []
 
     if not values:
         return []
