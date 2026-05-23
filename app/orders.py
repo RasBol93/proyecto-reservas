@@ -667,26 +667,61 @@ def get_order_by_id_strict(orders_sh, order_id: str) -> Optional[Dict[str, Any]]
     return dict(ctx.get("order") or {})
 
 
-def list_paid_pending_delivery_orders(orders_sh, tenant_id: str) -> List[Dict[str, Any]]:
+def _to_tenant_local_dt(value: Any, tenant_tz: str) -> Optional[datetime]:
+    parsed = _parse_iso_datetime(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(ZoneInfo(str(tenant_tz or "America/La_Paz")))
+
+
+def _requested_time_sort_key(value: Any) -> int:
+    raw = str(value or "").strip()
+    if not raw:
+        return 24 * 60 + 59
+
+    if raw.lower() == "ahora":
+        return -1
+
+    try:
+        parts = raw.split(":", 1)
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+    except Exception:
+        pass
+
+    return 24 * 60 + 59
+
+
+def get_today_delivery_tracking_orders(
+    orders_sh,
+    tenant_id: str,
+    tenant_tz: str,
+    limit_pending: int = 15,
+    limit_delivered: int = 15,
+) -> Dict[str, Any]:
     ws = _get_orders_ws(orders_sh)
     header = _get_header(ws)
     if not header:
-        return []
+        return {"pending": [], "delivered": [], "today_local_date": ""}
 
     try:
         values = ws.get_all_values()
     except Exception:
-        return []
+        return {"pending": [], "delivered": [], "today_local_date": ""}
 
     tenant_col = _find_col_idx(header, "tenant_id")
     status_col = _find_col_idx(header, "status")
     delivered_col = _find_col_idx(header, "delivered_at")
 
     if status_col is None:
-        return []
+        return {"pending": [], "delivered": [], "today_local_date": ""}
 
     clean_tenant_id = str(tenant_id or "").strip()
+    today_local = datetime.now(ZoneInfo(str(tenant_tz or "America/La_Paz"))).date()
     pending: List[Dict[str, Any]] = []
+    delivered: List[Dict[str, Any]] = []
 
     for row_index, row in enumerate(values[1:], start=2):
         order = _row_to_dict(header, row)
@@ -698,16 +733,55 @@ def list_paid_pending_delivery_orders(orders_sh, tenant_id: str) -> List[Dict[st
         if _normalize_status(order.get("status")) != "PAID":
             continue
 
-        delivered_at = str(order.get("delivered_at") or "").strip() if delivered_col is not None else ""
-        if delivered_at:
+        created_local = _to_tenant_local_dt(order.get("created_at"), tenant_tz)
+        if created_local is None or created_local.date() != today_local:
             continue
 
-        pending.append({
+        delivered_at = str(order.get("delivered_at") or "").strip() if delivered_col is not None else ""
+        row_payload = {
             "row_index": int(row_index),
             "order": order,
-        })
+            "created_local": created_local,
+            "delivered_local": _to_tenant_local_dt(delivered_at, tenant_tz) if delivered_at else None,
+        }
 
-    return pending
+        if delivered_at:
+            delivered.append(row_payload)
+        else:
+            pending.append(row_payload)
+
+    pending.sort(
+        key=lambda item: (
+            _requested_time_sort_key((item.get("order") or {}).get("requested_time")),
+            int((item.get("created_local").hour * 60 + item.get("created_local").minute) if item.get("created_local") else (24 * 60 + 59)),
+            str(((item.get("order") or {}).get("order_id")) or ""),
+        )
+    )
+    delivered.sort(
+        key=lambda item: (
+            -int(item.get("delivered_local").timestamp()) if item.get("delivered_local") else 0,
+            str(((item.get("order") or {}).get("order_id")) or ""),
+        )
+    )
+
+    return {
+        "pending": pending[: max(1, int(limit_pending or 15))],
+        "delivered": delivered[: max(1, int(limit_delivered or 15))],
+        "today_local_date": today_local.isoformat(),
+        "pending_total": len(pending),
+        "delivered_total": len(delivered),
+    }
+
+
+def list_paid_pending_delivery_orders(orders_sh, tenant_id: str) -> List[Dict[str, Any]]:
+    tracking = get_today_delivery_tracking_orders(
+        orders_sh=orders_sh,
+        tenant_id=tenant_id,
+        tenant_tz="America/La_Paz",
+        limit_pending=100,
+        limit_delivered=1,
+    )
+    return list(tracking.get("pending") or [])
 
 
 def mark_order_delivered(

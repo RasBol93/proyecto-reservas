@@ -3,14 +3,13 @@
 from typing import Any, Dict, Optional
 from datetime import datetime
 import time
-from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
 from app.orders import (
     get_order_by_id,
+    get_today_delivery_tracking_orders,
     get_order_context_by_id,
-    list_paid_pending_delivery_orders,
     mark_order_delivered,
     update_order_status,
 )
@@ -317,70 +316,23 @@ def _is_paid_transition_allowed(current_status: str) -> bool:
     return current_status == "PENDING_PAYMENT"
 
 
-def _parse_iso_dt_any(value: Any) -> Optional[datetime]:
-    raw = _safe_str(value)
-    if not raw:
-        return None
-
-    candidates = [
-        raw,
-        raw.replace("Z", "+00:00"),
-        raw.replace(" ", "T"),
-        raw.replace(" ", "T").replace("Z", "+00:00"),
-    ]
-    for candidate in candidates:
-        try:
-            return datetime.fromisoformat(candidate)
-        except Exception:
-            continue
-    return None
-
-
-def _to_tenant_local_dt(value: Any, tenant_tz: str) -> Optional[datetime]:
-    parsed = _parse_iso_dt_any(value)
-    if parsed is None:
-        return None
-    if parsed.tzinfo is None:
-        return parsed
-    return parsed.astimezone(ZoneInfo(tenant_tz))
-
-
 def _tracking_order_time_label(order: Dict[str, Any], tenant_tz: str) -> str:
     requested_slot = _extract_slot_hhmm(order.get("requested_time"))
     if requested_slot:
         return requested_slot
 
-    created_local = _to_tenant_local_dt(order.get("created_at"), tenant_tz)
+    created_local = order.get("created_local")
     if created_local is not None:
         return created_local.strftime("%H:%M")
 
     return "Sin hora"
 
-
-def _tracking_order_sort_key(order: Dict[str, Any], tenant_tz: str):
-    created_local = _to_tenant_local_dt(order.get("created_at"), tenant_tz)
-    created_day = created_local.date().isoformat() if created_local is not None else "9999-12-31"
-    created_minutes = (created_local.hour * 60 + created_local.minute) if created_local is not None else (24 * 60 + 59)
-
-    requested_slot = _extract_slot_hhmm(order.get("requested_time"))
-    if requested_slot:
-        try:
-            hours, minutes = requested_slot.split(":", 1)
-            requested_minutes = int(hours) * 60 + int(minutes)
-        except Exception:
-            requested_minutes = created_minutes
-    else:
-        requested_minutes = created_minutes
-
-    return (created_day, requested_minutes, created_minutes, _safe_str(order.get("order_id")))
-
-
-def _tracking_items_summary(order: Dict[str, Any]) -> str:
+def _tracking_items_lines(order: Dict[str, Any]) -> str:
     items_snapshot = parse_items_field(order.get("items_snapshot"))
     if not items_snapshot:
         items_snapshot = parse_items_field(order.get("items"))
 
-    parts = []
+    lines = []
     for item in items_snapshot:
         name = _safe_str(item.get("name") or item.get("sku"))
         if not name:
@@ -390,13 +342,31 @@ def _tracking_items_summary(order: Dict[str, Any]) -> str:
         except Exception:
             qty = 1
         qty = max(1, qty)
-        parts.append(f"{qty}x {name}")
+        lines.append(f"- {name} x{qty}")
 
-    if not parts:
+    if not lines:
         return "Sin detalle de productos"
-    if len(parts) <= 3:
-        return ", ".join(parts)
-    return ", ".join(parts[:3]) + f" +{len(parts) - 3} más"
+    return "\n".join(lines)
+
+
+def _tracking_total_label(order: Dict[str, Any]) -> str:
+    total_raw = _safe_str(order.get("total_amount"))
+    return total_raw or "0"
+
+
+def _tracking_date_label(today_local_iso: str) -> str:
+    try:
+        current_day = datetime.strptime(today_local_iso, "%Y-%m-%d")
+        return current_day.strftime("%d/%m/%Y")
+    except Exception:
+        return today_local_iso
+
+
+def _tracking_delivered_time_label(item: Dict[str, Any]) -> str:
+    delivered_local = item.get("delivered_local")
+    if delivered_local is not None:
+        return delivered_local.strftime("%H:%M")
+    return "Sin hora"
 
 
 def _tracking_footer_kb() -> Dict[str, Any]:
@@ -404,6 +374,36 @@ def _tracking_footer_kb() -> Dict[str, Any]:
         [("🔄 Actualizar", "admtrack|refresh")],
         [("⬅️ Volver", "admin_panel")],
     ])
+
+
+def _build_pending_tracking_text(order: Dict[str, Any], tenant_tz: str) -> str:
+    time_label = _tracking_order_time_label(order, tenant_tz)
+    customer_name = _safe_str(order.get("customer_name")) or "Sin nombre"
+    items_lines = _tracking_items_lines(order)
+    total_amount = _tracking_total_label(order)
+
+    return (
+        f"Hora: *{time_label}*\n"
+        f"Cliente: *{customer_name}*\n"
+        f"Productos:\n{items_lines}\n"
+        f"Total: *Bs {total_amount}*"
+    )
+
+
+def _build_delivered_tracking_text(item: Dict[str, Any], tenant_tz: str) -> str:
+    order = dict(item.get("order") or {})
+    created_label = _tracking_order_time_label(order, tenant_tz)
+    delivered_label = _tracking_delivered_time_label(item)
+    customer_name = _safe_str(order.get("customer_name")) or "Sin nombre"
+    items_lines = _tracking_items_lines(order)
+    total_amount = _tracking_total_label(order)
+
+    return (
+        f"✅ *{created_label}* — *{customer_name}*\n"
+        f"{items_lines}\n"
+        f"Total: *Bs {total_amount}*\n"
+        f"Entregado: *{delivered_label}*"
+    )
 
 
 def _send_admin_tracking_home(
@@ -414,63 +414,94 @@ def _send_admin_tracking_home(
     tenant_tz: str,
     sess: Dict[str, Any],
 ) -> bool:
-    pending_rows = list_paid_pending_delivery_orders(orders_sh, tenant_id)
+    tracking = get_today_delivery_tracking_orders(
+        orders_sh=orders_sh,
+        tenant_id=tenant_id,
+        tenant_tz=tenant_tz,
+        limit_pending=15,
+        limit_delivered=15,
+    )
     tmp = sess.setdefault("tmp", {})
     tracking_map: Dict[str, str] = {}
     tmp["tracking_order_map"] = tracking_map
+    pending_rows = list(tracking.get("pending") or [])
+    delivered_rows = list(tracking.get("delivered") or [])
+    date_label = _tracking_date_label(_safe_str(tracking.get("today_local_date")))
 
-    if not pending_rows:
+    if not pending_rows and not delivered_rows:
         return _safe_send_text(
             bot_token,
             chat_id,
-            "📦 *SEGUIMIENTO DE PEDIDOS*\n\nNo hay pedidos pagados pendientes de entregar.",
+            (
+                "📦 *SEGUIMIENTO DE PEDIDOS DE HOY*\n\n"
+                f"Fecha: {date_label}\n\n"
+                "Todavía no hay pedidos pagados hoy."
+            ),
             parse_mode="Markdown",
             reply_markup=_tracking_footer_kb(),
         )
 
-    pending_orders = [dict(item.get("order") or {}) for item in pending_rows]
-    pending_orders.sort(key=lambda order: _tracking_order_sort_key(order, tenant_tz))
+    _safe_send_text(
+        bot_token,
+        chat_id,
+        (
+            "📦 *SEGUIMIENTO DE PEDIDOS DE HOY*\n\n"
+            f"Fecha: {date_label}"
+        ),
+        parse_mode="Markdown",
+    )
 
-    lines = [
-        "📦 *SEGUIMIENTO DE PEDIDOS*",
-        "",
-        "Pedidos pagados pendientes de entregar:",
-        "",
-    ]
-    rows = []
+    if not pending_rows:
+        _safe_send_text(
+            bot_token,
+            chat_id,
+            "Pendientes de entrega\n\nNo tienes pedidos pendientes de entrega por ahora.",
+        )
+    else:
+        _safe_send_text(
+            bot_token,
+            chat_id,
+            "Pendientes de entrega",
+        )
 
-    for idx, order in enumerate(pending_orders[:20], start=1):
+    for idx, item in enumerate(pending_rows, start=1):
+        order = dict(item.get("order") or {})
         order_id = _safe_str(order.get("order_id"))
         short_id = f"t{idx}"
         tracking_map[short_id] = order_id
+        _safe_send_text(
+            bot_token,
+            chat_id,
+            _build_pending_tracking_text(order, tenant_tz),
+            parse_mode="Markdown",
+            reply_markup=kb([
+                [("✅ Entregado", f"admtrack|done|{short_id}")],
+            ]),
+        )
 
-        time_label = _tracking_order_time_label(order, tenant_tz)
-        customer_name = _safe_str(order.get("customer_name")) or "Sin nombre"
-        items_summary = _tracking_items_summary(order)
-        total_amount = _safe_str(order.get("total_amount")) or "0"
-
-        lines.append(f"{idx}. *{time_label}* · *{customer_name}*")
-        lines.append(f"   {items_summary}")
-        lines.append(f"   Total: *Bs {total_amount}*")
-        lines.append("")
-
-        rows.append([("✅ Entregado", f"admtrack|done|{short_id}")])
-
-    if len(pending_orders) > 20:
-        lines.append(f"Mostrando {min(len(pending_orders), 20)} de {len(pending_orders)} pedidos pendientes.")
-        lines.append("")
-
-    rows.extend([
-        [("🔄 Actualizar", "admtrack|refresh")],
-        [("⬅️ Volver", "admin_panel")],
-    ])
+    if not delivered_rows:
+        _safe_send_text(
+            bot_token,
+            chat_id,
+            "Entregados hoy\n\nTodavía no hay pedidos marcados como entregados hoy.",
+        )
+    else:
+        delivered_lines = ["Entregados hoy", ""]
+        for item in delivered_rows:
+            delivered_lines.append(_build_delivered_tracking_text(item, tenant_tz))
+            delivered_lines.append("")
+        _safe_send_text(
+            bot_token,
+            chat_id,
+            "\n".join(delivered_lines).strip(),
+            parse_mode="Markdown",
+        )
 
     return _safe_send_text(
         bot_token,
         chat_id,
-        "\n".join(lines).strip(),
-        parse_mode="Markdown",
-        reply_markup=kb(rows),
+        "Actualiza la lista o vuelve al panel cuando quieras.",
+        reply_markup=_tracking_footer_kb(),
     )
 
 
