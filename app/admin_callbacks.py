@@ -11,13 +11,13 @@ from app.admin_callbacks_business import handle_admin_business_callback
 from app.admin_callbacks_sales_goals import handle_admin_sales_goals_callback
 
 from app.telegram_api import telegram_send_text
+from app.telegram_keyboard import kb
 from app.utils import log_event
-from app.stats import resolve_period, build_stats_report_text, build_periods
+from app.stats import resolve_period, build_stats_report_text
 from app.webhook_helpers import (
     get_sess,
     assert_admin_authorized,
     get_user_role,
-    admin_periods_inline_kb,
 )
 from app.alerts import (
     alert_system_error,
@@ -30,6 +30,7 @@ from app.admin_consumers import (
 from app.admin_nav import (
     admin_panel_kb,
 )
+from app.tenants import build_admin_dashboard_url, get_admin_dashboard_url_error
 from app.admin_menu import (
     send_admin_menu_home,
 )
@@ -60,18 +61,32 @@ def handle_admin_callback_impl(
                 bot_token,
                 chat_id,
                 "🧭 PANEL ADMIN\n\nElige una opción:",
-                reply_markup=admin_panel_kb(user_role=user_role),
+                reply_markup=admin_panel_kb(user_role=user_role, tenant=tenant),
             )
             return {"ok": True}
 
         if data == "admin_stats":
             assert_admin_authorized(tenant, chat_id, tenant_id)
-            periods = build_periods(tenant_tz)
+            dashboard_url = build_admin_dashboard_url(tenant)
+            if not dashboard_url:
+                telegram_send_text(
+                    bot_token,
+                    chat_id,
+                    get_admin_dashboard_url_error(tenant) or "No pude preparar el acceso al panel.",
+                    reply_markup=kb([
+                        [("🧭 Panel admin", "admin_panel")],
+                    ]),
+                )
+                return {"ok": True}
+
             telegram_send_text(
                 bot_token,
                 chat_id,
-                "📊 ESTADÍSTICAS\n\nSelecciona el período:",
-                reply_markup=admin_periods_inline_kb(tenant_id, periods),
+                "📊 PANEL DE ESTADÍSTICAS\n\nAbre el panel para revisar ventas, pedidos, clientes y encuestas.",
+                reply_markup=kb([
+                    [("📊 Abrir panel", "url", dashboard_url)],
+                    [("🧭 Panel admin", "admin_panel")],
+                ]),
             )
             return {"ok": True}
 
@@ -194,7 +209,7 @@ def handle_admin_callback_impl(
                     bot_token,
                     chat_id,
                     "🧭 PANEL ADMIN\n\nElige una opción:",
-                    reply_markup=admin_panel_kb(user_role=user_role),
+                    reply_markup=admin_panel_kb(user_role=user_role, tenant=tenant),
                 )
                 return {"ok": True}
 

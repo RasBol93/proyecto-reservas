@@ -108,7 +108,7 @@ def handle_admin_menu_callback(
             bot_token,
             chat_id,
             "🧭 PANEL ADMIN\n\nElige una opción:",
-            reply_markup=admin_panel_kb(user_role=user_role),
+            reply_markup=admin_panel_kb(user_role=user_role, tenant=tenant),
         )
         return {"ok": True}
 

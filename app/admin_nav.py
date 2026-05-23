@@ -1,6 +1,7 @@
 # app/admin_nav.py
 
 from app.telegram_keyboard import kb
+from app.tenants import build_admin_dashboard_url
 
 
 def admin_root_kb():
@@ -9,7 +10,7 @@ def admin_root_kb():
     ])
 
 
-def admin_panel_kb(user_role: str = "admin"):
+def admin_panel_kb(user_role: str = "admin", tenant=None):
     """
     Panel rediseñado tipo mini app:
     - misma lógica / mismos callbacks
@@ -18,6 +19,8 @@ def admin_panel_kb(user_role: str = "admin"):
 
     user_role = str(user_role or "").strip().lower()
     is_owner = user_role == "owner"
+    dashboard_url = build_admin_dashboard_url(tenant or {}) if tenant else ""
+    stats_button = ("📊 Estadísticas", "url", dashboard_url) if dashboard_url else ("📊 Estadísticas", "admin_stats")
 
     rows = []
 
@@ -34,7 +37,7 @@ def admin_panel_kb(user_role: str = "admin"):
 
     # BLOQUE 2: ANÁLISIS
     rows.append([
-        ("📊 Estadísticas", "admin_stats"),
+        stats_button,
         ("👥 Clientes", "admin_consumers"),
     ])
 

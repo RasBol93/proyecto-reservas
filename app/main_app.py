@@ -1,11 +1,13 @@
 # app/main_app.py
 
 import logging
+import os
 import uuid
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from urllib.parse import urlparse
 
-from app.config import APP_NAME, APP_VERSION
+from app.config import APP_NAME, APP_VERSION, ENV_DASHBOARD_APP_BASE_URL, env_optional
 from app.api_routes import router as api_router
 from app.telegram_webhook import router as telegram_router
 from app.admin_diag import router as admin_diag_router
@@ -31,12 +33,45 @@ def _setup_logging():
 _setup_logging()
 logger = logging.getLogger(__name__)
 
-ALLOWED_CORS_ORIGINS = [
-    "https://app-pedidos-rho-eight.vercel.app",
-    "https://app-pedidos-git-main-rasbol93s-projects.vercel.app",
-    "http://localhost:3000",
-    "http://localhost:3001",
-]
+
+def _normalize_origin(value: str) -> str:
+    raw = str(value or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return ""
+
+
+def _build_allowed_cors_origins() -> list[str]:
+    allowed: list[str] = []
+
+    for candidate in [
+        env_optional("FRONTEND_APP_BASE_URL"),
+        env_optional(ENV_DASHBOARD_APP_BASE_URL),
+    ]:
+        origin = _normalize_origin(candidate)
+        if origin and origin not in allowed:
+            allowed.append(origin)
+
+    extra_origins_raw = os.getenv("CORS_ALLOWED_ORIGINS", "")
+    for part in extra_origins_raw.split(","):
+        origin = _normalize_origin(part)
+        if origin and origin not in allowed:
+            allowed.append(origin)
+
+    for local_origin in [
+        "http://localhost:3000",
+        "http://localhost:3001",
+    ]:
+        if local_origin not in allowed:
+            allowed.append(local_origin)
+
+    return allowed
+
+
+ALLOWED_CORS_ORIGINS = _build_allowed_cors_origins()
 
 
 # -------------------------

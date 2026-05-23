@@ -4,10 +4,18 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
 import time
+from urllib.parse import urlencode
 
 from fastapi import HTTPException
 
-from app.config import TENANTS_SHEET_NAME, ENV_CONFIG_SPREADSHEET_ID, env_required
+from app.config import (
+    TENANTS_SHEET_NAME,
+    ENV_ADMIN_TOKEN,
+    ENV_CONFIG_SPREADSHEET_ID,
+    ENV_DASHBOARD_APP_BASE_URL,
+    env_optional,
+    env_required,
+)
 from app.sheets import get_gspread_client, open_config_spreadsheet, invalidate_sheet_caches, set_sheets_observation_context
 from app.utils import now_iso_utc, to_bool, normalize, log_event
 
@@ -339,6 +347,37 @@ def _find_header_col(headers_norm: List[str], key: str) -> Optional[int]:
     return None
 
 
+def _resolve_dashboard_base_url(tenant: Dict[str, Any]) -> str:
+    return _safe_str(tenant.get("dashboard_base_url")).strip() or env_optional(ENV_DASHBOARD_APP_BASE_URL)
+
+
+def _resolve_dashboard_token(tenant: Dict[str, Any]) -> str:
+    return _safe_str(tenant.get("dashboard_token")).strip() or env_optional(ENV_ADMIN_TOKEN)
+
+
+def build_admin_dashboard_url(tenant: Dict[str, Any]) -> str:
+    tenant_id = _safe_str(tenant.get("tenant_id_raw") or tenant.get("tenant_id")).strip()
+    base_url = _resolve_dashboard_base_url(tenant).rstrip("/")
+    dashboard_token = _resolve_dashboard_token(tenant)
+
+    if not tenant_id or not base_url or not dashboard_token:
+        return ""
+
+    query = urlencode({
+        "tenant_id": tenant_id,
+        "token": dashboard_token,
+    })
+    return f"{base_url}/dashboard?{query}"
+
+
+def get_admin_dashboard_url_error(tenant: Dict[str, Any]) -> str:
+    if not _resolve_dashboard_base_url(tenant):
+        return "El link del panel todavía no está configurado para este negocio."
+    if not _resolve_dashboard_token(tenant):
+        return "El acceso al panel todavía no está configurado para este negocio."
+    return ""
+
+
 # -------------------------
 # Main API
 # -------------------------
@@ -518,6 +557,8 @@ def load_tenants(gc=None, force: bool = False) -> Dict[str, Dict[str, Any]]:
                 "timezone": (_safe_str(get(row, "timezone")) or "America/La_Paz").strip(),
                 "admin_whatsapp": _safe_str(get(row, "admin_whatsapp")).strip(),
                 "admin_username": _safe_str(get(row, "admin_username")).strip(),
+                "dashboard_base_url": _safe_str(get(row, "dashboard_base_url")).strip(),
+                "dashboard_token": _safe_str(get(row, "dashboard_token")).strip(),
 
                 # QR
                 "payment_qr_file_id": _safe_str(get(row, "payment_qr_file_id")).strip(),

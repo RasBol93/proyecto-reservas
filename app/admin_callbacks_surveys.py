@@ -19,6 +19,7 @@ from app.survey import (
     add_survey_question,
 )
 from app.sheets import get_ws
+from app.tenants import build_admin_dashboard_url, get_admin_dashboard_url_error
 
 
 SURVEY_CONFIG_WS = "Survey_Config"
@@ -112,6 +113,7 @@ def _survey_update_question_in_place(
 
 
 def _send_admin_surveys_home(
+    tenant: Dict[str, Any],
     bot_token: str,
     chat_id: int,
     tenant_id: str,
@@ -119,6 +121,8 @@ def _send_admin_surveys_home(
 ) -> bool:
     enabled = survey_is_enabled(orders_sh)
     status = "🟢 Activa" if enabled else "🔴 Inactiva"
+    dashboard_url = build_admin_dashboard_url(tenant)
+    results_button = ("📊 Ver resultados", "url", dashboard_url) if dashboard_url else ("📊 Ver resultados", f"admsurv|{tenant_id}|analytics")
 
     telegram_send_text(
         bot_token,
@@ -131,7 +135,7 @@ def _send_admin_surveys_home(
         reply_markup=kb([
             [("⚙️ Configuración", f"admsurv|{tenant_id}|config")],
             [("❓ Gestionar preguntas", f"admsurv|{tenant_id}|questions")],
-            [("📊 Ver resultados", f"admsurv|{tenant_id}|analytics")],
+            [results_button],
             [("⬅️ Volver", "admin_panel")],
         ]),
     )
@@ -257,7 +261,7 @@ def handle_admin_surveys_callback(
 ) -> Optional[Dict[str, Any]]:
     if data == "admin_surveys":
         assert_admin_authorized(tenant, chat_id, tenant_id)
-        return {"ok": _send_admin_surveys_home(bot_token, chat_id, tenant_id, orders_sh)}
+        return {"ok": _send_admin_surveys_home(tenant, bot_token, chat_id, tenant_id, orders_sh)}
 
     if not data.startswith("admsurv|"):
         return None
@@ -483,7 +487,30 @@ def handle_admin_surveys_callback(
         return {"ok": _send_admin_surveys_questions(bot_token, chat_id, tenant_id, orders_sh)}
 
     if action == "analytics":
-        return {"ok": _send_admin_surveys_periods(bot_token, chat_id, tenant_id, tenant_tz)}
+        dashboard_url = build_admin_dashboard_url(tenant)
+        if not dashboard_url:
+            telegram_send_text(
+                bot_token,
+                chat_id,
+                get_admin_dashboard_url_error(tenant) or "No pude preparar el acceso al panel.",
+                reply_markup=kb([
+                    [("⬅️ Volver a encuestas", "admin_surveys")],
+                    [("🧭 Panel admin", "admin_panel")],
+                ]),
+            )
+            return {"ok": True}
+
+        telegram_send_text(
+            bot_token,
+            chat_id,
+            "📊 RESULTADOS Y ENCUESTAS\n\nAbre el panel para revisar el detalle del negocio y las respuestas del período.",
+            reply_markup=kb([
+                [("📊 Abrir panel", "url", dashboard_url)],
+                [("⬅️ Volver a encuestas", "admin_surveys")],
+                [("🧭 Panel admin", "admin_panel")],
+            ]),
+        )
+        return {"ok": True}
 
     if action == "period" and len(parts) == 4:
         period_key = parts[3].strip()

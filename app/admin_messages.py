@@ -15,11 +15,9 @@ from app.admin_callbacks_sales_goals import clear_admin_sales_goals_state, send_
 from app.telegram_api import telegram_send_text
 from app.telegram_keyboard import kb
 from app.utils import normalize, log_event
-from app.stats import build_periods
 from app.webhook_helpers import (
     get_sess,
     assert_admin_authorized,
-    admin_periods_inline_kb,
     admin_fixed_kb,
 )
 from app.admin_hours import send_admin_hours_menu
@@ -40,7 +38,11 @@ from app.admin_manual_order import (
 from app.admin_nav import (
     admin_panel_kb,
 )
-from app.tenants import update_tenant_payment_qr
+from app.tenants import (
+    build_admin_dashboard_url,
+    get_admin_dashboard_url_error,
+    update_tenant_payment_qr,
+)
 from app.image_storage import upload_product_photo_for_tenant
 
 
@@ -265,7 +267,7 @@ def handle_admin_message_impl(
                 bot_token,
                 chat_id,
                 _build_admin_panel_text(is_owner=is_owner),
-                reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
+                reply_markup=admin_panel_kb("owner" if is_owner else "admin", tenant=tenant),
                 parse_mode="Markdown",
             )
             return {"ok": True}
@@ -283,7 +285,7 @@ def handle_admin_message_impl(
                     bot_token,
                     chat_id,
                     _build_admin_panel_text(is_owner=is_owner),
-                    reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
+                    reply_markup=admin_panel_kb("owner" if is_owner else "admin", tenant=tenant),
                     parse_mode="Markdown",
                 )
                 return {"ok": True}
@@ -294,7 +296,7 @@ def handle_admin_message_impl(
                 bot_token,
                 chat_id,
                 _build_admin_panel_text(is_owner=is_owner),
-                reply_markup=admin_panel_kb("owner" if is_owner else "admin"),
+                reply_markup=admin_panel_kb("owner" if is_owner else "admin", tenant=tenant),
                 parse_mode="Markdown",
             )
             return {"ok": True}
@@ -388,19 +390,25 @@ def handle_admin_message_impl(
 
         if txt_norm in ("estadisticas", "/stats", "stats"):
             assert_admin_authorized(tenant, chat_id, tenant_id)
-            periods = build_periods(tenant_tz)
+            dashboard_url = build_admin_dashboard_url(tenant)
+            if not dashboard_url:
+                _safe_send_text(
+                    bot_token,
+                    chat_id,
+                    get_admin_dashboard_url_error(tenant) or "No pude preparar el acceso al panel.",
+                    reply_markup=admin_fixed_kb(),
+                )
+                return {"ok": True}
+
             _safe_send_text(
                 bot_token,
                 chat_id,
                 _build_stats_intro_text(),
-                reply_markup=admin_periods_inline_kb(tenant_id, periods),
+                reply_markup=kb([
+                    [("📊 Abrir panel", "url", dashboard_url)],
+                    [("🧭 Panel admin", "admin_panel")],
+                ]),
                 parse_mode="Markdown",
-            )
-            _safe_send_text(
-                bot_token,
-                chat_id,
-                "Usa el botón inferior para volver al panel cuando quieras.",
-                reply_markup=admin_fixed_kb(),
             )
             return {"ok": True}
 
@@ -493,6 +501,8 @@ def handle_admin_message_impl(
             "configuracion de encuestas",
         ):
             assert_admin_authorized(tenant, chat_id, tenant_id)
+            dashboard_url = build_admin_dashboard_url(tenant)
+            results_button = ("📊 Ver resultados", "url", dashboard_url) if dashboard_url else ("📊 Ver resultados", f"admsurv|{tenant_id}|analytics")
             _safe_send_text(
                 bot_token,
                 chat_id,
@@ -500,7 +510,7 @@ def handle_admin_message_impl(
                 reply_markup=kb([
                     [("⚙️ Configuración", f"admsurv|{tenant_id}|config")],
                     [("❓ Gestionar preguntas", f"admsurv|{tenant_id}|questions")],
-                    [("📊 Ver resultados", f"admsurv|{tenant_id}|analytics")],
+                    [results_button],
                     [("🧭 Panel admin", "admin_panel")],
                 ]),
                 parse_mode="Markdown",
