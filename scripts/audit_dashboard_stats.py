@@ -1,5 +1,6 @@
 import argparse
 import json
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -19,9 +20,10 @@ SURVEY_RESPONSES_WORKSHEET = "Survey_Responses"
 
 DEFAULT_BASE_URL = "https://proyecto-reservas-idwl.onrender.com"
 DEFAULT_TENANT_TZ = "America/La_Paz"
-HTTP_TIMEOUT_SECONDS = 60
+HTTP_TIMEOUT_SECONDS = 120
 MONEY_TOLERANCE = 0.01
 AVERAGE_TOLERANCE = 0.01
+RETRY_BACKOFF_SECONDS = [20, 40, 60]
 
 PRESET_DEMO_CORE = [
     {"period": "today", "date": "2026-05-13"},
@@ -51,6 +53,10 @@ class AuditRunResult:
     case: AuditCase
     passed: bool
     failures: List[Dict[str, Any]]
+
+
+class AuditRequestError(RuntimeError):
+    pass
 
 
 def _safe_text(value: Any) -> str:
@@ -942,12 +948,53 @@ def _build_redacted_http_params(tenant_id: str, selection: PeriodSelection) -> D
 
 
 def _http_get_json(url: str, params: Dict[str, str]) -> Dict[str, Any]:
-    response = requests.get(url, params=params, timeout=HTTP_TIMEOUT_SECONDS)
-    response.raise_for_status()
-    data = response.json()
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Unexpected JSON payload from {url}")
-    return data
+    last_error: Optional[Exception] = None
+    retryable_statuses = {429, 500, 502, 503, 504}
+
+    for attempt in range(len(RETRY_BACKOFF_SECONDS) + 1):
+        try:
+            response = requests.get(url, params=params, timeout=HTTP_TIMEOUT_SECONDS)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_error = exc
+            if attempt >= len(RETRY_BACKOFF_SECONDS):
+                break
+            wait_seconds = RETRY_BACKOFF_SECONDS[attempt]
+            print(f"HTTP transport error. Waiting {wait_seconds} seconds before retry...")
+            time.sleep(wait_seconds)
+            continue
+
+        status_code = int(response.status_code or 0)
+        if status_code in retryable_statuses:
+            if attempt >= len(RETRY_BACKOFF_SECONDS):
+                try:
+                    response.raise_for_status()
+                except requests.HTTPError as exc:
+                    last_error = exc
+                break
+            wait_seconds = RETRY_BACKOFF_SECONDS[attempt]
+            if status_code == 429:
+                print(f"HTTP 429 quota hit. Waiting {wait_seconds} seconds before retry...")
+            else:
+                print(f"HTTP server error. Waiting {wait_seconds} seconds before retry...")
+            time.sleep(wait_seconds)
+            continue
+
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise AuditRequestError(f"HTTP request failed with status {status_code} for {url}") from exc
+
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise AuditRequestError(f"Invalid JSON payload from {url}") from exc
+        if not isinstance(data, dict):
+            raise AuditRequestError(f"Unexpected JSON payload from {url}")
+        return data
+
+    if last_error is not None:
+        raise AuditRequestError(f"HTTP request failed after retries for {url}: {last_error}") from last_error
+    raise AuditRequestError(f"HTTP request failed after retries for {url}")
 
 
 def _approx_equal(left: Any, right: Any, tolerance: float) -> bool:
@@ -1309,6 +1356,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--week-start")
     parser.add_argument("--month")
     parser.add_argument("--stop-on-fail", action="store_true")
+    parser.add_argument("--sleep-between-cases", type=float, default=2.0)
     return parser
 
 
@@ -1456,6 +1504,8 @@ def main() -> int:
         raise SystemExit("tenant-id is required.")
     if not token:
         raise SystemExit("token is required.")
+    if float(args.sleep_between_cases) < 0:
+        raise SystemExit("sleep-between-cases must be >= 0.")
 
     tenant_tz, orders_rows, survey_rows, menu_idx = _load_audit_inputs(tenant_id)
     cases = _build_cases(args, tenant_tz)
@@ -1487,17 +1537,24 @@ def main() -> int:
             print()
             print(f"{case.group} audit started")
 
-        result = run_audit_case(
-            index=index,
-            total_cases=total_cases,
-            case=case,
-            tenant_id=tenant_id,
-            token=token,
-            base_url=base_url,
-            all_orders_rows=orders_rows,
-            all_survey_rows=survey_rows,
-            menu_idx=menu_idx,
-        )
+        try:
+            result = run_audit_case(
+                index=index,
+                total_cases=total_cases,
+                case=case,
+                tenant_id=tenant_id,
+                token=token,
+                base_url=base_url,
+                all_orders_rows=orders_rows,
+                all_survey_rows=survey_rows,
+                menu_idx=menu_idx,
+            )
+        except AuditRequestError as exc:
+            print()
+            print(f"[{index}/{total_cases}] {case.label}")
+            print(f"Request error: {exc}")
+            print("FINAL RESULT: AUDIT FAIL")
+            return 1
         group_totals[case.group] = group_totals.get(case.group, 0) + 1
         if result.passed:
             group_passes[case.group] = group_passes.get(case.group, 0) + 1
@@ -1508,6 +1565,8 @@ def main() -> int:
                 print()
                 print("FINAL RESULT: AUDIT FAIL")
                 return 1
+        if total_cases > 1 and index < total_cases:
+            time.sleep(float(args.sleep_between_cases))
 
     print()
     if args.preset == "full-history":
