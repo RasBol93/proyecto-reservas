@@ -4,6 +4,7 @@
 import json
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 try:
     from gspread.exceptions import APIError, WorksheetNotFound
@@ -166,6 +167,25 @@ def _safe_json_loads(s: Any) -> Any:
         return None
 
 
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    candidates = [
+        raw,
+        raw.replace("Z", "+00:00"),
+        raw.replace(" ", "T"),
+        raw.replace(" ", "T").replace("Z", "+00:00"),
+    ]
+    for candidate in candidates:
+        try:
+            return datetime.fromisoformat(candidate)
+        except Exception:
+            continue
+    return None
+
+
 def _get_header(ws) -> List[str]:
     """
     Asumimos que fila 1 tiene headers técnicos.
@@ -204,6 +224,20 @@ def _find_col_idx(header: List[str], col_name: str) -> Optional[int]:
         if h.strip() == col_name:
             return i
     return None
+
+
+def _ensure_orders_column(ws, header: List[str], col_name: str) -> List[str]:
+    current_idx = _find_col_idx(header, col_name)
+    if current_idx is not None:
+        return header
+
+    clean_col_name = str(col_name or "").strip()
+    next_col_1based = len(header) + 1
+    ws.update_cell(1, next_col_1based, clean_col_name)
+
+    updated_header = list(header) + [clean_col_name]
+    _ORDERS_HEADER_CACHE[_orders_header_cache_key(ws)] = updated_header
+    return updated_header
 
 
 def _build_row_by_header(header: List[str], data: Dict[str, Any]) -> List[str]:
@@ -631,6 +665,144 @@ def get_order_by_id_strict(orders_sh, order_id: str) -> Optional[Dict[str, Any]]
     if not ctx:
         return None
     return dict(ctx.get("order") or {})
+
+
+def list_paid_pending_delivery_orders(orders_sh, tenant_id: str) -> List[Dict[str, Any]]:
+    ws = _get_orders_ws(orders_sh)
+    header = _get_header(ws)
+    if not header:
+        return []
+
+    try:
+        values = ws.get_all_values()
+    except Exception:
+        return []
+
+    tenant_col = _find_col_idx(header, "tenant_id")
+    status_col = _find_col_idx(header, "status")
+    delivered_col = _find_col_idx(header, "delivered_at")
+
+    if status_col is None:
+        return []
+
+    clean_tenant_id = str(tenant_id or "").strip()
+    pending: List[Dict[str, Any]] = []
+
+    for row_index, row in enumerate(values[1:], start=2):
+        order = _row_to_dict(header, row)
+
+        row_tenant_id = str(order.get("tenant_id") or "").strip() if tenant_col is not None else ""
+        if tenant_col is not None and row_tenant_id != clean_tenant_id:
+            continue
+
+        if _normalize_status(order.get("status")) != "PAID":
+            continue
+
+        delivered_at = str(order.get("delivered_at") or "").strip() if delivered_col is not None else ""
+        if delivered_at:
+            continue
+
+        pending.append({
+            "row_index": int(row_index),
+            "order": order,
+        })
+
+    return pending
+
+
+def mark_order_delivered(
+    orders_sh,
+    tenant_id: str,
+    order_id: str,
+    tenant_tz: str,
+    order_ctx: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    tenant_id_for_alert = str(tenant_id or "").strip()
+
+    try:
+        clean_order_id = str(order_id or "").strip()
+        if not clean_order_id:
+            return {"ok": True, "found": False}
+
+        use_ctx = order_ctx if isinstance(order_ctx, dict) else None
+        if use_ctx is not None:
+            ctx_order_id = str(((use_ctx.get("order") or {}).get("order_id")) or "").strip()
+            if ctx_order_id and ctx_order_id != clean_order_id:
+                use_ctx = None
+
+        if use_ctx is None:
+            use_ctx = get_order_context_by_id(orders_sh, clean_order_id)
+
+        if not use_ctx:
+            return {"ok": True, "found": False}
+
+        ws = use_ctx["ws"]
+        header = list(use_ctx["header"])
+        row_index = int(use_ctx["row_index"])
+        row = list(use_ctx.get("row") or [])
+
+        tenant_col = _find_col_idx(header, "tenant_id")
+        if tenant_col is not None and tenant_col < len(row):
+            row_tenant_id = str(row[tenant_col] or "").strip()
+            if row_tenant_id != tenant_id_for_alert:
+                return {"ok": True, "found": False}
+
+        status_col = _find_col_idx(header, "status")
+        if status_col is None:
+            raise RuntimeError("Missing status column")
+
+        current_status = _normalize_status(row[status_col] if status_col < len(row) else "")
+        if current_status != "PAID":
+            return {"ok": False, "found": True, "error": "order is not paid"}
+
+        header = _ensure_orders_column(ws, header, "delivered_at")
+        delivered_col = _find_col_idx(header, "delivered_at")
+        if delivered_col is None:
+            raise RuntimeError("Missing delivered_at column")
+
+        current_delivered_at = row[delivered_col] if delivered_col < len(row) else ""
+        current_delivered_at = str(current_delivered_at or "").strip()
+        if current_delivered_at:
+            return {
+                "ok": True,
+                "found": True,
+                "already_delivered": True,
+                "delivered_at": current_delivered_at,
+            }
+
+        delivered_at_value = datetime.now(ZoneInfo(str(tenant_tz or "America/La_Paz"))).isoformat()
+        _batch_write_cells(ws, [
+            {"row": row_index, "col": delivered_col + 1, "value": delivered_at_value},
+        ])
+
+        log_event(
+            "order_delivered_marked",
+            tenant_id=tenant_id_for_alert,
+            order_id=clean_order_id,
+            delivered_at=delivered_at_value,
+        )
+
+        return {
+            "ok": True,
+            "found": True,
+            "already_delivered": False,
+            "delivered_at": delivered_at_value,
+        }
+
+    except Exception as e:
+        log_event(
+            "order_delivered_mark_error",
+            tenant_id=tenant_id_for_alert,
+            order_id=order_id,
+            error_type=type(e).__name__,
+            error=str(e),
+        )
+        alert_sheet_error(
+            tenant_id=tenant_id_for_alert,
+            error=str(e),
+            extra_key="mark_order_delivered",
+        )
+        return {"ok": False, "error": str(e)}
 
 
 def find_latest_pending_order_for_contact(

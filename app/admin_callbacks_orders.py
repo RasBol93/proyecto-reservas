@@ -1,13 +1,17 @@
 # app/admin_callbacks_orders.py
 
 from typing import Any, Dict, Optional
+from datetime import datetime
 import time
+from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
 from app.orders import (
     get_order_by_id,
     get_order_context_by_id,
+    list_paid_pending_delivery_orders,
+    mark_order_delivered,
     update_order_status,
 )
 from app.menu import get_menu_product_or_404
@@ -313,6 +317,163 @@ def _is_paid_transition_allowed(current_status: str) -> bool:
     return current_status == "PENDING_PAYMENT"
 
 
+def _parse_iso_dt_any(value: Any) -> Optional[datetime]:
+    raw = _safe_str(value)
+    if not raw:
+        return None
+
+    candidates = [
+        raw,
+        raw.replace("Z", "+00:00"),
+        raw.replace(" ", "T"),
+        raw.replace(" ", "T").replace("Z", "+00:00"),
+    ]
+    for candidate in candidates:
+        try:
+            return datetime.fromisoformat(candidate)
+        except Exception:
+            continue
+    return None
+
+
+def _to_tenant_local_dt(value: Any, tenant_tz: str) -> Optional[datetime]:
+    parsed = _parse_iso_dt_any(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        return parsed
+    return parsed.astimezone(ZoneInfo(tenant_tz))
+
+
+def _tracking_order_time_label(order: Dict[str, Any], tenant_tz: str) -> str:
+    requested_slot = _extract_slot_hhmm(order.get("requested_time"))
+    if requested_slot:
+        return requested_slot
+
+    created_local = _to_tenant_local_dt(order.get("created_at"), tenant_tz)
+    if created_local is not None:
+        return created_local.strftime("%H:%M")
+
+    return "Sin hora"
+
+
+def _tracking_order_sort_key(order: Dict[str, Any], tenant_tz: str):
+    created_local = _to_tenant_local_dt(order.get("created_at"), tenant_tz)
+    created_day = created_local.date().isoformat() if created_local is not None else "9999-12-31"
+    created_minutes = (created_local.hour * 60 + created_local.minute) if created_local is not None else (24 * 60 + 59)
+
+    requested_slot = _extract_slot_hhmm(order.get("requested_time"))
+    if requested_slot:
+        try:
+            hours, minutes = requested_slot.split(":", 1)
+            requested_minutes = int(hours) * 60 + int(minutes)
+        except Exception:
+            requested_minutes = created_minutes
+    else:
+        requested_minutes = created_minutes
+
+    return (created_day, requested_minutes, created_minutes, _safe_str(order.get("order_id")))
+
+
+def _tracking_items_summary(order: Dict[str, Any]) -> str:
+    items_snapshot = parse_items_field(order.get("items_snapshot"))
+    if not items_snapshot:
+        items_snapshot = parse_items_field(order.get("items"))
+
+    parts = []
+    for item in items_snapshot:
+        name = _safe_str(item.get("name") or item.get("sku"))
+        if not name:
+            continue
+        try:
+            qty = int(item.get("qty") or 1)
+        except Exception:
+            qty = 1
+        qty = max(1, qty)
+        parts.append(f"{qty}x {name}")
+
+    if not parts:
+        return "Sin detalle de productos"
+    if len(parts) <= 3:
+        return ", ".join(parts)
+    return ", ".join(parts[:3]) + f" +{len(parts) - 3} más"
+
+
+def _tracking_footer_kb() -> Dict[str, Any]:
+    return kb([
+        [("🔄 Actualizar", "admtrack|refresh")],
+        [("⬅️ Volver", "admin_panel")],
+    ])
+
+
+def _send_admin_tracking_home(
+    tenant_id: str,
+    bot_token: str,
+    chat_id: int,
+    orders_sh,
+    tenant_tz: str,
+    sess: Dict[str, Any],
+) -> bool:
+    pending_rows = list_paid_pending_delivery_orders(orders_sh, tenant_id)
+    tmp = sess.setdefault("tmp", {})
+    tracking_map: Dict[str, str] = {}
+    tmp["tracking_order_map"] = tracking_map
+
+    if not pending_rows:
+        return _safe_send_text(
+            bot_token,
+            chat_id,
+            "📦 *SEGUIMIENTO DE PEDIDOS*\n\nNo hay pedidos pagados pendientes de entregar.",
+            parse_mode="Markdown",
+            reply_markup=_tracking_footer_kb(),
+        )
+
+    pending_orders = [dict(item.get("order") or {}) for item in pending_rows]
+    pending_orders.sort(key=lambda order: _tracking_order_sort_key(order, tenant_tz))
+
+    lines = [
+        "📦 *SEGUIMIENTO DE PEDIDOS*",
+        "",
+        "Pedidos pagados pendientes de entregar:",
+        "",
+    ]
+    rows = []
+
+    for idx, order in enumerate(pending_orders[:20], start=1):
+        order_id = _safe_str(order.get("order_id"))
+        short_id = f"t{idx}"
+        tracking_map[short_id] = order_id
+
+        time_label = _tracking_order_time_label(order, tenant_tz)
+        customer_name = _safe_str(order.get("customer_name")) or "Sin nombre"
+        items_summary = _tracking_items_summary(order)
+        total_amount = _safe_str(order.get("total_amount")) or "0"
+
+        lines.append(f"{idx}. *{time_label}* · *{customer_name}*")
+        lines.append(f"   {items_summary}")
+        lines.append(f"   Total: *Bs {total_amount}*")
+        lines.append("")
+
+        rows.append([("✅ Entregado", f"admtrack|done|{short_id}")])
+
+    if len(pending_orders) > 20:
+        lines.append(f"Mostrando {min(len(pending_orders), 20)} de {len(pending_orders)} pedidos pendientes.")
+        lines.append("")
+
+    rows.extend([
+        [("🔄 Actualizar", "admtrack|refresh")],
+        [("⬅️ Volver", "admin_panel")],
+    ])
+
+    return _safe_send_text(
+        bot_token,
+        chat_id,
+        "\n".join(lines).strip(),
+        parse_mode="Markdown",
+        reply_markup=kb(rows),
+    )
+
+
 def handle_admin_orders_callback(
     tenant: Dict[str, Any],
     tenant_id: str,
@@ -341,6 +502,11 @@ def handle_admin_orders_callback(
         _admin_order_reset(tmp)
         tmp["admin_order_cart"] = []
         return {"ok": _send_admin_order_home(bot_token, chat_id, tenant_id, orders_sh, sess)}
+
+    if data == "admin_tracking":
+        assert_admin_authorized(tenant, chat_id, tenant_id)
+        sess = get_sess(tenant_id, chat_id)
+        return {"ok": _send_admin_tracking_home(tenant_id, bot_token, chat_id, orders_sh, tenant_tz, sess)}
 
     if data.startswith("paid|"):
         parts = data.split("|")
@@ -500,6 +666,75 @@ def handle_admin_orders_callback(
 
         finally:
             _release_paid_lock(order_id)
+
+    if data.startswith("admtrack|"):
+        assert_admin_authorized(tenant, chat_id, tenant_id)
+        sess = get_sess(tenant_id, chat_id)
+        tmp = sess.setdefault("tmp", {})
+
+        parts = data.split("|")
+        if len(parts) < 2:
+            return {"ok": True}
+
+        action = parts[1].strip()
+
+        if action == "refresh":
+            return {"ok": _send_admin_tracking_home(tenant_id, bot_token, chat_id, orders_sh, tenant_tz, sess)}
+
+        if action == "done" and len(parts) == 3:
+            short_id = parts[2].strip()
+            tracking_map = tmp.setdefault("tracking_order_map", {})
+            order_id = _safe_str(tracking_map.get(short_id))
+
+            if not order_id:
+                _safe_send_text(
+                    bot_token,
+                    chat_id,
+                    "⚠️ No encontré ese pedido en la lista actual. Actualiza el seguimiento e intenta nuevamente.",
+                    reply_markup=_tracking_footer_kb(),
+                )
+                return {"ok": True}
+
+            result = mark_order_delivered(
+                orders_sh=orders_sh,
+                tenant_id=tenant_id,
+                order_id=order_id,
+                tenant_tz=tenant_tz,
+            )
+            if not result.get("ok"):
+                _safe_send_text(
+                    bot_token,
+                    chat_id,
+                    "⚠️ No pude marcar este pedido como entregado en este momento.",
+                    reply_markup=_tracking_footer_kb(),
+                )
+                return {"ok": True}
+
+            if not result.get("found"):
+                _safe_send_text(
+                    bot_token,
+                    chat_id,
+                    "⚠️ No encontré ese pedido. Actualiza el seguimiento e intenta nuevamente.",
+                    reply_markup=_tracking_footer_kb(),
+                )
+                return {"ok": True}
+
+            if result.get("already_delivered"):
+                _safe_send_text(
+                    bot_token,
+                    chat_id,
+                    "Este pedido ya estaba marcado como entregado.",
+                )
+                return {"ok": _send_admin_tracking_home(tenant_id, bot_token, chat_id, orders_sh, tenant_tz, sess)}
+
+            _safe_send_text(
+                bot_token,
+                chat_id,
+                "✅ Pedido marcado como entregado.",
+            )
+            return {"ok": _send_admin_tracking_home(tenant_id, bot_token, chat_id, orders_sh, tenant_tz, sess)}
+
+        return {"ok": True}
 
     if not data.startswith("admord|"):
         return None

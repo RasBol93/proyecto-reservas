@@ -27,11 +27,15 @@ def admin_panel_kb(user_role: str = "admin", tenant=None):
     # BLOQUE 1: OPERACIÓN
     if not is_owner:
         rows.append([
-            ("🧺 Crear pedido", "admin_order"),
+            ("✅ Hacer pedido", "admin_order"),
+            ("📦 Seguimiento de pedidos", "admin_tracking"),
+        ])
+        rows.append([
             ("📱 QR", "admin_payments"),
         ])
     else:
         rows.append([
+            ("📦 Seguimiento de pedidos", "admin_tracking"),
             ("📱 QR", "admin_payments"),
         ])
 
