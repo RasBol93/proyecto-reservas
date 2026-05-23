@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -6,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from app.menu import load_menu_index
 from app.sheets import detect_header_row
-from app.stats import resolve_period
+from app.stats import resolve_period, resolve_selected_period_context
 from app.utils import normalize, log_event
 
 
@@ -43,8 +44,26 @@ def _parse_iso_dt_any(value: Any) -> Optional[datetime]:
     return None
 
 
+def _has_explicit_timezone(value: Any) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    if raw.endswith("Z"):
+        return True
+    return bool(re.search(r"([+-]\d{2}:\d{2}|[+-]\d{4})$", raw))
+
+
 def _to_local(dt: datetime, tenant_tz: str) -> datetime:
     return dt.astimezone(ZoneInfo(tenant_tz))
+
+
+def _to_tenant_filter_naive(value: Any, tenant_tz: str) -> Optional[datetime]:
+    dt = _parse_iso_dt_any(value)
+    if dt is None:
+        return None
+    if _has_explicit_timezone(value):
+        return dt.astimezone(ZoneInfo(tenant_tz)).replace(tzinfo=None)
+    return dt.replace(tzinfo=None)
 
 
 def _fmt_local_date(dt: datetime) -> str:
@@ -197,6 +216,15 @@ def build_dashboard_orders_detail(
         selected_week_start=selected_week_start,
         selected_month=selected_month,
     )
+    selected_period_context = resolve_selected_period_context(
+        tenant_tz=tenant_tz,
+        period_key=clean_period_key,
+        selected_date=selected_date,
+        selected_week_start=selected_week_start,
+        selected_month=selected_month,
+    )
+    start_filter = selected_period_context.start_local.replace(tzinfo=None)
+    end_filter = selected_period_context.end_local.replace(tzinfo=None)
     rows = _load_orders_records(orders_sh)
 
     try:
@@ -213,8 +241,10 @@ def build_dashboard_orders_detail(
         if not created_dt:
             continue
 
-        created_filter_dt = created_dt.replace(tzinfo=None)
-        if not (period.start_utc <= created_filter_dt < period.end_utc):
+        created_filter_dt = _to_tenant_filter_naive(row.get("created_at"), tenant_tz)
+        if created_filter_dt is None:
+            continue
+        if not (start_filter <= created_filter_dt < end_filter):
             continue
 
         status = str(row.get("status") or "").strip()
